@@ -1,8 +1,11 @@
 import telebot
 import os
 
-# Получаем токен из переменной окружения
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+if not BOT_TOKEN:
+    raise ValueError("❌ BOT_TOKEN не найден. Добавь его в переменные окружения Render!")
+
 bot = telebot.TeleBot(BOT_TOKEN)
 
 # Главное меню
