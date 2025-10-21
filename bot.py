@@ -17,15 +17,11 @@ main_menu.add(
 @bot.message_handler(commands=['start'])
 def start(message):
     text = (
-        "👋 Привет, {0.first_name}!
-
-"
+        f"👋 Привет, {message.from_user.first_name}!\n\n"
         "Я — твой финансовый помощник. "
-        "Помогу вести бюджет, анализировать расходы и достигать целей 💼
-
-"
+        "Помогу вести бюджет, анализировать расходы и достигать целей 💼\n\n"
         "Выбери нужный раздел ниже 👇"
-    ).format(message.from_user)
+    )
     bot.send_message(message.chat.id, text, reply_markup=main_menu)
 
 @bot.message_handler(func=lambda message: True)
