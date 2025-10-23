@@ -4,14 +4,13 @@ import logging
 from threading import Thread
 from datetime import datetime
 import sqlite3
-
 import telebot
 from telebot import types
 from flask import Flask
 
 # ---------- CONFIG ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-PORT = int(os.getenv("PORT", "8080"))  # Render provides PORT env var
+PORT = int(os.getenv("PORT", "8080"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("financial_guide")
@@ -22,7 +21,7 @@ if not BOT_TOKEN:
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
-# ---------- HEALTH SERVER (для Render Web Service) ----------
+# ---------- HEALTH SERVER ----------
 app = Flask("financial_guide_health")
 
 @app.route("/")
@@ -30,7 +29,6 @@ def health():
     return "Financial Guide is running", 200
 
 def run_health():
-    # bind to 0.0.0.0 so platform can access it
     try:
         app.run(host="0.0.0.0", port=PORT)
     except Exception as e:
@@ -39,7 +37,7 @@ def run_health():
 Thread(target=run_health, daemon=True).start()
 logger.info(f"Health endpoint started on port {PORT}")
 
-# ---------- SIMPLE SQLITE STORAGE ----------
+# ---------- SQLITE ----------
 DB_PATH = os.getenv("DB_PATH", "data.sqlite")
 
 def get_db_connection():
@@ -50,14 +48,32 @@ def get_db_connection():
 def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("""CREATE TABLE IF NOT EXISTS expenses (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        amount REAL NOT NULL,
-        category TEXT NOT NULL,
-        note TEXT,
-        created_at TEXT NOT NULL
-    )""")
+
+    # Таблица расходов
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS expenses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            amount REAL NOT NULL,
+            category TEXT NOT NULL,
+            note TEXT,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    # Таблица категорий
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS categories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL
+        )
+    """)
+
+    # Добавим базовые категории, если их нет
+    base_categories = ["еда", "транспорт", "жильё", "развлечения", "здоровье", "одежда", "прочее"]
+    for cat in base_categories:
+        cur.execute("INSERT OR IGNORE INTO categories (name) VALUES (?)", (cat,))
+
     conn.commit()
     conn.close()
 
@@ -70,6 +86,33 @@ def add_expense(user_id, amount, category, note=""):
     )
     conn.commit()
     conn.close()
+
+def get_recent_expenses(user_id, limit=10):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT amount, category, note, created_at
+        FROM expenses
+        WHERE user_id = ?
+        ORDER BY created_at DESC
+        LIMIT ?
+    """, (user_id, limit))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+def delete_last_expense(user_id):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM expenses WHERE user_id = ? ORDER BY created_at DESC LIMIT 1", (user_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return False
+    cur.execute("DELETE FROM expenses WHERE id = ?", (row["id"],))
+    conn.commit()
+    conn.close()
+    return True
 
 def get_month_stats(user_id, year, month):
     conn = get_db_connection()
@@ -98,7 +141,10 @@ main_menu = types.ReplyKeyboardMarkup(resize_keyboard=True)
 main_menu.add(
     types.KeyboardButton("💰 Добавить трату"),
     types.KeyboardButton("📊 Моя статистика"),
-    types.KeyboardButton("🎯 Цели (скоро)"),
+    types.KeyboardButton("🕒 История"),
+    types.KeyboardButton("↩️ Отменить последнюю"),
+)
+main_menu.add(
     types.KeyboardButton("ℹ️ Помощь")
 )
 
@@ -112,7 +158,6 @@ def parse_expense_text(text: str):
         category = " ".join(parts[1:]) if len(parts) > 1 else "прочее"
         return amount, category
     except Exception:
-        # try to find numeric token anywhere
         for i, p in enumerate(parts):
             try:
                 amount = float(p)
@@ -126,71 +171,77 @@ def parse_expense_text(text: str):
 def cmd_start(message):
     first = message.from_user.first_name or "друг"
     text = (
-        f"👋 Привет! Я — <b>Financial Guide</b>, помогу следить за расходами и целями.\n\n"
-        "Отправь сообщение в формате <code>500 еда</code> чтобы быстро добавить трату.\n\n"
-        "Или выбери действие в меню ниже."
+        f"👋 Привет, <b>{first}</b>!\n\n"
+        "Я — <b>Financial Guide</b> 💼\n"
+        "Помогу вести учёт расходов и анализировать траты.\n\n"
+        "Отправь сообщение в формате <code>500 еда</code> или выбери действие ниже 👇"
     )
     bot.send_message(message.chat.id, text, reply_markup=main_menu)
 
 @bot.message_handler(commands=['help'])
 def cmd_help(message):
-    bot.send_message(message.chat.id, "ℹ️ Отправь '500 еда' или используй кнопки меню. Команды: /start /help")
+    bot.send_message(message.chat.id,
+        "ℹ️ Формат добавления: <code>500 еда</code>\n"
+        "/history — последние расходы\n"
+        "/undo — удалить последнюю запись\n"
+        "/summary — сумма по категориям"
+    )
 
-add_state = {}
+@bot.message_handler(commands=['history'])
+def cmd_history(message):
+    rows = get_recent_expenses(message.from_user.id)
+    if not rows:
+        bot.send_message(message.chat.id, "Пока нет расходов.")
+        return
+    text = "🕒 Последние траты:\n\n"
+    for r in rows:
+        dt = datetime.fromisoformat(r["created_at"]).strftime("%d.%m %H:%M")
+        note = f" ({r['note']})" if r["note"] else ""
+        text += f"• {dt} — {r['category']}: {r['amount']:.2f} ₽{note}\n"
+    bot.send_message(message.chat.id, text)
 
-@bot.message_handler(func=lambda m: m.text == "💰 Добавить трату")
-def start_add_flow(message):
-    add_state[message.from_user.id] = {"step": "ask_amount"}
-    bot.send_message(message.chat.id, "Введите сумму и категорию. Пример: <code>250 кафе</code>")
+@bot.message_handler(commands=['undo'])
+def cmd_undo(message):
+    ok = delete_last_expense(message.from_user.id)
+    bot.send_message(message.chat.id, "✅ Последняя запись удалена." if ok else "❌ Нет записей для удаления.")
 
-@bot.message_handler(func=lambda m: m.text == "📊 Моя статистика")
-def show_stats(message):
+@bot.message_handler(commands=['summary'])
+def cmd_summary(message):
     now = datetime.utcnow()
     rows = get_month_stats(message.from_user.id, now.year, now.month)
     if not rows:
-        bot.send_message(message.chat.id, "Пока нет расходов за этот месяц.")
-    else:
-        bot.send_message(message.chat.id, ("\n" + "\n").join([f"{r['category']}: {r['total']:.2f} ₽ ({r['cnt']} записей)" for r in rows]))
+        bot.send_message(message.chat.id, "Нет данных за этот месяц.")
+        return
+    total = sum(r["total"] for r in rows)
+    text = f"📊 Расходы за {now.strftime('%B %Y')}:\n\n"
+    for r in rows:
+        perc = (r["total"] / total) * 100
+        text += f"{r['category']}: {r['total']:.2f} ₽ ({perc:.1f}%)\n"
+    text += f"\n💵 Всего: {total:.2f} ₽"
+    bot.send_message(message.chat.id, text)
 
 @bot.message_handler(func=lambda m: True)
 def all_messages(message):
-    user_id = message.from_user.id
     txt = (message.text or "").strip()
-    state = add_state.get(user_id)
-    if state and state.get("step") == "ask_amount":
-        parsed = parse_expense_text(txt)
-        if parsed:
-            amount, category = parsed
-            add_expense(user_id, amount, category)
-            bot.send_message(message.chat.id, f"✅ Записано: {amount:.2f} ₽ — {category}", reply_markup=main_menu)
-        else:
-            bot.send_message(message.chat.id, "Не удалось распознать. Введи в формате: <code>500 еда</code>")
-        add_state.pop(user_id, None)
-        return
-
     parsed = parse_expense_text(txt)
     if parsed:
         amount, category = parsed
-        add_expense(user_id, amount, category)
-        bot.send_message(message.chat.id, f"✅ Быстрая запись: {amount:.2f} ₽ — {category}", reply_markup=main_menu)
-        return
+        add_expense(message.from_user.id, amount, category)
+        bot.send_message(message.chat.id, f"✅ Записано: {amount:.2f} ₽ — {category}", reply_markup=main_menu)
+    else:
+        bot.send_message(message.chat.id, "❓ Не понял. Введи, например: <code>200 еда</code>", reply_markup=main_menu)
 
-    bot.send_message(message.chat.id, "❓ Не понял сообщение. Используй меню или отправь сумму и категорию.", reply_markup=main_menu)
-
-# ---------- START POLLING (удаляем возможный webhook) ----------
+# ---------- START ----------
 def start_polling():
     try:
-        logger.info("Попытка удалить webhook (если был установлен)...")
-        try:
-            bot.remove_webhook()
-        except Exception as e:
-            logger.debug("remove_webhook() raised: %s", e)
-        logger.info("Запуск polling...")
+        logger.info("Удаление webhook...")
+        bot.remove_webhook()
+        logger.info("Polling...")
         bot.polling(none_stop=True, interval=0, timeout=20)
     except Exception as e:
-        logger.exception("Polling остановлен с исключением: %s", e)
+        logger.exception("Polling error: %s", e)
         raise
 
 if __name__ == "__main__":
-    logger.info("Financial Guide стартует")
+    logger.info("Financial Guide запущен")
     start_polling()
