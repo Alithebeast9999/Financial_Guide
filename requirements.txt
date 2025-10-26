@@ -1,4 +1,4 @@
-python-telegram-bot==20.6
+python-telegram-bot==20.3
 APScheduler==3.10.1
 SQLAlchemy==2.0.36
 pytz==2024.1
