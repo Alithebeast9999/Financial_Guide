@@ -1,0 +1,6 @@
+service: finance-bot
+env: python
+build:
+  commands:
+    - pip install -r requirements.txt
+start: gunicorn --bind 0.0.0.0:$PORT main:app
