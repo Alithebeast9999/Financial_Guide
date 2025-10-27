@@ -411,6 +411,7 @@ async def start_scheduler(app):
 def main():
     init_db()
     app = build_app()
+
     async def _on_startup():
         if WEBHOOK_URL:
             try:
@@ -419,9 +420,19 @@ def main():
             except Exception:
                 logger.exception("set_webhook failed")
         await start_scheduler(app)
-    webhook_path = "/webhook"
-    listen_addr = "0.0.0.0"
-    app.run_webhook(listen=listen_addr, port=PORT, url_path=webhook_path, webhook_url=WEBHOOK_URL, on_startup=_on_startup)
+
+    async def run():
+        await _on_startup()
+        await app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path="/webhook",
+            webhook_url=WEBHOOK_URL,
+        )
+
+    asyncio.run(run())
+
 
 if __name__ == "__main__":
     main()
+
