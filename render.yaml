@@ -1,0 +1,15 @@
+
+services:
+  - type: web
+    name: finance-bot
+    env: python
+    plan: free
+    buildCommand: ""
+    startCommand: "python main.py"
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: WEBHOOK_URL
+        sync: false
+      - key: PORT
+        value: 8080
