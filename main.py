@@ -1,6 +1,7 @@
 
 import os
 import logging
+import asyncio
 from telegram.ext import Application
 from db import init_db
 from scheduler import start_scheduler
@@ -30,13 +31,15 @@ def main():
                 logger.exception("set_webhook failed")
         await start_scheduler(app)
 
-    app.run_webhook(
+   async def run():
+    await _on_startup(app)  # вызываем вручную
+    await app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
-        url_path="/webhook",
-        webhook_url=WEBHOOK_URL,
-        post_init=_on_startup,
+        url_path=TOKEN,
+        webhook_url=f"{WEBHOOK_URL}/{TOKEN}"
     )
 
 if __name__ == "__main__":
+    asyncio.run(run())
     main()
