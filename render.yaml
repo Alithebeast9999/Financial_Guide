@@ -1,12 +1,16 @@
+# render.yaml for deploying on Render as a Web Service
 services:
   - type: web
-    name: finance-bot
+    name: telegram-finance-bot
     env: python
     plan: free
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "python main.py"
+    disk: 512
+    # entry point should run uvicorn - using main:app
+    # Render will use start script from Dockerfile or the start command below
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    buildCommand: pip install -r requirements.txt
     envVars:
-      - key: BOT_TOKEN
-        sync: false
-      - key: PORT
-        value: 8080
+      - key: TELEGRAM_TOKEN
+        # set value in Render dashboard (do not store in repo)
+      - key: APP_URL
+      - key: DATABASE_URL
