@@ -1,584 +1,714 @@
-"""
-main.py - Telegram Finance Assistant (webhook-based) for Render
-
-This single-file implementation uses FastAPI + APScheduler + SQLite + requests to
-implement a Telegram bot webhook service suitable for deploying on Render as a
-web service. It intentionally avoids heavy Telegram libraries to keep webhook
-handling explicit and simple.
-
-FILES (suggested):
-- main.py  (this file)
-- render.yaml (see below block)
-- requirements.txt (see below block)
-
---- Suggested render.yaml ---
-# replace <YOUR_SERVICE_NAME> and the appropriate env var name for TELEGRAM_TOKEN
-services:
-  - type: web
-    name: telegram-fin-helper
-    env: python
-    buildCommand: ""
-    startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT"
-    envVars:
-      - key: TELEGRAM_TOKEN
-        value: "__ADD_TOKEN_IN_RENDER__"
-      - key: WEBHOOK_URL
-        value: "https://<your-render-service>.onrender.com/webhook/${TELEGRAM_TOKEN}"
-
---- Suggested requirements.txt ---
-fastapi
-uvicorn[standard]
-requests
-apscheduler
-python-dotenv
-pytz
-
-Save these two files in your repo alongside main.py. On Render, set the TELEGRAM_TOKEN
-and make sure WEBHOOK_URL points to https://<service>.onrender.com/webhook/<token>.
-
-USAGE NOTES
-1) After deployment, set Telegram webhook manually once:
-   curl -X POST "https://api.telegram.org/bot<token>/setWebhook" -d "url=<WEBHOOK_URL>"
-2) Set the TELEGRAM_TOKEN env var in Render settings.
-
-"""
-
-from fastapi import FastAPI, Request, BackgroundTasks
-from fastapi.responses import JSONResponse
+# main.py
+import logging
 import sqlite3
 import os
-import requests
-import json
-from datetime import datetime, timedelta, timezone, date
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
-import pytz
-from dotenv import load_dotenv
+import re
+from datetime import datetime, timezone, timedelta, time, date
+from zoneinfo import ZoneInfo
+from typing import Optional, Dict, Any, List
 
-load_dotenv()
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardRemove,
+)
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    CallbackQueryHandler,
+    ContextTypes,
+    ConversationHandler,
+)
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-if not TELEGRAM_TOKEN:
-    print("WARNING: TELEGRAM_TOKEN not set. Set it in Render environment variables.")
+# Basic config
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-API_BASE = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+# Environment
+TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+BASE_URL = os.environ.get("BASE_URL")  # https://your-render-url
+PORT = int(os.environ.get("PORT", "8080"))
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}" if BASE_URL else None
 
-app = FastAPI()
-DB_PATH = os.environ.get("DB_PATH", "finance_bot.db")
+# Timezone used for scheduling
+TZ = timezone(timedelta(hours=3))  # UTC+3 fixed offset (as requested)
 
-# Recommended category distribution from the provided image
-DEFAULT_CATEGORIES = [
-    ("rent", "АРЕНДА ЖИЛЬЯ", 35),
-    ("groceries", "ПРОДУКТОВАЯ КОРЗИНА", 15),
-    ("utilities", "КОММ. УСЛУГИ", 5),
-    ("phone", "СВЯЗЬ", 3),
-    ("transport", "ТРАНСПОРТ", 5),
-    ("personal_care", "ЛИЧНЫЙ УХОД", 2),
-    ("medicine", "МЕДИЦИНА", 8),
-    ("investments", "ИНВЕСТИЦИИ", 5),
-    ("safety", "ПОДУШКА БЕЗОПАСНОСТИ", 5),
-    ("entertainment", "РАЗВЛЕЧЕНИЯ", 7),
-    ("travel", "ОТДЫХ - ПУТЕШЕСТВИЯ", 5),
-    ("shopping", "ШОПИНГ", 5),
-]
+# Categories and recommended percents (from provided image)
+CATEGORIES = {
+    # "section": (category_name, percent)
+    "Аренда жилья": 35,
+    "Продуктовая корзина": 15,
+    "Комм. услуги": 5,
+    "Связь": 3,
+    "Транспорт": 5,
+    "Личный уход": 2,
+    "Медицина": 8,
+    "Инвестиции": 5,
+    "Подушка безопасности": 5,
+    "Развлечения": 7,
+    "Отдых - путешествия": 5,
+    "Шопинг": 5,
+}
 
-# ========== DB helpers ===========
+# DB file
+DB_PATH = os.environ.get("DB_PATH", "data.sqlite")
 
+# Conversation states
+ASKING_INCOME = "ASKING_INCOME"
+AWAITING_EXPENSE_AMOUNT = "AWAITING_EXPENSE_AMOUNT"
+AWAITING_EXPENSE_CATEGORY = "AWAITING_EXPENSE_CATEGORY"
+AWAITING_RECURRING_PARAMS = "AWAITING_RECURRING_PARAMS"
+
+# --- Database helpers -------------------------------------------------
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
     cur = conn.cursor()
-    cur.execute("""
+    cur.execute(
+        """
     CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        first_name TEXT,
-        last_name TEXT,
-        username TEXT,
-        monthly_budget REAL,
-        timezone TEXT,
-        notifications_enabled INTEGER DEFAULT 1
+        id INTEGER PRIMARY KEY,
+        chat_id INTEGER UNIQUE,
+        income INTEGER DEFAULT 0,
+        notify INTEGER DEFAULT 1,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS categories (
-        key TEXT PRIMARY KEY,
-        title TEXT,
-        percent INTEGER
+    """
     )
-    """)
-
-    cur.execute("""
+    cur.execute(
+        """
     CREATE TABLE IF NOT EXISTS expenses (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id INTEGER PRIMARY KEY,
         user_id INTEGER,
-        amount REAL,
-        category_key TEXT,
+        amount INTEGER,
+        category TEXT,
         note TEXT,
-        created_at TEXT
+        ts TIMESTAMP,
+        recurring_id INTEGER,
+        FOREIGN KEY(user_id) REFERENCES users(id)
     )
-    """)
-
-    cur.execute("""
+    """
+    )
+    cur.execute(
+        """
     CREATE TABLE IF NOT EXISTS recurring (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id INTEGER PRIMARY KEY,
         user_id INTEGER,
-        amount REAL,
-        category_key TEXT,
+        amount INTEGER,
+        category TEXT,
         day_of_month INTEGER,
-        note TEXT
+        active INTEGER DEFAULT 1
     )
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS states (
-        user_id INTEGER PRIMARY KEY,
-        state TEXT,
-        tmp_amount REAL,
-        tmp_meta TEXT
+    """
     )
-    """)
-
-    # seed categories if empty
-    cur.execute("SELECT COUNT(1) FROM categories")
-    if cur.fetchone()[0] == 0:
-        cur.executemany("INSERT INTO categories(key, title, percent) VALUES (?, ?, ?)", DEFAULT_CATEGORIES)
-
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_expenses_user ON expenses(user_id)")
     conn.commit()
     conn.close()
 
 
-def db_connect():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+def get_db():
+    conn = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
     conn.row_factory = sqlite3.Row
     return conn
 
-init_db()
-db = db_connect()
 
-# ========== Telegram helpers ===========
-
-def send_message(chat_id, text, reply_markup=None, parse_mode=None):
-    payload = {"chat_id": chat_id, "text": text}
-    if reply_markup is not None:
-        payload["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
-    requests.post(f"{API_BASE}/sendMessage", data=payload)
+# --- Business logic --------------------------------------------------
+def calculate_limits(income: int) -> Dict[str, Dict[str, Any]]:
+    """
+    Returns dict of category -> {percent, limit_amount}
+    """
+    result = {}
+    for cat, pct in CATEGORIES.items():
+        result[cat] = {"percent": pct, "limit": int(income * pct / 100)}
+    return result
 
 
-def answer_callback(callback_id, text=None):
-    data = {"callback_query_id": callback_id}
-    if text:
-        data["text"] = text
-    requests.post(f"{API_BASE}/answerCallbackQuery", data=data)
-
-
-# ========== Business logic ===========
-
-def set_user_from_message(msg):
-    user = msg.get("from", {})
-    uid = user.get("id")
-    if not uid:
-        return
-    cur = db.cursor()
-    cur.execute("SELECT user_id FROM users WHERE user_id = ?", (uid,))
-    if cur.fetchone() is None:
-        cur.execute("INSERT INTO users(user_id, first_name, last_name, username) VALUES (?, ?, ?, ?)",
-                    (uid, user.get("first_name"), user.get("last_name"), user.get("username")))
-        db.commit()
-
-
-def format_money(amount):
-    return f"{amount:.0f}₽"
-
-
-def compute_limits(monthly_budget):
-    limits = {}
-    for key, title, pct in DEFAULT_CATEGORIES:
-        limits[key] = {"title": title, "percent": pct, "amount": round(monthly_budget * pct / 100)}
-    return limits
-
-
-def get_user_settings(user_id):
-    cur = db.cursor()
-    cur.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-    return cur.fetchone()
-
-
-def save_monthly_budget(user_id, amount):
-    cur = db.cursor()
-    cur.execute("UPDATE users SET monthly_budget = ? WHERE user_id = ?", (amount, user_id))
-    db.commit()
-
-
-def add_expense(user_id, amount, category_key, note=None, created_at=None):
-    created_at = created_at or datetime.utcnow().isoformat()
-    cur = db.cursor()
-    cur.execute("INSERT INTO expenses(user_id, amount, category_key, note, created_at) VALUES (?, ?, ?, ?, ?)",
-                (user_id, amount, category_key, note, created_at))
-    db.commit()
-    return cur.lastrowid
-
-
-def get_month_expenses_sum(user_id, month_start=None):
-    cur = db.cursor()
-    if not month_start:
-        now = datetime.utcnow()
-        month_start = datetime(now.year, now.month, 1)
-    cur.execute("SELECT SUM(amount) as total FROM expenses WHERE user_id = ? AND created_at >= ?",
-                (user_id, month_start.isoformat()))
+def ensure_user(chat_id: int):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM users WHERE chat_id = ?", (chat_id,))
     row = cur.fetchone()
-    return row["total"] or 0
+    if not row:
+        cur.execute("INSERT INTO users (chat_id) VALUES (?)", (chat_id,))
+        conn.commit()
+        user_id = cur.lastrowid
+    else:
+        user_id = row["id"]
+    conn.close()
+    return user_id
 
 
-def get_category_sum_month(user_id, category_key, month_start=None):
-    cur = db.cursor()
-    if not month_start:
-        now = datetime.utcnow()
-        month_start = datetime(now.year, now.month, 1)
-    cur.execute("SELECT SUM(amount) as total FROM expenses WHERE user_id = ? AND category_key = ? AND created_at >= ?",
-                (user_id, category_key, month_start.isoformat()))
+def set_income(chat_id: int, income: int):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET income = ? WHERE chat_id = ?", (income, chat_id))
+    conn.commit()
+    conn.close()
+
+
+def get_user_by_chat(chat_id: int) -> Optional[sqlite3.Row]:
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,))
     row = cur.fetchone()
-    return row["total"] or 0
+    conn.close()
+    return row
 
 
-# ========== Message flow handlers ===========
-
-CATEGORY_OPTIONS = [
-    {"text": c[1], "key": c[0]} for c in DEFAULT_CATEGORIES
-]
-
-
-def keyboard_main():
-    return {
-        "inline_keyboard": [
-            [{"text": "➕ Добавить трату", "callback_data": "action_add"}, {"text": "📜 История", "callback_data": "action_history"}],
-            [{"text": "📊 Моя статистика", "callback_data": "action_stats"}, {"text": "❓ Помощь", "callback_data": "action_help"}]
-        ]
-    }
+def add_expense_db(user_id: int, amount: int, category: str, note: Optional[str] = None, recurring_id: Optional[int] = None):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO expenses (user_id, amount, category, note, ts, recurring_id) VALUES (?, ?, ?, ?, ?, ?)",
+        (user_id, amount, category, note, datetime.now(TZ), recurring_id),
+    )
+    conn.commit()
+    eid = cur.lastrowid
+    conn.close()
+    return eid
 
 
-@app.post("/webhook/{token}")
-async def webhook(token: str, request: Request):
-    if token != TELEGRAM_TOKEN:
-        return JSONResponse(status_code=403, content={"ok": False})
-    data = await request.json()
-    # Basic user create
-    if "message" in data:
-        msg = data["message"]
-        set_user_from_message(msg)
-        await handle_message(msg)
-    elif "callback_query" in data:
-        await handle_callback(data["callback_query"])    
-    return JSONResponse(status_code=200, content={"ok": True})
+def delete_expense_by_id(user_id: int, expense_id: int) -> bool:
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM expenses WHERE id = ? AND user_id = ?", (expense_id, user_id))
+    changed = cur.rowcount
+    conn.commit()
+    conn.close()
+    return changed > 0
 
 
-async def handle_message(msg):
-    chat_id = msg["chat"]["id"]
-    text = msg.get("text", "")
-    user_id = msg["from"]["id"]
+def list_expenses(user_id: int, limit: int = 50) -> List[sqlite3.Row]:
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, amount, category, note, ts FROM expenses WHERE user_id = ? ORDER BY ts DESC LIMIT ?",
+        (user_id, limit),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
 
-    # check if user is in a state
-    cur = db.cursor()
-    cur.execute("SELECT state, tmp_amount, tmp_meta FROM states WHERE user_id = ?", (user_id,))
-    st = cur.fetchone()
-    if text.startswith("/"):
-        # Commands
-        if text.startswith("/start"):
-            help_text = (
-                "Привет! Я — твой финансовый помощник. Я помогаю учитывать траты, "
-                "рассчитывать рекомендованные лимиты и присылать напоминания.\n\n"
-                "Как начать:\n1) Введите ваш месячный доход (например: 100000) в сообщении.\n"
-                "2) Нажмите 'Добавить трату' или просто отправьте сумму — я попрошу выбрать категорию.\n\n"
-                "Команды:\n/report week — недельный отчёт\n/report month — месячный отчёт\n/help — помощь"
+
+def get_expenses_sum_by_category(user_id: int, since: Optional[datetime] = None) -> Dict[str, int]:
+    conn = get_db()
+    cur = conn.cursor()
+    if since:
+        cur.execute(
+            "SELECT category, SUM(amount) as s FROM expenses WHERE user_id = ? AND ts >= ? GROUP BY category",
+            (user_id, since),
+        )
+    else:
+        cur.execute("SELECT category, SUM(amount) as s FROM expenses WHERE user_id = ? GROUP BY category", (user_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return {r["category"]: (r["s"] or 0) for r in rows}
+
+
+def add_recurring(user_id: int, amount: int, category: str, day_of_month: int):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO recurring (user_id, amount, category, day_of_month, active) VALUES (?, ?, ?, ?, 1)",
+        (user_id, amount, category, day_of_month),
+    )
+    conn.commit()
+    rid = cur.lastrowid
+    conn.close()
+    return rid
+
+
+def list_recurring(user_id: int):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id, amount, category, day_of_month, active FROM recurring WHERE user_id = ?", (user_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def apply_recurring_for_day(day: int):
+    """
+    Create expenses for all recurring where day_of_month == day or day == last day of month
+    This is called daily by scheduler.
+    """
+    conn = get_db()
+    cur = conn.cursor()
+    # Get all recurring active
+    cur.execute("SELECT id, user_id, amount, category, day_of_month FROM recurring WHERE active = 1")
+    rows = cur.fetchall()
+    inserted = []
+    for r in rows:
+        rid, user_id, amount, category, dom = r
+        if dom == day:
+            cur.execute(
+                "INSERT INTO expenses (user_id, amount, category, note, ts, recurring_id) VALUES (?, ?, ?, ?, ?, ?)",
+                (user_id, amount, category, "Авто: регулярный платеж", datetime.now(TZ), rid),
             )
-            send_message(chat_id, help_text)
-            send_message(chat_id, "Введите, пожалуйста, ваш месячный доход (в ₽), например: 100000")
-            return
-        elif text.startswith("/help"):
-            send_message(chat_id, "Команды: /start, /help, /report week, /report month. Также используйте кнопки меню.")
-            send_message(chat_id, "Меню:", reply_markup=keyboard_main())
-            return
-        elif text.startswith("/report"):
-            parts = text.split()
-            period = parts[1] if len(parts) > 1 else "month"
-            if period == "week":
-                txt = generate_report_week(user_id)
-                send_message(chat_id, txt)
-            else:
-                txt = generate_report_month(user_id)
-                send_message(chat_id, txt)
-            return
-    # If in flow expecting category
-    if st and st["state"] == "await_category":
-        # we expect the category text or inline selection key
-        category_text = text.strip()
-        # find matching key
-        cur.execute("SELECT key FROM categories WHERE title = ?", (category_text,))
-        row = cur.fetchone()
+            inserted.append((user_id, rid))
+    conn.commit()
+    conn.close()
+    return inserted
+
+
+# --- Telegram handlers ------------------------------------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    ensure_user(chat_id)
+    kb = [
+        [KeyboardButton("Добавить трату"), KeyboardButton("История")],
+        [KeyboardButton("Моя статистика"), KeyboardButton("Помощь /commands")],
+    ]
+    text = (
+        "Привет! Я — финансовый помощник.\n\n"
+        "Я помогу учесть и оптимизировать ваши расходы, напомню про регулярные платежи, "
+        "уведомлю если лимит категории будет превышен и пришлю еженедельные/ежемесячные отчёты.\n\n"
+        "Пожалуйста, введите ваш месячный доход в рублях (например: 100000)."
+    )
+    await update.message.reply_text(text, reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+    return ASKING_INCOME
+
+
+async def handle_income(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    text = update.message.text.strip().replace(" ", "")
+    if not text.isdigit():
+        await update.message.reply_text("Пожалуйста, отправьте сумму цифрами, например: 100000")
+        return ASKING_INCOME
+    income = int(text)
+    set_income(chat_id, income)
+    limits = calculate_limits(income)
+    # reply with summary
+    lines = [f"Установлен месячный доход: {income}₽\nРекомендованные лимиты по категориям:"]
+    for cat, v in limits.items():
+        lines.append(f"- {cat}: {v['percent']}% → {v['limit']}₽")
+    await update.message.reply_text("\n".join(lines), reply_markup=ReplyKeyboardRemove())
+    # Offer quick actions
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Добавить трату", callback_data="btn_add")],
+            [InlineKeyboardButton("Моя статистика", callback_data="btn_stats"), InlineKeyboardButton("История", callback_data="btn_history")],
+            [InlineKeyboardButton("Помощь", callback_data="btn_help")],
+        ]
+    )
+    await update.message.reply_text("Чем хотите заняться дальше?", reply_markup=kb)
+    return ConversationHandler.END
+
+
+async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data
+    if data == "btn_add":
+        await q.message.reply_text("Отправьте сумму траты (например: 2500). Можно прямо сейчас добавить: `2500`", parse_mode="Markdown")
+        return
+    if data == "btn_history":
+        await send_history(q.message, context)
+        return
+    if data == "btn_stats":
+        await send_stats(q.message, context)
+        return
+    if data == "btn_help":
+        await send_help(q.message, context)
+        return
+
+
+async def send_help(dest, context):
+    text = (
+        "Команды:\n"
+        "/start - начать\n"
+        "/report week - отчёт за неделю\n"
+        "/report month - отчёт за месяц\n"
+        "/recurring - добавить регулярный платёж (формат: /recurring сумма|категория|день_месяца)\n\n"
+        "Быстрые кнопки:\n"
+        "- Добавить трату (можно просто отправить число)\n"
+        "- История (удалить запись — красный крестик)\n"
+        "- Моя статистика (показывает текущие траты и лимиты)\n\n"
+        "Если отправите сумму (например: `5000`), бот предложит выбрать категорию и сохранит трату."
+    )
+    await dest.reply_text(text)
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    chat_id = update.effective_chat.id
+    # If message is just a number, treat as expense amount
+    normalized = re.sub(r"[^\d]", "", text)
+    if normalized.isdigit():
+        amount = int(normalized)
+        # Ask category
+        context.user_data["pending_amount"] = amount
+        # inline keyboard of categories
+        buttons = []
+        row = []
+        for i, cat in enumerate(CATEGORIES.keys()):
+            row.append(InlineKeyboardButton(cat, callback_data=f"cat|{cat}"))
+            if (i + 1) % 2 == 0:
+                buttons.append(row)
+                row = []
         if row:
-            key = row["key"]
-            amount = st["tmp_amount"]
-            add_expense(user_id, amount, key)
-            send_message(chat_id, f"Добавлена трата {format_money(amount)} в категорию {category_text}.")
-            # clear state
-            cur.execute("DELETE FROM states WHERE user_id = ?", (user_id,))
-            db.commit()
-            check_limits_and_warn(user_id, chat_id, key)
+            buttons.append(row)
+        buttons.append([InlineKeyboardButton("Отмена", callback_data="cat|CANCEL")])
+        await update.message.reply_text(f"Сумма: {amount}₽\nВыберите категорию:", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+    # other commands or phrases
+    text_lower = text.lower()
+    if text_lower in ["добавить трату", "add expense", "add"]:
+        await update.message.reply_text("Отправьте сумму (например: 1200) или: `1200 groceries` (опционно с категорией в одной строке).")
+        return
+    if text_lower in ["история", "history"]:
+        await send_history(update.message, context)
+        return
+    if text_lower in ["моя статистика", "статистика"]:
+        await send_stats(update.message, context)
+        return
+    if text_lower in ["помощь", "/help", "/commands"]:
+        await send_help(update.message, context)
+        return
+    # Fallback
+    await update.message.reply_text("Не понял. Используйте кнопки или /commands для списка команд.")
+
+
+async def cat_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data
+    _, cat = data.split("|", 1)
+    if cat == "CANCEL":
+        await q.message.reply_text("Операция отменена.")
+        context.user_data.pop("pending_amount", None)
+        return
+    amount = context.user_data.get("pending_amount")
+    if not amount:
+        # Maybe user passed "1200 groceries" earlier
+        await q.message.reply_text("Не найдена сумма. Отправьте сумму, например: 1200")
+        return
+    chat_id = q.message.chat.id
+    user = get_user_by_chat(chat_id)
+    if not user:
+        ensure_user(chat_id)
+        user = get_user_by_chat(chat_id)
+    add_expense_db(user["id"], amount, cat)
+    context.user_data.pop("pending_amount", None)
+    await q.message.reply_text(f"Записано: {amount}₽ — {cat}")
+    # Check limit
+    await check_limits_and_warn(q.message, user["id"], cat, context)
+
+
+async def check_limits_and_warn(dest_message, user_id: int, category: str, context: ContextTypes.DEFAULT_TYPE):
+    user = None
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT income, chat_id FROM users WHERE id = ?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return
+    income = row["income"] or 0
+    chat_id = row["chat_id"]
+    limits = calculate_limits(income)
+    cat_limit = limits.get(category, {}).get("limit", 0)
+    # sum current month for the category
+    now = datetime.now(TZ)
+    start_month = datetime(now.year, now.month, 1, tzinfo=TZ)
+    sums = get_expenses_sum_by_category(user_id, since=start_month)
+    cat_sum = sums.get(category, 0)
+    # overall month sum
+    overall = sum(sums.values())
+    total_limit = income
+    warn_msgs = []
+    if cat_limit and cat_sum > cat_limit:
+        warn_msgs.append(f"⚠️ Вы превысили лимит для категории *{category}*: {cat_sum}₽ / {cat_limit}₽.")
+    if total_limit and overall > total_limit:
+        warn_msgs.append(f"⚠️ Общие расходы за месяц превысили доход: {overall}₽ / {total_limit}₽.")
+    if warn_msgs:
+        await dest_message.reply_text("\n".join(warn_msgs))
+
+
+async def send_history(dest_message, context):
+    chat_id = dest_message.chat.id
+    user = get_user_by_chat(chat_id)
+    if not user:
+        await dest_message.reply_text("Сначала укажите доход через /start.")
+        return
+    rows = list_expenses(user["id"], limit=20)
+    if not rows:
+        await dest_message.reply_text("История пуста.")
+        return
+    for r in rows:
+        ts = datetime.fromisoformat(r["ts"]).astimezone(TZ).strftime("%Y-%m-%d %H:%M")
+        text = f"{r['id']}: {r['amount']}₽ — {r['category']} ({ts})"
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Удалить", callback_data=f"del|{r['id']}")]])
+        await dest_message.reply_text(text, reply_markup=kb)
+
+
+async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data
+    _, eid = data.split("|", 1)
+    chat_id = q.message.chat.id
+    user = get_user_by_chat(chat_id)
+    if not user:
+        await q.message.reply_text("Пользователь не найден.")
+        return
+    ok = delete_expense_by_id(user["id"], int(eid))
+    if ok:
+        await q.message.reply_text("Запись удалена.")
+    else:
+        await q.message.reply_text("Не удалось удалить запись.")
+
+
+async def send_stats(dest_message, context):
+    chat_id = dest_message.chat.id
+    user = get_user_by_chat(chat_id)
+    if not user:
+        await dest_message.reply_text("Сначала укажите доход через /start.")
+        return
+    income = user["income"] or 0
+    limits = calculate_limits(income)
+    now = datetime.now(TZ)
+    start_month = datetime(now.year, now.month, 1, tzinfo=TZ)
+    sums = get_expenses_sum_by_category(user["id"], since=start_month)
+    lines = [f"Статистика за текущий месяц (до {now.strftime('%Y-%m-%d')}):", f"Доход: {income}₽\n"]
+    total_spent = 0
+    for cat, v in limits.items():
+        spent = sums.get(cat, 0)
+        total_spent += spent
+        pct = (spent / v["limit"] * 100) if v["limit"] > 0 else 0
+        lines.append(f"{cat}: {spent}₽ / {v['limit']}₽ ({v['percent']}%) — {int(pct)}% от лимита")
+    lines.append(f"\nИтого потрачено: {total_spent}₽")
+    await dest_message.reply_text("\n".join(lines))
+
+
+async def recurring_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Expected formats:
+    /recurring 25000|Аренда жилья|1
+    or just /recurring and bot will reply instructions.
+    """
+    chat_id = update.effective_chat.id
+    args = update.message.text.replace("/recurring", "").strip()
+    if not args:
+        await update.message.reply_text(
+            "Добавить регулярный платёж — формат:\n"
+            "/recurring сумма|категория|день_месяца\n"
+            "Пример:\n/recurring 35000|Аренда жилья|1\n\n"
+            "Список доступных категорий:\n" + ", ".join(CATEGORIES.keys())
+        )
+        return
+    parts = [p.strip() for p in args.split("|")]
+    if len(parts) != 3 or not parts[0].isdigit() or not parts[2].isdigit():
+        await update.message.reply_text("Неправильный формат. Пример: /recurring 35000|Аренда жилья|1")
+        return
+    amount = int(parts[0])
+    category = parts[1]
+    day = int(parts[2])
+    chat_user = get_user_by_chat(chat_id)
+    if not chat_user:
+        ensure_user(chat_id)
+        chat_user = get_user_by_chat(chat_id)
+    if category not in CATEGORIES:
+        await update.message.reply_text("Неизвестная категория. Используйте одну из: " + ", ".join(CATEGORIES.keys()))
+        return
+    rid = add_recurring(chat_user["id"], amount, category, day)
+    await update.message.reply_text(f"Регулярный платёж добавлен (id {rid}): {amount}₽ — {category} каждый {day}-й день.")
+
+
+async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    text = update.message.text.strip()
+    if text.startswith("/report"):
+        parts = text.split()
+        if len(parts) == 1 or parts[1] not in ("week", "month"):
+            await update.message.reply_text("Используйте: /report week или /report month")
             return
-        else:
-            send_message(chat_id, "Не распознал категорию. Введите одну из следующих категорий:\n" + ", ".join([c[1] for c in DEFAULT_CATEGORIES]))
-            return
-
-    # If message is just a number -> treat as expense amount and ask for category
-    cleaned = text.replace(" ", "").replace("₽", "")
-    try:
-        amt = float(cleaned)
-        # store state
-        cur.execute("REPLACE INTO states(user_id, state, tmp_amount, tmp_meta) VALUES (?, ?, ?, ?)",
-                    (user_id, "await_category", amt, None))
-        db.commit()
-        # prompt category list
-        kb = {"keyboard": [[{"text": c[1]}] for c in DEFAULT_CATEGORIES], "one_time_keyboard": True}
-        send_message(chat_id, f"Вы ввели сумму {format_money(amt)}. Выберите категорию (напишите или нажмите):")
-        # Also show inline categories (compact)
-        inline = {"inline_keyboard": [[{"text": c[1], "callback_data": f"pickcat:{c[0]}"}] for c in DEFAULT_CATEGORIES]}
-        send_message(chat_id, "Или выберите категорию кнопкой:", reply_markup=inline)
-        return
-    except Exception:
-        pass
-
-    # If nothing else, show main menu
-    send_message(chat_id, "Меню:", reply_markup=keyboard_main())
+        period = parts[1]
+        await send_report_for_user(chat_id, period, context)
 
 
-async def handle_callback(cb):
-    data = cb.get("data")
-    chat_id = cb["message"]["chat"]["id"] if cb.get("message") else cb["from"]["id"]
-    user_id = cb["from"]["id"]
-    callback_id = cb.get("id")
+async def send_report_for_user(chat_id: int, period: str, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user_by_chat(chat_id)
+    if not user:
+        return
+    now = datetime.now(TZ)
+    if period == "week":
+        since = now - timedelta(days=7)
+    else:
+        # month
+        since = datetime(now.year, now.month, 1, tzinfo=TZ)
+    sums = get_expenses_sum_by_category(user["id"], since=since)
+    total = sum(sums.values())
+    lines = [f"Отчёт ({period}) до {now.strftime('%Y-%m-%d')}", f"Всего потрачено: {total}₽", ""]
+    for cat, amt in sums.items():
+        lines.append(f"- {cat}: {amt}₽")
+    await context.bot.send_message(chat_id=chat_id, text="\n".join(lines))
 
-    if data == "action_add":
-        send_message(chat_id, "Отправьте сумму траты (например: 1250) или нажмите кнопку ниже:", reply_markup=None)
-        answer_callback(callback_id)
-        return
-    if data == "action_history":
-        txt = build_history_text(user_id)
-        send_message(chat_id, txt)
-        answer_callback(callback_id)
-        return
-    if data == "action_stats":
-        txt = generate_stat_text(user_id)
-        send_message(chat_id, txt)
-        answer_callback(callback_id)
-        return
-    if data == "action_help":
-        send_message(chat_id, "Помощь: Отправьте сумму для добавления траты, используйте кнопки меню или команды /report.")
-        answer_callback(callback_id)
-        return
-    if data.startswith("pickcat:"):
-        cat = data.split(":", 1)[1]
-        # fetch state amount
-        cur = db.cursor()
-        cur.execute("SELECT tmp_amount FROM states WHERE user_id = ?", (user_id,))
+
+# --- Scheduled jobs ----------------------------------------------------
+async def daily_reminder(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Send daily reminder to users with notify=1 to add today's expenses.
+    """
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT chat_id FROM users WHERE notify = 1")
+    rows = cur.fetchall()
+    conn.close()
+    for r in rows:
+        chat_id = r["chat_id"]
+        try:
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("Добавить трату", callback_data="btn_add")]])
+            await context.bot.send_message(chat_id=chat_id, text="Напоминание: не забудьте добавить сегодняшние траты.", reply_markup=kb)
+        except Exception as e:
+            logger.exception("Failed to send daily reminder to %s: %s", chat_id, e)
+
+
+async def weekly_autoreport(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Send weekly report to users with notify=1 every Monday (UTC+3).
+    """
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT chat_id, id FROM users WHERE notify = 1")
+    rows = cur.fetchall()
+    conn.close()
+    for r in rows:
+        chat_id = r["chat_id"]
+        user_id = r["id"]
+        # compose report for last 7 days
+        now = datetime.now(TZ)
+        since = now - timedelta(days=7)
+        sums = get_expenses_sum_by_category(user_id, since=since)
+        total = sum(sums.values())
+        lines = [f"Еженедельный отчёт (последние 7 дней):\nВсего: {total}₽\n"]
+        for cat, amt in sums.items():
+            lines.append(f"- {cat}: {amt}₽")
+        try:
+            await context.bot.send_message(chat_id=chat_id, text="\n".join(lines))
+        except Exception as e:
+            logger.exception("Failed to send weekly report to %s: %s", chat_id, e)
+
+
+async def apply_recurring_job(context: ContextTypes.DEFAULT_TYPE):
+    # Called daily; determine today's day-of-month and apply recurrings
+    now = datetime.now(TZ)
+    today = now.day
+    inserted = apply_recurring_for_day(today)
+    # for each insertion we may want to notify user
+    for user_id, rid in inserted:
+        # lookup chat_id
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT chat_id FROM users WHERE id = ?", (user_id,))
         row = cur.fetchone()
-        if not row:
-            send_message(chat_id, "Не найдена ожидаемая сумма. Пожалуйста, сначала отправьте сумму траты.")
-            answer_callback(callback_id)
-            return
-        amt = row["tmp_amount"]
-        # get title
-        cur.execute("SELECT title FROM categories WHERE key = ?", (cat,))
-        title = cur.fetchone()["title"]
-        add_expense(user_id, amt, cat)
-        cur.execute("DELETE FROM states WHERE user_id = ?", (user_id,))
-        db.commit()
-        send_message(chat_id, f"Добавлена трата {format_money(amt)} в категорию {title}.")
-        answer_callback(callback_id, "Трата сохранена")
-        check_limits_and_warn(user_id, chat_id, cat)
-        return
-    if data.startswith("del:"):
-        exp_id = int(data.split(":", 1)[1])
-        cur = db.cursor()
-        cur.execute("DELETE FROM expenses WHERE id = ?", (exp_id,))
-        db.commit()
-        answer_callback(callback_id, "Удалено")
-        send_message(chat_id, "Трата удалена.")
-        return
-
-    answer_callback(callback_id)
+        conn.close()
+        if row:
+            try:
+                await context.bot.send_message(row["chat_id"], "Добавлен регулярный платёж автоматом.")
+            except Exception:
+                logger.exception("Notify recurring failed for user %s", user_id)
 
 
-def build_history_text(user_id, limit=20):
-    cur = db.cursor()
-    cur.execute("SELECT id, amount, category_key, note, created_at FROM expenses WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
-                (user_id, limit))
-    rows = cur.fetchall()
-    if not rows:
-        return "История пуста."
-    lines = []
-    for r in rows:
-        # get category title
-        cur.execute("SELECT title FROM categories WHERE key = ?", (r["category_key"],))
-        cat = cur.fetchone()["title"]
-        dt = r["created_at"]
-        lines.append(f"{r['id']}: {format_money(r['amount'])} — {cat} — {dt}")
-    text = "История последних трат:\n" + "\n".join(lines)
-    # include instruction for deletion
-    text += "\n\nЧтобы удалить трату, нажмите красный крестик рядом (внизу каждой строки)"  # we will provide inline buttons below
-    # Add inline keyboard with delete buttons for each expense (up to 5 to avoid spam)
-    # but we cannot attach keyboard in the same text here because send_message called separately above. We'll return text and the client will show buttons separately.
-    return text
+# --- Main setup -------------------------------------------------------
+async def on_startup(application):
+    # Set webhook if BASE_URL provided
+    if WEBHOOK_URL:
+        await application.bot.set_webhook(WEBHOOK_URL)
+        logger.info("Webhook set to %s", WEBHOOK_URL)
+    # schedule daily reminder at 09:00 UTC+3
+    # Using JobQueue (times with tzinfo)
+    job_queue = application.job_queue
+    # daily reminder at 09:00
+    job_queue.run_daily(daily_reminder, time(hour=9, tzinfo=TZ), name="daily_reminder")
+    # weekly autoreport every Monday at 09:30 UTC+3
+    # weekday: Monday is 0, but run_daily has "days" args optional. Use run_repeating with next interval = 7 days starting next Monday.
+    job_queue.run_daily(weekly_autoreport, time(hour=9, minute=30, tzinfo=TZ), name="weekly_report", days=(0,))
+    # recurring application job: run daily at 00:05 UTC+3
+    job_queue.run_daily(apply_recurring_job, time(hour=0, minute=5, tzinfo=TZ), name="apply_recurring")
+    logger.info("Jobs scheduled.")
 
 
-def generate_stat_text(user_id):
-    cur = db.cursor()
-    cur.execute("SELECT monthly_budget FROM users WHERE user_id = ?", (user_id,))
-    row = cur.fetchone()
-    if not row or not row["monthly_budget"]:
-        return "Бюджет не установлен. Введите ваш месячный доход, чтобы получить статистику."
-    monthly = row["monthly_budget"]
-    limits = compute_limits(monthly)
-    month_start = datetime.utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    lines = [f"Ваш доход: {format_money(monthly)}\nРекомендованные лимиты:"]
-    total_spent = get_month_expenses_sum(user_id, month_start)
-    for key, v in limits.items():
-        spent = get_category_sum_month(user_id, key, month_start)
-        lines.append(f"{v['title']}: {v['percent']}% — лимит {format_money(v['amount'])}, потрачено {format_money(spent)}")
-    lines.append(f"\nВсего потрачено за месяц: {format_money(total_spent)}")
-    return "\n".join(lines)
+async def on_shutdown(application):
+    # remove webhook
+    if WEBHOOK_URL:
+        await application.bot.delete_webhook()
+        logger.info("Webhook deleted.")
 
 
-def generate_report_month(user_id):
-    cur = db.cursor()
-    month_start = datetime.utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    cur.execute("SELECT category_key, SUM(amount) as s FROM expenses WHERE user_id = ? AND created_at >= ? GROUP BY category_key",
-                (user_id, month_start.isoformat()))
-    rows = cur.fetchall()
-    if not rows:
-        return "Нет трат за текущий месяц."
-    lines = ["Месячный отчёт:"]
-    for r in rows:
-        cur.execute("SELECT title FROM categories WHERE key = ?", (r["category_key"],))
-        title = cur.fetchone()["title"]
-        lines.append(f"{title}: {format_money(r['s'])}")
-    return "\n".join(lines)
+def build_application():
+    if not TOKEN:
+        logger.error("TELEGRAM_TOKEN is not set in environment.")
+        raise RuntimeError("TELEGRAM_TOKEN env var required")
+    application = ApplicationBuilder().token(TOKEN).build()
+
+    # Conversation for start/income
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            ASKING_INCOME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_income)],
+        },
+        fallbacks=[],
+    )
+    application.add_handler(conv_handler)
+
+    # Buttons
+    application.add_handler(CallbackQueryHandler(button_router, pattern=r"^btn_"))
+    # category selection
+    application.add_handler(CallbackQueryHandler(cat_selected, pattern=r"^cat\|"))
+    # delete
+    application.add_handler(CallbackQueryHandler(delete_callback, pattern=r"^del\|"))
+
+    # text handler (for amounts, quick phrases)
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    # recurring command
+    application.add_handler(CommandHandler("recurring", recurring_command))
+
+    # reports
+    application.add_handler(CommandHandler("report", report_handler))
+    application.add_handler(MessageHandler(filters.Regex(r"^/report (week|month)$"), report_handler))
+
+    # help/shorthand
+    application.add_handler(CommandHandler("help", lambda u, c: send_help(u.message, c)))
+
+    # startup/shutdown hooks
+    application.post_init = on_startup
+    application.post_shutdown = on_shutdown
+
+    return application
 
 
-def generate_report_week(user_id):
-    now = datetime.utcnow()
-    week_start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
-    cur = db.cursor()
-    cur.execute("SELECT category_key, SUM(amount) as s FROM expenses WHERE user_id = ? AND created_at >= ? GROUP BY category_key",
-                (user_id, week_start.isoformat()))
-    rows = cur.fetchall()
-    if not rows:
-        return "Нет трат за текущую неделю."
-    lines = ["Недельный отчёт:"]
-    for r in rows:
-        cur.execute("SELECT title FROM categories WHERE key = ?", (r["category_key"],))
-        title = cur.fetchone()["title"]
-        lines.append(f"{title}: {format_money(r['s'])}")
-    return "\n".join(lines)
+def main():
+    # init db
+    init_db()
+    application = build_application()
 
-
-def check_limits_and_warn(user_id, chat_id, category_key):
-    cur = db.cursor()
-    cur.execute("SELECT monthly_budget FROM users WHERE user_id = ?", (user_id,))
-    row = cur.fetchone()
-    if not row or not row["monthly_budget"]:
-        return
-    monthly = row["monthly_budget"]
-    limits = compute_limits(monthly)
-    cat_limit = limits[category_key]["amount"]
-    cat_spent = get_category_sum_month(user_id, category_key)
-    if cat_spent > cat_limit:
-        send_message(chat_id, f"⚠️ Внимание: вы превысили лимит для {limits[category_key]['title']} — {format_money(cat_spent)} из {format_money(cat_limit)}")
-    total_spent = get_month_expenses_sum(user_id)
-    if total_spent > monthly:
-        send_message(chat_id, f"⚠️ Внимание: вы превысили общий месячный бюджет — потрачено {format_money(total_spent)} из {format_money(monthly)}")
-
-
-# ========== Recurring & Scheduled jobs ===========
-
-scheduler = AsyncIOScheduler()
-
-
-def insert_recurring_for_today():
-    # Run at start of day UTC+3
-    cur = db.cursor()
-    cur.execute("SELECT id, user_id, amount, category_key, day_of_month, note FROM recurring")
-    rows = cur.fetchall()
-    if not rows:
-        return
-    today = datetime.now(pytz.timezone('Europe/Moscow')).day
-    for r in rows:
-        if r["day_of_month"] == today:
-            add_expense(r["user_id"], r["amount"], r["category_key"], r["note"], created_at=datetime.utcnow().isoformat())
-            # optional: send notif
-            send_message(r["user_id"], f"Автозапись регулярной траты {format_money(r['amount'])} в категорию {r['category_key']}")
-
-
-def daily_reminder_to_users():
-    # send to users with notifications_enabled
-    cur = db.cursor()
-    cur.execute("SELECT user_id FROM users WHERE notifications_enabled = 1")
-    rows = cur.fetchall()
-    for r in rows:
-        send_message(r["user_id"], "Не забыли добавить сегодняшние траты? Отправьте сумму или нажмите 'Добавить трату'.", reply_markup=keyboard_main())
-
-
-def weekly_send_reports():
-    # Monday UTC+3 weekly report
-    cur = db.cursor()
-    cur.execute("SELECT user_id FROM users WHERE notifications_enabled = 1")
-    rows = cur.fetchall()
-    for r in rows:
-        txt = generate_report_week(r["user_id"])
-        send_message(r["user_id"], txt)
-
-
-@app.on_event("startup")
-async def startup_event():
-    # Scheduler jobs
-    scheduler.add_job(insert_recurring_for_today, CronTrigger(hour=0, minute=5, timezone=pytz.timezone('Europe/Moscow')))
-    scheduler.add_job(daily_reminder_to_users, CronTrigger(hour=9, minute=0, timezone=pytz.timezone('Europe/Moscow')))
-    scheduler.add_job(weekly_send_reports, CronTrigger(day_of_week='mon', hour=9, minute=30, timezone=pytz.timezone('Europe/Moscow')))
-    scheduler.start()
-    print("Scheduler started")
-
-
-# ========== Extra endpoints to manage budget & recurring (HTTP API for future web UI) ===========
-
-@app.post("/set_budget/{user_id}/{amount}")
-async def set_budget(user_id: int, amount: float):
-    cur = db.cursor()
-    cur.execute("UPDATE users SET monthly_budget = ? WHERE user_id = ?", (amount, user_id))
-    db.commit()
-    return {"ok": True}
-
-
-@app.post("/add_recurring")
-async def api_add_recurring(payload: dict):
-    user_id = payload.get('user_id')
-    amount = payload.get('amount')
-    key = payload.get('category_key')
-    day = payload.get('day_of_month')
-    note = payload.get('note')
-    cur = db.cursor()
-    cur.execute("INSERT INTO recurring(user_id, amount, category_key, day_of_month, note) VALUES (?, ?, ?, ?, ?)",
-                (user_id, amount, key, day, note))
-    db.commit()
-    return {"ok": True}
-
-
-# ========== Simple healthcheck ===========
-
-@app.get("/")
-async def root():
-    return {"ok": True}
+    # Run as webhook server (built-in) so Render can route HTTP -> this process
+    # Listen on 0.0.0.0:PORT
+    listen = "0.0.0.0"
+    logger.info("Starting webhook server on %s:%s", listen, PORT)
+    # path is WEBHOOK_PATH, and url must be BASE_URL + WEBHOOK_PATH
+    if WEBHOOK_URL:
+        application.run_webhook(
+            listen=listen,
+            port=PORT,
+            webhook_path=WEBHOOK_PATH,
+            webhook_url_path=WEBHOOK_PATH,
+            webhook_url=WEBHOOK_URL,
+        )
+    else:
+        # If no BASE_URL provided run long-polling (useful for local dev)
+        logger.warning("BASE_URL not set — running polling mode (dev only).")
+        application.run_polling()
 
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get('PORT', 8000)))
+    main()
