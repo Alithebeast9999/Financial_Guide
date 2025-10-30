@@ -1,5 +1,6 @@
-python-telegram-bot==21.11
-APScheduler==3.11.0
-SQLAlchemy==2.0.36
-pytz==2024.1
-tzlocal==5.3.1
+fastapi==0.95.2
+uvicorn[standard]==0.22.0
+python-telegram-bot==20.7
+SQLAlchemy==1.4.52
+apscheduler==3.11.1
+pydantic==1.10.12
