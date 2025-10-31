@@ -1,7 +1,7 @@
-fastapi==0.95.2
+fastapi==0.115.2
 uvicorn[standard]==0.22.0
 python-telegram-bot==20.7
 SQLAlchemy==1.4.52
 apscheduler==3.10.4
-pydantic==1.10.13
+pydantic==2.9.2
 python-dotenv==1.0.1
