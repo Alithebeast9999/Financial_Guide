@@ -4,7 +4,7 @@ services:
     name: telegram-finance-bot
     env: python
     build:
-        pythonVersion: 3.11.9
+      pythonVersion: 3.11.9
     plan: free
     disk: 512
     # entry point should run uvicorn - using main:app
