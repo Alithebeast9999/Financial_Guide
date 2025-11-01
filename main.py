@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
-# main.py
 """
 Telegram Finance Assistant Bot (Webhook via FastAPI, PTB 20.7+)
-- No Updater (pure Application API)
-- Persistent SQLite via SQLAlchemy
-- Scheduled tasks (apscheduler)
-- Webhook compatible for Render
+- Без Updater
+- Асинхронно
+- SQLite + SQLAlchemy
+- APScheduler
 """
 
 import os
 import logging
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
@@ -21,9 +20,9 @@ from sqlalchemy.orm import sessionmaker, scoped_session, relationship
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 from telegram.ext import (
-    Application,
+    ApplicationBuilder,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
@@ -37,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 # --- Config ---
 TOKEN = os.getenv("TELEGRAM_TOKEN")
-APP_URL = os.getenv("APP_URL")  # e.g. https://your-app.onrender.com
+APP_URL = os.getenv("APP_URL")
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///data.sqlite")
 
 if not TOKEN:
@@ -48,7 +47,6 @@ engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = scoped_session(sessionmaker(bind=engine, autoflush=False, autocommit=False))
 Base = declarative_base()
 
-# --- Models ---
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
@@ -80,8 +78,7 @@ CATEGORY_PERCENT = {
 }
 CATEGORIES = list(CATEGORY_PERCENT.keys())
 
-# --- Bot + FastAPI + Scheduler ---
-bot = Bot(token=TOKEN)
+# --- FastAPI + Scheduler ---
 app = FastAPI()
 scheduler = AsyncIOScheduler()
 scheduler.start()
@@ -98,10 +95,7 @@ def get_user(db, tg_user):
 def save_limits(user, db):
     if user.monthly_income <= 0:
         return
-    parts = [
-        f"{cat}:{pct}:{round(user.monthly_income * pct / 100, 2)}"
-        for cat, pct in CATEGORY_PERCENT.items()
-    ]
+    parts = [f"{cat}:{pct}:{round(user.monthly_income * pct / 100, 2)}" for cat, pct in CATEGORY_PERCENT.items()]
     user.limits = ",".join(parts)
     db.commit()
 
@@ -125,20 +119,17 @@ def main_keyboard():
     )
 
 def categories_inline():
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton(c, callback_data=f"cat|{c}")] for c in CATEGORIES]
-    )
+    return InlineKeyboardMarkup([[InlineKeyboardButton(c, callback_data=f"cat|{c}")] for c in CATEGORIES])
 
 # --- Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = SessionLocal()
     try:
         user = get_user(db, update.effective_user)
-        text = (
-            "Привет! Я помогу отслеживать расходы и лимиты по категориям.\n"
-            "Введите ваш месячный доход (например, 50000)."
+        await update.message.reply_text(
+            "Привет! Я помогу отслеживать расходы и лимиты.\nВведите ваш месячный доход (например, 50000).",
+            reply_markup=main_keyboard()
         )
-        await update.message.reply_text(text, reply_markup=main_keyboard())
     finally:
         db.close()
 
@@ -166,10 +157,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
             context.chat_data["pending_amount"] = val
-            await update.message.reply_text(
-                f"Трата {val:.2f} ₽. Выберите категорию:",
-                reply_markup=categories_inline()
-            )
+            await update.message.reply_text(f"Трата {val:.2f} ₽. Выберите категорию:", reply_markup=categories_inline())
             return
         except ValueError:
             pass
@@ -236,8 +224,8 @@ class TelegramUpdate(BaseModel):
 async def webhook(request: Request):
     try:
         data = await request.json()
-        update = Update.de_json(data, bot)
-        await app.tg_app.process_update(update)
+        update = Update.de_json(data, app.bot)
+        await app.application.process_update(update)
     except Exception as e:
         logger.exception("Update error: %s", e)
         raise HTTPException(status_code=500)
@@ -247,23 +235,26 @@ async def webhook(request: Request):
 @app.on_event("startup")
 async def on_startup():
     webhook_url = f"{APP_URL}/webhook/{TOKEN}" if APP_URL else None
-    app.tg_app = Application.builder().bot(bot).build()
-    app.tg_app.add_handler(CommandHandler("start", start))
-    app.tg_app.add_handler(CommandHandler("help", help_cmd))
-    app.tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
-    app.tg_app.add_handler(CallbackQueryHandler(callback_handler))
+
+    # создаём Application правильно
+    app.application = ApplicationBuilder().token(TOKEN).build()
+    app.bot = app.application.bot
+
+    app.application.add_handler(CommandHandler("start", start))
+    app.application.add_handler(CommandHandler("help", help_cmd))
+    app.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    app.application.add_handler(CallbackQueryHandler(callback_handler))
 
     if webhook_url:
-        await bot.set_webhook(url=webhook_url)
+        await app.bot.set_webhook(url=webhook_url)
         logger.info("Webhook set: %s", webhook_url)
 
-    # Schedule daily reminder at 06:00 UTC
     scheduler.add_job(lambda: asyncio.create_task(daily_reminder()), CronTrigger(hour=6, minute=0))
     logger.info("Scheduler started")
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    await bot.delete_webhook()
+    await app.bot.delete_webhook()
     scheduler.shutdown()
 
 async def daily_reminder():
@@ -271,13 +262,13 @@ async def daily_reminder():
     try:
         users = db.query(User).filter(User.notify == True).all()
         for u in users:
-            await bot.send_message(chat_id=u.id, text="Не забудьте добавить траты за сегодня 💰")
+            await app.bot.send_message(chat_id=u.id, text="Не забудьте добавить траты за сегодня 💰")
     except Exception:
         logger.exception("Reminder error")
     finally:
         db.close()
 
-# --- Run locally ---
+# --- Local run ---
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
