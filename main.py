@@ -22,7 +22,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 from telegram.ext import (
-    ApplicationBuilder,
+    Application,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
@@ -216,7 +216,7 @@ async def send_history(user, update, db):
     text = "\n".join([f"{e.amount:.2f} ₽ | {e.category} | {e.created_at.strftime('%d.%m')}" for e in exps])
     await update.message.reply_text(text)
 
-# --- FastAPI Webhook ---
+# --- Webhook ---
 class TelegramUpdate(BaseModel):
     update_id: int
 
@@ -225,7 +225,7 @@ async def webhook(request: Request):
     try:
         data = await request.json()
         update = Update.de_json(data, app.bot)
-        await app.application.process_update(update)
+        await app.tg_app.process_update(update)
     except Exception as e:
         logger.exception("Update error: %s", e)
         raise HTTPException(status_code=500)
@@ -236,14 +236,13 @@ async def webhook(request: Request):
 async def on_startup():
     webhook_url = f"{APP_URL}/webhook/{TOKEN}" if APP_URL else None
 
-    # создаём Application правильно
-    app.application = ApplicationBuilder().token(TOKEN).build()
-    app.bot = app.application.bot
+    app.tg_app = Application.builder().token(TOKEN).build()
+    app.bot = app.tg_app.bot
 
-    app.application.add_handler(CommandHandler("start", start))
-    app.application.add_handler(CommandHandler("help", help_cmd))
-    app.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
-    app.application.add_handler(CallbackQueryHandler(callback_handler))
+    app.tg_app.add_handler(CommandHandler("start", start))
+    app.tg_app.add_handler(CommandHandler("help", help_cmd))
+    app.tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    app.tg_app.add_handler(CallbackQueryHandler(callback_handler))
 
     if webhook_url:
         await app.bot.set_webhook(url=webhook_url)
