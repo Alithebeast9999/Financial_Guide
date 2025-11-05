@@ -2,7 +2,7 @@ services:
   - type: web
     name: finance-assistant-bot
     env: python
-    region: moscow  # Можно изменить на ближайший к тебе регион
+    region: moscow
     plan: free
     buildCommand: |
       pip install --upgrade pip
@@ -12,4 +12,7 @@ services:
       - key: BOT_TOKEN
         sync: false
       - key: WEBHOOK_URL
-        value: https://finance-assistant-bot.onrender.com
+        generateValue: true
+      - key: PORT
+        value: "10000"
+    autoDeploy: true
