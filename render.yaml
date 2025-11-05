@@ -1,14 +1,14 @@
 services:
   - type: web
-    name: financial-guide-bot  # Имя твоего сервиса
+    name: financial-guide-bot
     env: python
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
     envVars:
       - key: PYTHON_VERSION
-        value: 3.12.3
+        value: 3.11.9  # <-- КРИТИЧНО: Python 3.11
       - key: BOT_TOKEN
-        sync: false  # Введи вручную в дашборде
+        sync: false
       - key: WEBHOOK_URL
-        generateValue: true  # Render сам сгенерирует после деплоя
+        generateValue: true
     autoDeploy: true
