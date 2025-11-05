@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Financial Assistant Telegram Bot (Webhook + Polling fallback).
-Подходит для деплоя на Render (web service).
+Актуальная версия: поддерживает root/health endpoint (aiohttp) для Render,
+и прокси-вебхук через aiogram executor.start_webhook(web_app=app).
 """
 
 import os
@@ -10,6 +11,7 @@ import sqlite3
 from datetime import datetime, timedelta
 import pytz
 import asyncio
+from aiohttp import web
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -22,7 +24,7 @@ from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils import executor
 
-# === LOG ===
+# === LOGGING ===
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -30,19 +32,17 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # optional; if not set — fallback to polling
 PORT = int(os.environ.get("PORT", 10000))
-# Use UTC+3 as requested for scheduler triggers — Europe/Moscow corresponds to UTC+3 (no DST issues here).
-TZ = pytz.timezone("Europe/Moscow")
+TZ = pytz.timezone("Europe/Moscow")  # UTC+3
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не установлен в переменных окружения!")
 
-# === DB ===
+# === DB SETUP ===
 DB_FILE = "bot.db"
 conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 conn.row_factory = sqlite3.Row
 cursor = conn.cursor()
 
-# Create tables if needed
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
@@ -94,12 +94,13 @@ CATEGORIES = {
 }
 ALL_CATEGORIES = [c for g in CATEGORIES.values() for c in g]
 
-# === BOT & FSM ===
+# === BOT ===
 bot = Bot(token=BOT_TOKEN, timeout=30)
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 db_lock = asyncio.Lock()
 
+# === STATES ===
 class IncomeState(StatesGroup):
     income = State()
 
@@ -234,7 +235,6 @@ async def process_recurring():
         except Exception as e:
             logger.debug(f"process_recurring send failed for {uid}: {e}")
 
-# schedule jobs (UTC+3 triggers approx morning)
 scheduler.add_job(daily_reminders, CronTrigger(hour=9, minute=0))
 scheduler.add_job(weekly_report, CronTrigger(day_of_week="mon", hour=9, minute=0))
 scheduler.add_job(process_recurring, CronTrigger(hour=6, minute=0))
@@ -416,7 +416,7 @@ async def on_startup(dp):
     except Exception:
         logger.exception("Scheduler start failed (may already be running).")
 
-    # set webhook if provided (Render will send requests)
+    # set webhook if provided
     if WEBHOOK_URL:
         webhook = WEBHOOK_URL.rstrip("/") + "/webhook"
         try:
@@ -441,9 +441,23 @@ async def on_shutdown(dp):
         pass
     logger.info("Bot shutdown completed")
 
+# === AIOHTTP APP (health + root) ===
+def create_web_app():
+    app = web.Application()
+    async def index(request):
+        return web.Response(text="OK")
+    async def health(request):
+        return web.Response(text="OK")
+    app.router.add_get("/", index)
+    app.router.add_get("/health", health)
+    # Optionally you can add an endpoint to dump webhook info (protected) for debugging
+    return app
+
+# === RUN ===
 if __name__ == "__main__":
-    # If WEBHOOK_URL present, start webhook; otherwise fallback to polling (useful for local dev)
+    web_app = create_web_app()
     if WEBHOOK_URL:
+        # pass aiohttp web_app into aiogram start_webhook so both root and webhook are served
         executor.start_webhook(
             dispatcher=dp,
             webhook_path="/webhook",
@@ -451,7 +465,9 @@ if __name__ == "__main__":
             on_shutdown=on_shutdown,
             skip_updates=True,
             host="0.0.0.0",
-            port=PORT
+            port=PORT,
+            web_app=web_app
         )
     else:
+        # local polling mode (useful for dev)
         executor.start_polling(dp, skip_updates=True, on_startup=on_startup, on_shutdown=on_shutdown)
