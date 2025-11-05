@@ -16,6 +16,7 @@ from aiogram.utils import executor
 
 # Logging setup
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Environment variables
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
@@ -30,7 +31,7 @@ DB_FILE = 'bot.db'
 conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 cursor = conn.cursor()
 
-# Create tables
+# Create tables if not exists
 cursor.execute('''
 CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
@@ -61,7 +62,6 @@ CREATE TABLE IF NOT EXISTS recurring (
     FOREIGN KEY (user_id) REFERENCES users(user_id)
 )
 ''')
-
 conn.commit()
 
 # Categories and percentages from the screenshot
@@ -108,12 +108,18 @@ class RecurringState(StatesGroup):
     day = State()
 
 # Helper functions
+def ensure_user(user_id):
+    cursor.execute('INSERT OR IGNORE INTO users (user_id) VALUES (?)', (user_id,))
+    conn.commit()
+
 def get_user_income(user_id):
+    ensure_user(user_id)
     cursor.execute('SELECT income FROM users WHERE user_id = ?', (user_id,))
     result = cursor.fetchone()
     return result[0] if result else 0
 
 def set_user_income(user_id, income):
+    ensure_user(user_id)
     cursor.execute('INSERT OR REPLACE INTO users (user_id, income) VALUES (?, ?)', (user_id, income))
     conn.commit()
 
@@ -131,7 +137,8 @@ def get_current_expenses(user_id, start_date, end_date):
     WHERE user_id = ? AND timestamp BETWEEN ? AND ?
     GROUP BY category
     ''', (user_id, start_date, end_date))
-    return dict(cursor.fetchall())
+    result = cursor.fetchall()
+    return {cat: amt for cat, amt in result}
 
 def add_expense(user_id, amount, category, timestamp=None, recurring_id=None):
     if timestamp is None:
@@ -143,11 +150,11 @@ def add_expense(user_id, amount, category, timestamp=None, recurring_id=None):
     conn.commit()
     return cursor.lastrowid
 
-def get_expenses(user_id):
+def get_expenses(user_id, limit=10):
     cursor.execute('''
     SELECT id, amount, category, timestamp FROM expenses
-    WHERE user_id = ? ORDER BY timestamp DESC
-    ''', (user_id,))
+    WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?
+    ''', (user_id, limit))
     return cursor.fetchall()
 
 def delete_expense(expense_id):
@@ -155,6 +162,7 @@ def delete_expense(expense_id):
     conn.commit()
 
 def add_recurring(user_id, amount, category, day):
+    ensure_user(user_id)
     cursor.execute('''
     INSERT INTO recurring (user_id, amount, category, day)
     VALUES (?, ?, ?, ?)
@@ -166,11 +174,13 @@ def get_recurring(user_id):
     return cursor.fetchall()
 
 def get_notifications_enabled(user_id):
+    ensure_user(user_id)
     cursor.execute('SELECT notifications FROM users WHERE user_id = ?', (user_id,))
     result = cursor.fetchone()
     return result[0] if result else True
 
 def toggle_notifications(user_id):
+    ensure_user(user_id)
     current = get_notifications_enabled(user_id)
     new = not current
     cursor.execute('UPDATE users SET notifications = ? WHERE user_id = ?', (new, user_id))
@@ -180,7 +190,7 @@ def toggle_notifications(user_id):
 def check_and_notify_limits(user_id, category, amount):
     limits = get_limits(user_id)
     if category not in limits:
-        return
+        return []
     income = get_user_income(user_id)
     month_start = datetime.now(TZ).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     month_end = (month_start + timedelta(days=32)).replace(day=1) - timedelta(seconds=1)
@@ -189,9 +199,9 @@ def check_and_notify_limits(user_id, category, amount):
     cat_spent = current.get(category, 0) + amount
     messages = []
     if total_spent > income:
-        messages.append("Внимание: Общий месячный лимит превышен!")
+        messages.append("⚠️ Внимание: Общий месячный лимит превышен!")
     if cat_spent > limits[category]:
-        messages.append(f"Внимание: Лимит по категории '{category}' превышен!")
+        messages.append(f"⚠️ Внимание: Лимит по категории '{category}' превышен!")
     return messages
 
 def format_statistics(user_id):
@@ -200,33 +210,37 @@ def format_statistics(user_id):
     month_start = datetime.now(TZ).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     month_end = (month_start + timedelta(days=32)).replace(day=1) - timedelta(seconds=1)
     current = get_current_expenses(user_id, month_start, month_end)
-    text = f"ВАШ ДОХОД: {income:.0f} ₽\n\n"
+    text = f"ВАШ ДОХОД: {income:,.0f} ₽\n\n"
     for group, cats in CATEGORIES.items():
         text += f"{group}\n"
+        group_total_lim = 0
         for cat, percent in cats.items():
             lim = limits[cat]
             spent = current.get(cat, 0)
-            text += f"{cat}: {percent*100}% {lim:.0f} ₽ (потрачено: {spent:.0f} ₽)\n"
-        text += "\n"
+            group_total_lim += lim
+            text += f"{cat:<20} {percent*100:>3}% {lim:>7,.0f} ₽ (потрачено: {spent:,.0f} ₽)\n"
+        text += f"Итого {group}: {group_total_lim:,.0f} ₽\n\n"
     return text
 
 def format_report(user_id, period):
     now = datetime.now(TZ)
     if period == 'week':
-        start = now - timedelta(days=now.weekday() + 7)
+        start = now - timedelta(days=now.weekday())  # Start of current week (Monday)
         end = start + timedelta(days=7)
     elif period == 'month':
         start = now.replace(day=1)
         end = (start + timedelta(days=32)).replace(day=1) - timedelta(seconds=1)
     else:
-        return "Неверный период"
+        return "Неверный период."
     current = get_current_expenses(user_id, start, end)
-    text = f"Отчет за {period}:\n"
+    text = f"📊 Отчёт за {period.upper()}:\n\n"
     total = 0
-    for cat, amt in current.items():
-        text += f"{cat}: {amt:.0f} ₽\n"
+    for cat, amt in sorted(current.items()):
+        text += f"• {cat}: {amt:,.0f} ₽\n"
         total += amt
-    text += f"Итого: {total:.0f} ₽"
+    text += f"\nИТОГО: {total:,.0f} ₽"
+    if total == 0:
+        text += "\n\nНет трат за период."
     return text
 
 # Scheduler
@@ -238,30 +252,51 @@ async def daily_tasks():
     
     # Add recurring expenses
     cursor.execute('SELECT user_id, id, amount, category FROM recurring WHERE day = ?', (day,))
-    for user_id, rec_id, amount, category in cursor.fetchall():
+    recurring_list = cursor.fetchall()
+    for user_id, rec_id, amount, category in recurring_list:
         add_expense(user_id, amount, category, now, rec_id)
+        logger.info(f"Added recurring expense for user {user_id}: {amount} {category}")
     
     # Daily reminders
     cursor.execute('SELECT user_id FROM users WHERE notifications = TRUE')
-    for (user_id,) in cursor.fetchall():
-        await bot.send_message(user_id, "Не забудьте добавить сегодняшние траты!")
+    users = cursor.fetchall()
+    for (user_id,) in users:
+        try:
+            await bot.send_message(user_id, "👋 Не забудьте добавить сегодняшние траты! /add")
+        except Exception as e:
+            logger.error(f"Failed to send reminder to {user_id}: {e}")
 
 async def weekly_reports():
     cursor.execute('SELECT user_id FROM users')
-    for (user_id,) in cursor.fetchall():
-        report = format_report(user_id, 'week')
-        await bot.send_message(user_id, report)
+    users = cursor.fetchall()
+    for (user_id,) in users:
+        try:
+            report = format_report(user_id, 'week')
+            await bot.send_message(user_id, f"📅 Еженедельный отчёт:\n{report}")
+        except Exception as e:
+            logger.error(f"Failed to send weekly report to {user_id}: {e}")
 
-scheduler.add_job(daily_tasks, CronTrigger(hour=9, minute=0))  # 9:00 daily
-scheduler.add_job(weekly_reports, CronTrigger(day_of_week='mon', hour=9, minute=0))  # Monday 9:00
+if os.environ.get('ENV') != 'local':  # Start scheduler only in production
+    scheduler.add_job(daily_tasks, CronTrigger(hour=9, minute=0))  # 9:00 daily UTC+3
+    scheduler.add_job(weekly_reports, CronTrigger(day_of_week='mon', hour=9, minute=0))  # Monday 9:00
+    scheduler.start()
 
 # Handlers
 @dp.message_handler(commands=['start'])
 async def start(message: types.Message):
     user_id = message.from_user.id
+    ensure_user(user_id)
     income = get_user_income(user_id)
     if income == 0:
-        await message.reply("Привет! Я финансовый помощник. Я помогаю учитывать и оптимизировать траты.\nПожалуйста, введите ваш ежемесячный доход (например, 10000):")
+        welcome_text = (
+            "Привет! 👋 Я финансовый помощник.\n\n"
+            "Что я делаю:\n"
+            "• Учитываю твои траты и доход.\n"
+            "• Оптимизирую бюджет по рекомендованным лимитам (НАДО / МОГУ / ХОЧУ).\n"
+            "• Отправляю напоминания и отчёты.\n\n"
+            "Давай начнём: введи твой ежемесячный доход (₽, например: 100 000)."
+        )
+        await message.reply(welcome_text)
         await IncomeState.income.set()
     else:
         await show_menu(message)
@@ -269,116 +304,161 @@ async def start(message: types.Message):
 @dp.message_handler(state=IncomeState.income)
 async def process_income(message: types.Message, state: FSMContext):
     try:
-        income = float(message.text.replace(' ', ''))
+        income = float(message.text.replace(' ', '').replace(',', '.'))
+        if income <= 0:
+            raise ValueError("Доход должен быть положительным.")
         set_user_income(message.from_user.id, income)
         await state.finish()
+        await message.reply(f"✅ Доход установлен: {income:,.0f} ₽.\nРекомендованные лимиты рассчитаны!")
         await show_menu(message)
     except ValueError:
-        await message.reply("Неверный формат. Введите число, например 10000.")
+        await message.reply("❌ Неверный формат. Введи число, например: 100000 или 100 000.")
 
 async def show_menu(message: types.Message):
-    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    buttons = ["Добавить трату", "История", "Моя статистика", "Помощь"]
+    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    buttons = ["➕ Добавить трату", "📜 История", "📊 Моя статистика", "❓ Помощь"]
     keyboard.add(*buttons)
     await message.reply("Выберите действие:", reply_markup=keyboard)
 
-@dp.message_handler(Text(equals="Добавить трату"))
+@dp.message_handler(Text(equals=["➕ Добавить трату", "Добавить трату"]))
 async def add_expense_start(message: types.Message):
-    await message.reply("Введите сумму траты:")
+    await message.reply("💰 Введи сумму траты (₽, например: 1500):")
     await ExpenseState.amount.set()
 
 @dp.message_handler(state=ExpenseState.amount)
 async def process_amount(message: types.Message, state: FSMContext):
     try:
-        amount = float(message.text.replace(' ', ''))
+        amount = float(message.text.replace(' ', '').replace(',', '.'))
+        if amount <= 0:
+            raise ValueError("Сумма должна быть положительной.")
         await state.update_data(amount=amount)
         keyboard = InlineKeyboardMarkup(row_width=2)
         for cat in ALL_CATEGORIES:
             keyboard.add(InlineKeyboardButton(cat, callback_data=f"cat_{cat}"))
-        await message.reply("Выберите категорию:", reply_markup=keyboard)
+        keyboard.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_exp"))
+        await message.reply("Выбери категорию:", reply_markup=keyboard)
         await ExpenseState.category.set()
     except ValueError:
-        await message.reply("Неверный формат. Введите число.")
+        await message.reply("❌ Неверный формат. Введи число, например: 1500.")
 
 @dp.callback_query_handler(lambda c: c.data.startswith('cat_'), state=ExpenseState.category)
 async def process_category(callback: CallbackQuery, state: FSMContext):
-    category = callback.data.split('_')[1]
+    if callback.data == 'cancel_exp':
+        await state.finish()
+        await callback.message.edit_text("❌ Добавление отменено.")
+        return
+    category = '_'.join(callback.data.split('_')[1:])  # Handle categories with spaces/dashes
     data = await state.get_data()
     amount = data['amount']
     user_id = callback.from_user.id
     warnings = check_and_notify_limits(user_id, category, amount)
     add_expense(user_id, amount, category)
     await bot.answer_callback_query(callback.id)
-    await bot.send_message(user_id, f"Трата добавлена: {amount:.0f} ₽ на {category}")
+    await callback.message.edit_text(f"✅ Трата добавлена: {amount:,.0f} ₽ на '{category}'")
     if warnings:
-        await bot.send_message(user_id, "\n".join(warnings))
+        for warn in warnings:
+            await bot.send_message(user_id, warn)
     await state.finish()
-    await show_menu(types.Message(chat=types.Chat(id=user_id), from_user=types.User(id=user_id)))
+    await show_menu(types.Message(text="", chat=callback.message.chat, from_user=callback.from_user))
 
-@dp.message_handler(lambda message: message.text.replace(' ', '').isdigit(), state='*')
-async def quick_add_amount(message: types.Message):
-    await process_amount(message, FSMContext(dp.storage, message.chat.id, message.from_user.id))
+# Quick add if message is just amount
+@dp.message_handler(lambda message: message.text and message.text.replace(' ', '').replace(',', '.').replace('-', '').isdigit() and not message.text.startswith('/'))
+async def quick_add_amount(message: types.Message, state: FSMContext):
+    if dp.current_state(user=message.from_user.id).get_state() != 'ExpenseState:amount':
+        await add_expense_start(message)
+        await process_amount(message, state)
 
-@dp.message_handler(Text(equals="История"))
+@dp.message_handler(Text(equals=["📜 История", "История"]))
 async def history(message: types.Message):
     user_id = message.from_user.id
     expenses = get_expenses(user_id)
     if not expenses:
-        await message.reply("Нет трат.")
+        await message.reply("📭 Нет трат в истории.")
         return
     for exp_id, amount, category, ts in expenses:
+        ts_str = ts.strftime("%d.%m %H:%M")
         keyboard = InlineKeyboardMarkup()
-        keyboard.add(InlineKeyboardButton("❌", callback_data=f"del_{exp_id}"))
-        await message.reply(f"{ts}: {amount:.0f} ₽ - {category}", reply_markup=keyboard)
+        keyboard.add(InlineKeyboardButton("❌ Удалить", callback_data=f"del_{exp_id}"))
+        await message.reply(f"{ts_str}\n{amount:,.0f} ₽ — {category}", reply_markup=keyboard)
 
 @dp.callback_query_handler(lambda c: c.data.startswith('del_'))
 async def delete_callback(callback: CallbackQuery):
     exp_id = int(callback.data.split('_')[1])
     delete_expense(exp_id)
-    await bot.answer_callback_query(callback.id, "Трата удалена")
+    await bot.answer_callback_query(callback.id, "✅ Трата удалена!")
     await bot.delete_message(callback.message.chat.id, callback.message.message_id)
+    await bot.send_message(callback.from_user.id, "Обнови историю командой /history")
 
-@dp.message_handler(Text(equals="Моя статистика"))
+@dp.message_handler(Text(equals=["📊 Моя статистика", "Моя статистика"]))
 async def statistics(message: types.Message):
     text = format_statistics(message.from_user.id)
     await message.reply(text)
 
-@dp.message_handler(Text(equals="Помощь"))
+@dp.message_handler(Text(equals=["❓ Помощь", "Помощь"]))
 async def help_command(message: types.Message):
     text = """
-Команды:
-/start - начать
-/add_recurring - добавить регулярную трату (сумма, категория, день месяца)
-/toggle_notifications - включить/выключить уведомления
-/report week - отчет за неделю
-/report month - отчет за месяц
-"""
+🆘 Помощь по командам:
+
+/start — Начать работу (установить доход)
+/add — Добавить трату (или просто напиши сумму)
+/history — История трат (с удалением)
+/stats — Моя статистика (лимитами по категориям)
+/report week — Отчёт за неделю
+/report month — Отчёт за месяц
+/add_recurring — Добавить регулярную трату (аренда и т.п.)
+/toggle_notifications — Вкл/выкл напоминания
+/help — Это меню
+
+Категории: {cats}
+
+Напоминания: ежедневно в 9:00 (если включены).
+Отчёты: еженедельно по понедельникам.
+""".format(cats=', '.join(ALL_CATEGORIES))
     await message.reply(text)
+
+@dp.message_handler(commands=['add', 'add_expense'])
+async def add_cmd(message: types.Message):
+    await add_expense_start(message)
+
+@dp.message_handler(commands=['stats'])
+async def stats_cmd(message: types.Message):
+    await statistics(message)
+
+@dp.message_handler(commands=['history_list'])
+async def history_cmd(message: types.Message):
+    await history(message)
 
 @dp.message_handler(commands=['add_recurring'])
 async def add_recurring_start(message: types.Message):
-    await message.reply("Введите сумму:")
+    await message.reply("🔄 Добавь регулярную трату (авто-добавляется в указанный день месяца).\nВведи сумму:")
     await RecurringState.amount.set()
 
 @dp.message_handler(state=RecurringState.amount)
 async def recurring_amount(message: types.Message, state: FSMContext):
     try:
-        amount = float(message.text.replace(' ', ''))
+        amount = float(message.text.replace(' ', '').replace(',', '.'))
+        if amount <= 0:
+            raise ValueError()
         await state.update_data(amount=amount)
         keyboard = InlineKeyboardMarkup(row_width=2)
         for cat in ALL_CATEGORIES:
-            keyboard.add(InlineKeyboardButton(cat, callback_data=f"rec_cat_{cat}"))
-        await message.reply("Выберите категорию:", reply_markup=keyboard)
+            keyboard.add(InlineKeyboardButton(cat, callback_data=f"rec_cat_{cat.replace(' ', '_')}"))
+        keyboard.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_rec"))
+        await message.reply("Выбери категорию:", reply_markup=keyboard)
         await RecurringState.category.set()
     except ValueError:
-        await message.reply("Неверный формат.")
+        await message.reply("❌ Неверный формат суммы.")
 
 @dp.callback_query_handler(lambda c: c.data.startswith('rec_cat_'), state=RecurringState.category)
 async def recurring_category(callback: CallbackQuery, state: FSMContext):
-    category = callback.data.split('_')[2]
+    if callback.data == 'cancel_rec':
+        await state.finish()
+        await callback.message.edit_text("❌ Добавление отменено.")
+        return
+    category = callback.data.replace('rec_cat_', '').replace('_', ' ')
     await state.update_data(category=category)
     await bot.answer_callback_query(callback.id)
-    await bot.send_message(callback.from_user.id, "Введите день месяца (1-31):")
+    await callback.message.edit_text("📅 Введи день месяца (1–31):")
     await RecurringState.day.set()
 
 @dp.message_handler(state=RecurringState.day)
@@ -386,44 +466,48 @@ async def recurring_day(message: types.Message, state: FSMContext):
     try:
         day = int(message.text)
         if not 1 <= day <= 31:
-            raise ValueError
+            raise ValueError()
         data = await state.get_data()
         add_recurring(message.from_user.id, data['amount'], data['category'], day)
-        await message.reply("Регулярная трата добавлена.")
+        await message.reply(f"✅ Регулярная трата добавлена: {data['amount']:,.0f} ₽ '{data['category']}' в {day} число.")
         await state.finish()
     except ValueError:
-        await message.reply("Неверный день.")
+        await message.reply("❌ День должен быть от 1 до 31.")
 
 @dp.message_handler(commands=['toggle_notifications'])
 async def toggle_notif(message: types.Message):
     new = toggle_notifications(message.from_user.id)
-    await message.reply(f"Уведомления {'включены' if new else 'выключены'}.")
+    status = "включены" if new else "выключены"
+    await message.reply(f"🔔 Напоминания {status}.")
 
 @dp.message_handler(commands=['report'])
 async def report(message: types.Message):
-    args = message.text.split()
-    if len(args) < 2:
-        await message.reply("Использование: /report week или /report month")
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2 or args[1] not in ['week', 'month']:
+        await message.reply("❌ Использование: /report week или /report month")
         return
     period = args[1]
     text = format_report(message.from_user.id, period)
     await message.reply(text)
-
-# Start scheduler
-scheduler.start()
 
 # Webhook setup for Render
 async def on_startup(dp):
     webhook_url = os.environ.get('WEBHOOK_URL')
     if webhook_url:
         await bot.set_webhook(webhook_url)
+        logger.info("Webhook set up successfully")
+    scheduler.start()  # Ensure scheduler starts on deploy
+
+async def on_shutdown(dp):
+    scheduler.shutdown()
 
 if __name__ == '__main__':
     executor.start_webhook(
         dispatcher=dp,
-        webhook_path='/',
+        webhook_path='/webhook',  # Changed to /webhook for clarity
         on_startup=on_startup,
+        on_shutdown=on_shutdown,
         skip_updates=True,
         host='0.0.0.0',
-        port=int(os.environ.get('PORT', 8000))
+        port=int(os.environ.get('PORT', 10000))  # Render uses PORT env
     )
