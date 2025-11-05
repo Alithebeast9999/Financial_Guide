@@ -276,9 +276,8 @@ async def on_startup(dp):
     if not webhook_url:
         logger.error("WEBHOOK_URL не установлен!")
         return
-    # Убираем слэш в конце, если есть
     webhook_url = webhook_url.rstrip("/")
-    full_webhook = f"{webhook_url}/"
+    full_webhook = f"{webhook_url}/webhook"
     await bot.set_webhook(full_webhook)
     logger.info(f"Webhook установлен: {full_webhook}")
 
@@ -289,7 +288,7 @@ async def on_shutdown(dp):
 if __name__ == '__main__':
     executor.start_webhook(
         dispatcher=dp,
-        webhook_path='/',  # Telegram шлёт POST на /
+        webhook_path='/webhook',  # ← ТОЧНЫЙ ПУТЬ
         on_startup=on_startup,
         on_shutdown=on_shutdown,
         skip_updates=True,
