@@ -272,21 +272,27 @@ async def help_cmd(msg: types.Message):
 
 # === ЗАПУСК ===
 async def on_startup(dp):
-    if WEBHOOK_URL:
-        await bot.set_webhook(WEBHOOK_URL)
-        logger.info(f"Webhook: {WEBHOOK_URL}")
-    scheduler.start()
+    webhook_url = os.environ.get('WEBHOOK_URL')
+    if not webhook_url:
+        logger.error("WEBHOOK_URL не установлен!")
+        return
+    # Убираем слэш в конце, если есть
+    webhook_url = webhook_url.rstrip("/")
+    full_webhook = f"{webhook_url}/"
+    await bot.set_webhook(full_webhook)
+    logger.info(f"Webhook установлен: {full_webhook}")
+
+async def on_shutdown(dp):
+    await bot.delete_webhook()
+    scheduler.shutdown()
 
 if __name__ == '__main__':
-    if WEBHOOK_URL:
-        executor.start_webhook(
-            dispatcher=dp,
-            webhook_path='/',
-            on_startup=on_startup,
-            skip_updates=True,
-            host='0.0.0.0',
-            port=int(os.environ.get('PORT', 10000))
-        )
-    else:
-        # Для локального теста
-        executor.start_polling(dp, skip_updates=True)
+    executor.start_webhook(
+        dispatcher=dp,
+        webhook_path='/',  # Telegram шлёт POST на /
+        on_startup=on_startup,
+        on_shutdown=on_shutdown,
+        skip_updates=True,
+        host='0.0.0.1',
+        port=int(os.environ.get('PORT', 10000))
+    )
