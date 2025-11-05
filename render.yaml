@@ -1,14 +1,15 @@
 services:
   - type: web
-    name: financial-guide-bot
+    name: finance-assistant-bot
     env: python
-    buildCommand: pip install -r requirements.txt
+    region: moscow  # Можно изменить на ближайший к тебе регион
+    plan: free
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
     startCommand: python main.py
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.9  # <-- КРИТИЧНО: Python 3.11
       - key: BOT_TOKEN
         sync: false
       - key: WEBHOOK_URL
-        generateValue: true
-    autoDeploy: true
+        value: https://finance-assistant-bot.onrender.com
