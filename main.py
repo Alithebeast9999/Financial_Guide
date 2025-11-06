@@ -4,8 +4,9 @@ Stable Telegram Finance Assistant (main.py)
 - aiohttp web server with / and /webhook
 - safe webhook handling via asyncio.Queue + background worker
 - keep-alive background task to keep event loop alive on Render free tier
+- fallback to long polling if webhook cannot be set
+- /debug and /set_webhook endpoints for diagnostics and manual control
 - proper graceful shutdown: close bot.session, bot.close(), scheduler, storage, DB
-- handlers: start -> income -> table, add expense, history, recurring, reports, notify
 """
 
 import os
@@ -14,7 +15,7 @@ import sqlite3
 from datetime import datetime, timedelta
 import pytz
 import asyncio
-from aiohttp import web
+from aiohttp import web, ClientError
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -36,6 +37,8 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # e.g. https://financial-guide.onrender.com
 PORT = int(os.environ.get("PORT", 10000))
 TZ = pytz.timezone("Europe/Moscow")
+# Optionally force polling instead of webhook (useful for debugging)
+FORCE_POLLING = os.environ.get("FORCE_POLLING", "0") == "1"
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не установлен!")
@@ -479,6 +482,55 @@ async def keep_alive():
         logger.info("Keep-alive cancelled")
         raise
 
+# debugging endpoint: returns webhook info + status
+async def handle_debug(request: web.Request):
+    info = {"ok": True}
+    try:
+        wh = await bot.get_webhook_info()
+        # convert to serializable form:
+        info["webhook"] = {
+            "url": getattr(wh, "url", None),
+            "has_custom_certificate": getattr(wh, "has_custom_certificate", None),
+            "pending_update_count": getattr(wh, "pending_update_count", None),
+            "last_error_date": getattr(wh, "last_error_date", None),
+            "last_error_message": getattr(wh, "last_error_message", None),
+        }
+    except Exception as e:
+        info["webhook_error"] = str(e)
+    info["queue_size"] = _updates_queue.qsize() if _updates_queue else None
+    info["worker_running"] = _worker_task is not None and not _worker_task.done()
+    info["scheduler_running"] = scheduler.running
+    info["using_polling"] = bool(request.app.get("polling_task"))
+    return web.json_response(info)
+
+# manual set webhook endpoint (POST optional)
+async def handle_set_webhook(request: web.Request):
+    if not WEBHOOK_URL:
+        return web.json_response({"ok": False, "error": "WEBHOOK_URL not configured in env"})
+    webhook = WEBHOOK_URL.rstrip("/") + "/webhook"
+    try:
+        await bot.set_webhook(webhook)
+        wh = await bot.get_webhook_info()
+        return web.json_response({"ok": True, "webhook": getattr(wh, "url", None)})
+    except Exception as e:
+        logger.exception("set_webhook failed via endpoint")
+        return web.json_response({"ok": False, "error": str(e)})
+
+# Polling helper (fallback)
+async def start_polling_background(app: web.Application):
+    """
+    Start long polling in background. We use a task stored in app['polling_task'].
+    """
+    logger.info("Starting long polling (fallback)")
+    try:
+        # dp.start_polling is a coroutine in aiogram v2
+        await dp.start_polling()
+    except asyncio.CancelledError:
+        logger.info("Polling task cancelled")
+        raise
+    except Exception:
+        logger.exception("Exception in polling")
+
 async def on_startup_app(app: web.Application):
     global _updates_queue, _worker_task
     # prepare queue and worker
@@ -495,14 +547,26 @@ async def on_startup_app(app: web.Application):
     except Exception:
         logger.exception("Failed to start scheduler")
 
-    # set webhook at Telegram
-    if WEBHOOK_URL:
+    # Try to set webhook unless forced polling
+    if not FORCE_POLLING and WEBHOOK_URL:
         webhook = WEBHOOK_URL.rstrip("/") + "/webhook"
         try:
             await bot.set_webhook(webhook)
             logger.info(f"Webhook установлен: {webhook}")
-        except Exception:
-            logger.exception("Не удалось установить webhook (on_startup)")
+            # check webhook info:
+            try:
+                wh = await bot.get_webhook_info()
+                logger.info(f"Webhook info: url={getattr(wh,'url',None)} pending={getattr(wh,'pending_update_count',None)} last_err={getattr(wh,'last_error_message',None)}")
+            except Exception:
+                logger.exception("Failed to get webhook info after set_webhook")
+        except Exception as e:
+            logger.exception("set_webhook failed on startup, falling back to polling")
+            # start polling as fallback
+            app['polling_task'] = asyncio.create_task(start_polling_background(app))
+    else:
+        # Force polling mode (no webhook)
+        logger.info("FORCE_POLLING enabled or WEBHOOK_URL not set — starting polling")
+        app['polling_task'] = asyncio.create_task(start_polling_background(app))
 
 async def on_cleanup_app(app: web.Application):
     global _updates_queue, _worker_task
@@ -536,7 +600,23 @@ async def on_cleanup_app(app: web.Application):
             logger.exception("Error while waiting queue join")
     _updates_queue = None
 
-    # remove webhook
+    # If polling was started as fallback — stop it
+    polling_task = app.get('polling_task')
+    if polling_task:
+        # attempt to stop dispatcher polling nicely
+        try:
+            await dp.stop_polling()
+        except Exception:
+            logger.debug("dp.stop_polling() failed or not available")
+        polling_task.cancel()
+        try:
+            await polling_task
+        except asyncio.CancelledError:
+            logger.info("Polling cancelled")
+        except Exception:
+            logger.exception("Error while cancelling polling task")
+
+    # remove webhook (best effort)
     try:
         await bot.delete_webhook()
         logger.info("Webhook deleted on cleanup")
@@ -559,7 +639,6 @@ async def on_cleanup_app(app: web.Application):
         logger.debug("Storage close failed")
 
     # ensure bot.session closed (explicit) then bot.close() to be safe
-    # some aiogram versions keep an internal aiohttp.ClientSession; close it explicitly if present
     try:
         sess = getattr(bot, "session", None)
         if sess:
@@ -590,6 +669,8 @@ def create_app():
     app = web.Application()
     app.router.add_get('/', handle_root)
     app.router.add_post('/webhook', handle_webhook)
+    app.router.add_get('/debug', handle_debug)        # diagnostic endpoint
+    app.router.add_post('/set_webhook', handle_set_webhook)  # manual webhook setter
     app.on_startup.append(on_startup_app)
     app.on_cleanup.append(on_cleanup_app)
     return app
