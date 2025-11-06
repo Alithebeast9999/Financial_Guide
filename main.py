@@ -3,7 +3,8 @@
 Stable Telegram Finance Assistant (main.py)
 - aiohttp web server with / and /webhook
 - safe webhook handling via asyncio.Queue + background worker
-- proper graceful shutdown: close bot (aiohttp session), scheduler, storage, DB
+- keep-alive background task to keep event loop alive on Render free tier
+- proper graceful shutdown: close bot.session, bot.close(), scheduler, storage, DB
 - handlers: start -> income -> table, add expense, history, recurring, reports, notify
 """
 
@@ -467,17 +468,34 @@ async def handle_webhook(request: web.Request):
 async def handle_root(request: web.Request):
     return web.Response(text="OK")
 
+# Keep-alive task to keep event loop busy so Render doesn't "close" app on free tier
+async def keep_alive():
+    logger.info("Keep-alive task started")
+    try:
+        while True:
+            await asyncio.sleep(60)
+            logger.debug("keep-alive tick")
+    except asyncio.CancelledError:
+        logger.info("Keep-alive cancelled")
+        raise
+
 async def on_startup_app(app: web.Application):
     global _updates_queue, _worker_task
+    # prepare queue and worker
     _updates_queue = asyncio.Queue(maxsize=1000)
     _worker_task = asyncio.create_task(webhook_worker())
 
+    # start keep-alive and store task in app for cleanup
+    app['keep_alive_task'] = asyncio.create_task(keep_alive())
+
+    # start scheduler
     try:
         scheduler.start()
         logger.info("Scheduler started")
     except Exception:
         logger.exception("Failed to start scheduler")
 
+    # set webhook at Telegram
     if WEBHOOK_URL:
         webhook = WEBHOOK_URL.rstrip("/") + "/webhook"
         try:
@@ -488,6 +506,16 @@ async def on_startup_app(app: web.Application):
 
 async def on_cleanup_app(app: web.Application):
     global _updates_queue, _worker_task
+
+    # cancel keep-alive first
+    keep_task = app.get('keep_alive_task')
+    if keep_task:
+        keep_task.cancel()
+        try:
+            await keep_task
+        except asyncio.CancelledError:
+            logger.info("Keep-alive stopped")
+
     # cancel worker
     if _worker_task:
         _worker_task.cancel()
@@ -530,7 +558,19 @@ async def on_cleanup_app(app: web.Application):
     except Exception:
         logger.debug("Storage close failed")
 
-    # close bot (and underlying aiohttp session) — prevents "Unclosed client session"
+    # ensure bot.session closed (explicit) then bot.close() to be safe
+    # some aiogram versions keep an internal aiohttp.ClientSession; close it explicitly if present
+    try:
+        sess = getattr(bot, "session", None)
+        if sess:
+            try:
+                await sess.close()
+                logger.info("bot.session closed explicitly")
+            except Exception:
+                logger.exception("Error while closing bot.session")
+    except Exception:
+        logger.debug("Could not check bot.session attribute")
+
     try:
         await bot.close()
         logger.info("Bot closed (client session closed)")
