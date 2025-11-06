@@ -193,61 +193,120 @@ scheduler.add_job(process_recurring, CronTrigger(hour=6, minute=0))
 
 # === WEBHOOK / AIOHTTP APP ===
 
-async def handle_root(request):
-    return web.Response(text="OK")
+# === NEW: Safe webhook handling with queue + background worker ===
+import asyncio
+from aiogram.types import Update as TgUpdate
 
-async def handle_webhook(request):
-    """
-    Обработчик входящих POST от Telegram.
-    Конвертируем JSON в aiogram.types.Update и передаём в Dispatcher.
-    Всегда возвращаем 200 (Telegram получит подтверждение).
-    """
+# global queue for incoming updates
+_updates_queue: "asyncio.Queue[TgUpdate]" = None
+_worker_task: asyncio.Task = None
+
+async def webhook_worker():
+    """Background worker: берёт апдейты из очереди и обрабатывает через dp.process_update."""
+    logger.info("Webhook worker started")
+    while True:
+        try:
+            update = await _updates_queue.get()
+            try:
+                # process update inside try/except so exceptions won't kill the worker
+                await dp.process_update(update)
+            except Exception:
+                logger.exception("Error while processing update (worker)")
+            finally:
+                _updates_queue.task_done()
+        except asyncio.CancelledError:
+            logger.info("Webhook worker cancelled")
+            break
+        except Exception:
+            logger.exception("Unexpected exception in webhook worker; continuing")
+
+async def handle_webhook(request: web.Request):
+    """AIOHTTP POST handler for Telegram webhook — push update to queue and return 200 quickly."""
     try:
-        json_data = await request.json()
-    except Exception as e:
-        logger.exception("Webhook: invalid json")
+        data = await request.json()
+    except Exception:
+        logger.exception("Webhook: invalid JSON")
         return web.Response(status=400, text="invalid json")
 
     try:
-        update = TgUpdate.to_object(json_data)
-        await dp.process_update(update)
-    except Exception as e:
-        # логируем, но возвращаем 200 — чтобы Telegram не переотправлял бесконечно
-        logger.exception("Exception while processing update")
-        # всё равно возвращаем 200, чтобы Telegram не накапливал очередь
-        return web.Response(status=200, text="OK")
+        update = TgUpdate.to_object(data)
+    except Exception:
+        logger.exception("Webhook: can't parse update to aiogram Update")
+        return web.Response(status=400, text="invalid update")
+
+    # put update into queue (do not await processing here)
+    try:
+        _updates_queue.put_nowait(update)
+    except asyncio.QueueFull:
+        # queue full -> log and still return 200 to avoid Telegram retry storm
+        logger.warning("Updates queue is full — dropping update")
+    except Exception:
+        logger.exception("Failed to enqueue update")
+
+    # quick response to Telegram
     return web.Response(status=200, text="OK")
 
-async def on_startup_app(app):
-    # старт планировщика
+async def handle_root(request: web.Request):
+    return web.Response(text="OK")
+
+async def on_startup_app(app: web.Application):
+    global _updates_queue, _worker_task
+    # prepare queue and start worker
+    _updates_queue = asyncio.Queue(maxsize=1000)
+    _worker_task = asyncio.create_task(webhook_worker())
+
+    # start scheduler
     try:
         scheduler.start()
+        logger.info("Scheduler started")
     except Exception:
-        logger.exception("Scheduler start failed")
-    # set webhook for telegram
+        logger.exception("Failed to start scheduler")
+
+    # set webhook URL at Telegram (best effort)
     if WEBHOOK_URL:
         webhook = WEBHOOK_URL.rstrip("/") + "/webhook"
         try:
             await bot.set_webhook(webhook)
             logger.info(f"Webhook установлен: {webhook}")
         except Exception:
-            logger.exception("Не удалось установить webhook")
+            logger.exception("Не удалось установить webhook (on_startup)")
 
-async def on_cleanup_app(app):
-    # graceful shutdown
+async def on_cleanup_app(app: web.Application):
+    global _updates_queue, _worker_task
+    # cancel worker gracefully
+    if _worker_task:
+        _worker_task.cancel()
+        try:
+            await _worker_task
+        except asyncio.CancelledError:
+            logger.info("Worker cancelled successfully")
+        except Exception:
+            logger.exception("Exception when cancelling worker")
+
+    # ensure queue drained (optional) - not waiting here to speed up shutdown
+    _updates_queue = None
+
+    # delete webhook
     try:
         await bot.delete_webhook()
+        logger.info("Webhook deleted on cleanup")
     except Exception:
         logger.debug("Could not delete webhook on cleanup")
+
+    # shutdown scheduler
     try:
         scheduler.shutdown(wait=False)
+        logger.info("Scheduler shutdown")
     except Exception:
         logger.debug("Scheduler shutdown failed")
+
+    # close FSM storage
     try:
         await dp.storage.close()
         await dp.storage.wait_closed()
     except Exception:
         logger.debug("Storage close failed")
+
     logger.info("Cleanup complete")
 
 def create_app():
@@ -258,7 +317,7 @@ def create_app():
     app.on_cleanup.append(on_cleanup_app)
     return app
 
+# Run app (at bottom of file)
 if __name__ == '__main__':
     app = create_app()
-    # Запускаем aiohttp сервер (Render ожидает HTTP-сервис).
     web.run_app(app, host='0.0.0.0', port=PORT)
