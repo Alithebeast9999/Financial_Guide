@@ -7,6 +7,10 @@ Stable Telegram Finance Assistant (main.py)
 - fallback to long polling if webhook cannot be set
 - /debug and /set_webhook endpoints for diagnostics and manual control
 - proper graceful shutdown: close bot.session, bot.close(), scheduler, storage, DB
+
+This version includes explicit Bot.set_current(bot) calls to ensure aiogram
+handlers can access the current Bot instance when processing updates from
+webhook_worker and when starting long polling.
 """
 
 import os
@@ -15,7 +19,7 @@ import sqlite3
 from datetime import datetime, timedelta
 import pytz
 import asyncio
-from aiohttp import web, ClientError
+from aiohttp import web
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -434,9 +438,22 @@ _worker_task: asyncio.Task = None
 
 async def webhook_worker():
     logger.info("Webhook worker started")
+    # Ensure current bot is set for this worker context
+    try:
+        Bot.set_current(bot)
+        logger.debug("Bot.set_current set in worker")
+    except Exception:
+        logger.debug("Bot.set_current failed on worker startup", exc_info=True)
+
     while True:
         try:
             update = await _updates_queue.get()
+            # make sure bot is available in context before processing each update
+            try:
+                Bot.set_current(bot)
+            except Exception:
+                logger.debug("Bot.set_current failed before processing update", exc_info=True)
+
             try:
                 await dp.process_update(update)
             except Exception:
@@ -471,7 +488,7 @@ async def handle_webhook(request: web.Request):
 async def handle_root(request: web.Request):
     return web.Response(text="OK")
 
-# Keep-alive task to keep event loop busy so Render doesn't "close" app on free tier
+# Keep-alive task to keep event loop busy so Render doesn't "close" app on Free plan
 async def keep_alive():
     logger.info("Keep-alive task started")
     try:
@@ -487,7 +504,6 @@ async def handle_debug(request: web.Request):
     info = {"ok": True}
     try:
         wh = await bot.get_webhook_info()
-        # convert to serializable form:
         info["webhook"] = {
             "url": getattr(wh, "url", None),
             "has_custom_certificate": getattr(wh, "has_custom_certificate", None),
@@ -518,12 +534,12 @@ async def handle_set_webhook(request: web.Request):
 
 # Polling helper (fallback)
 async def start_polling_background(app: web.Application):
-    """
-    Start long polling in background. We use a task stored in app['polling_task'].
-    """
     logger.info("Starting long polling (fallback)")
     try:
-        # dp.start_polling is a coroutine in aiogram v2
+        Bot.set_current(bot)
+    except Exception:
+        logger.debug("Bot.set_current failed before polling", exc_info=True)
+    try:
         await dp.start_polling()
     except asyncio.CancelledError:
         logger.info("Polling task cancelled")
@@ -533,6 +549,14 @@ async def start_polling_background(app: web.Application):
 
 async def on_startup_app(app: web.Application):
     global _updates_queue, _worker_task
+
+    # Ensure Bot is set current in startup context
+    try:
+        Bot.set_current(bot)
+        logger.info("Bot.set_current set on startup")
+    except Exception:
+        logger.debug("Bot.set_current failed on startup", exc_info=True)
+
     # prepare queue and worker
     _updates_queue = asyncio.Queue(maxsize=1000)
     _worker_task = asyncio.create_task(webhook_worker())
@@ -553,7 +577,6 @@ async def on_startup_app(app: web.Application):
         try:
             await bot.set_webhook(webhook)
             logger.info(f"Webhook установлен: {webhook}")
-            # check webhook info:
             try:
                 wh = await bot.get_webhook_info()
                 logger.info(f"Webhook info: url={getattr(wh,'url',None)} pending={getattr(wh,'pending_update_count',None)} last_err={getattr(wh,'last_error_message',None)}")
@@ -561,10 +584,8 @@ async def on_startup_app(app: web.Application):
                 logger.exception("Failed to get webhook info after set_webhook")
         except Exception as e:
             logger.exception("set_webhook failed on startup, falling back to polling")
-            # start polling as fallback
             app['polling_task'] = asyncio.create_task(start_polling_background(app))
     else:
-        # Force polling mode (no webhook)
         logger.info("FORCE_POLLING enabled or WEBHOOK_URL not set — starting polling")
         app['polling_task'] = asyncio.create_task(start_polling_background(app))
 
@@ -603,7 +624,6 @@ async def on_cleanup_app(app: web.Application):
     # If polling was started as fallback — stop it
     polling_task = app.get('polling_task')
     if polling_task:
-        # attempt to stop dispatcher polling nicely
         try:
             await dp.stop_polling()
         except Exception:
