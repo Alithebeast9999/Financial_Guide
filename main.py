@@ -2,8 +2,8 @@
 """
 Resilient Telegram Finance Assistant — webhook queue + optional resilient polling.
 Key env flags:
- - KEEP_BOT_ALIVE=1  -> при cleanup НЕ закрываем bot.session / bot.close() (поведение "не закрывать никогда")
- - FORCE_POLLING=1   -> форсировать polling (не ставить webhook)
+ - KEEP_BOT_ALIVE=1 -> при cleanup НЕ закрываем bot.session / bot.close() (поведение "не закрывать никогда")
+ - FORCE_POLLING=1 -> форсировать polling (не ставить webhook)
 """
 import os
 import logging
@@ -12,10 +12,8 @@ import asyncio
 from datetime import datetime, timedelta
 import pytz
 from aiohttp import web
-
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-
 from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
@@ -23,26 +21,21 @@ from aiogram.dispatcher.filters import Text
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.types import Update as TgUpdate
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-
 # ========== Config ===========
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # e.g. https://financial-guide.onrender.com
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL") # e.g. https://financial-guide.onrender.com
 PORT = int(os.environ.get("PORT", 10000))
 TZ = pytz.timezone("Europe/Moscow")
 FORCE_POLLING = os.environ.get("FORCE_POLLING", "0") == "1"
-KEEP_BOT_ALIVE = os.environ.get("KEEP_BOT_ALIVE", "0") == "1"  # NEW: если true -> не закрываем бот в cleanup
-
+KEEP_BOT_ALIVE = os.environ.get("KEEP_BOT_ALIVE", "0") == "1" # NEW: если true -> не закрываем бот в cleanup
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN not set")
-
 # ========== Bot/Dispatcher =========
 bot = Bot(token=BOT_TOKEN, timeout=30, parse_mode=types.ParseMode.HTML)
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
-
 # ========== DB ============
 DB_FILE = "bot.db"
 conn = sqlite3.connect(DB_FILE, check_same_thread=False)
@@ -52,18 +45,15 @@ cursor.execute("""CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY,
 cursor.execute("""CREATE TABLE IF NOT EXISTS expenses (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount REAL, category TEXT, timestamp DATETIME, recurring_id INTEGER DEFAULT NULL)""")
 cursor.execute("""CREATE TABLE IF NOT EXISTS recurring (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount REAL, category TEXT, day INTEGER)""")
 conn.commit()
-
 # ========== (Handlers/logic omitted for brevity) ==========
 # For brevity assume your handlers (start, expense handling etc.) are exactly as before.
-# Keep same handlers placed here (copy from your working file). 
+# Keep same handlers placed here (copy from your working file).
 # -------------------------------------------------------------------------
 # (Put all dp.message_handler, dp.callback_query_handler etc. functions here.)
 # -------------------------------------------------------------------------
-
 # ========== WEBHOOK QUEUE & WORKER ==========
 _updates_queue = None
 _worker_task = None
-
 async def webhook_worker():
     logger.info("Webhook worker started")
     try:
@@ -88,7 +78,6 @@ async def webhook_worker():
             break
         except Exception:
             logger.exception("Unexpected exception in webhook worker; continuing")
-
 async def handle_webhook(request: web.Request):
     try:
         data = await request.json()
@@ -100,10 +89,8 @@ async def handle_webhook(request: web.Request):
     except asyncio.QueueFull:
         logger.warning("queue full - drop update")
     return web.Response(text="OK")
-
 async def handle_root(request: web.Request):
     return web.Response(text="OK")
-
 # ========== Resilient polling runner (background) ==========
 async def polling_runner(app):
     backoff = 1
@@ -126,24 +113,20 @@ async def polling_runner(app):
             logger.exception("Polling crashed, will retry")
             await asyncio.sleep(backoff)
             backoff = min(max_backoff, backoff * 2)
-
 # ========== Startup / Cleanup ==========
 scheduler = AsyncIOScheduler(timezone=TZ)
 # (add your scheduler jobs if any)
-
-# ... (rest of imports and config unchanged)
-
-# In on_startup_app, add delete_webhook before polling to prevent conflicts
 async def on_startup_app(app):
     global _updates_queue, _worker_task
     logger.info("on_startup_app: initializing")
     _updates_queue = asyncio.Queue(maxsize=2000)
     _worker_task = asyncio.create_task(webhook_worker())
-    app['keep_alive'] = asyncio.create_task(asyncio.sleep(3600*24))  # Optional, can remove
+    app['keep_alive'] = asyncio.create_task(asyncio.sleep(3600*24)) # dummy to keep loop busy (or use your keep-alive task)
     scheduler.start()
     logger.info("Scheduler started")
-    
+    # If we want persistent bot that should *not* be closed, prefer polling.
     if FORCE_POLLING or KEEP_BOT_ALIVE or not WEBHOOK_URL:
+        # Start resilient polling
         # Polling mode: Always delete webhook first to avoid 409 conflict
         try:
             await bot.delete_webhook(drop_pending_updates=True)  # Add this: Clears any existing webhook and pending updates
@@ -153,7 +136,7 @@ async def on_startup_app(app):
         app['polling_task'] = asyncio.create_task(polling_runner(app))
         logger.info("Polling mode enabled (background)")
     else:
-        # Webhook mode
+        # Attempt to set webhook normally
         try:
             await bot.set_webhook(WEBHOOK_URL.rstrip("/") + "/webhook")
             logger.info("Webhook set successfully")
@@ -166,14 +149,6 @@ async def on_startup_app(app):
             except Exception:
                 logger.exception("Failed to delete webhook during fallback")
             app['polling_task'] = asyncio.create_task(polling_runner(app))
-
-# ... (rest of code unchanged, including on_cleanup_app, which is fine)
-
-if __name__ == '__main__':
-    app = create_app()  # Still run the web app (for pinger/health checks)
-    logger.info(f"Starting web app on 0.0.0.0:{PORT} (FORCE_POLLING={FORCE_POLLING}, KEEP_BOT_ALIVE={KEEP_BOT_ALIVE})")
-    web.run_app(app, host='0.0.0.0', port=PORT)
-
 async def on_cleanup_app(app):
     global _updates_queue, _worker_task
     logger.info("on_cleanup: graceful shutdown")
@@ -201,7 +176,6 @@ async def on_cleanup_app(app):
         polling_task.cancel()
         try: await polling_task
         except: pass
-
     # IMPORTANT: do not delete webhook / close bot if KEEP_BOT_ALIVE is True
     if not KEEP_BOT_ALIVE:
         try:
@@ -209,7 +183,6 @@ async def on_cleanup_app(app):
             logger.info("Webhook deleted on cleanup")
         except Exception:
             logger.debug("Failed to delete webhook on cleanup")
-
     try:
         scheduler.shutdown(wait=False)
     except Exception:
@@ -218,7 +191,6 @@ async def on_cleanup_app(app):
         await dp.storage.close(); await dp.storage.wait_closed()
     except Exception:
         pass
-
     # close bot session & bot only if NOT KEEP_BOT_ALIVE
     if not KEEP_BOT_ALIVE:
         try:
@@ -242,13 +214,11 @@ async def on_cleanup_app(app):
             logger.exception('Error while closing bot')
     else:
         logger.info("KEEP_BOT_ALIVE is set -> skipping bot.close() and webhook deletion on cleanup")
-
     try:
         conn.close()
     except:
         pass
     logger.info("Cleanup complete")
-
 # ========== Debug endpoint ==========
 async def debug_handler(request: web.Request):
     info = {
@@ -265,7 +235,6 @@ async def debug_handler(request: web.Request):
     except Exception as e:
         info['telegram_webhook_error'] = str(e)
     return web.json_response(info)
-
 # ========== App creation ==========
 def create_app():
     app = web.Application()
@@ -275,7 +244,6 @@ def create_app():
     app.on_startup.append(on_startup_app)
     app.on_cleanup.append(on_cleanup_app)
     return app
-
 if __name__ == '__main__':
     app = create_app()
     logger.info(f"Starting web app on 0.0.0.0:{PORT} (FORCE_POLLING={FORCE_POLLING}, KEEP_BOT_ALIVE={KEEP_BOT_ALIVE})")
