@@ -157,7 +157,12 @@ async def on_shutdown(dp):
 
 # === ЗАПУСК ===
 if __name__ == "__main__":
-    asyncio.run(init_db())
+    # Создаем и назначаем event loop вручную — важно для Python 3.11+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    loop.run_until_complete(init_db())
+
     start_webhook(
         dispatcher=dp,
         webhook_path=WEBHOOK_PATH,
