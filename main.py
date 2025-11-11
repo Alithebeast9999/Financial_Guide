@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 """
 Resilient Telegram Finance Assistant (main.py)
-- aiohttp web server with / and /webhook
-- safe webhook handling via asyncio.Queue + background worker
-- optional resilient polling fallback
-- KEEP_BOT_ALIVE option to avoid closing bot/session on cleanup
-- scheduler jobs for reminders and recurring expenses
-- debug and set_webhook endpoints
-
-This file is intended to be dropped into your repo as `main.py`.
-Make sure environment variables are set: BOT_TOKEN, WEBHOOK_URL (optional), PORT (optional), FORCE_POLLING (optional), KEEP_BOT_ALIVE (optional)
+Integrated: webhook queue + worker, resilient polling fallback, KEEP_BOT_ALIVE option,
+scheduler jobs created on startup, debug & admin endpoints.
+Environment variables:
+ - BOT_TOKEN (required)
+ - WEBHOOK_URL (optional)
+ - PORT (optional, default 10000)
+ - FORCE_POLLING (optional, "1" to force polling)
+ - KEEP_BOT_ALIVE (optional, default "1" -> True, set to "0" to close bot on cleanup)
 """
-
 import os
 import logging
 import sqlite3
@@ -31,6 +29,7 @@ from aiogram.dispatcher.filters import Text
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.types import Update as TgUpdate
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils.exceptions import TerminatedByOtherGetUpdates
 
 # ---------------- Config ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -64,8 +63,8 @@ cursor.execute("""CREATE TABLE IF NOT EXISTS expenses (id INTEGER PRIMARY KEY AU
 cursor.execute("""CREATE TABLE IF NOT EXISTS recurring (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount REAL, category TEXT, day INTEGER)""")
 conn.commit()
 
-# small DB lock to avoid concurrent writes
-db_lock = asyncio.Lock()
+# db_lock will be created on startup (bound to running loop)
+db_lock = None  # type: asyncio.Lock | None
 
 # ---------------- Categories & states -------------
 CATEGORIES = {
@@ -89,21 +88,23 @@ class RecurringState(StatesGroup):
 
 # ---------------- Helpers & DB access ------------
 async def ensure_user(uid: int):
+    global db_lock
+    if db_lock is None:
+        # safety: create local lock if missing
+        db_lock = asyncio.Lock()
     async with db_lock:
         cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (uid,))
         conn.commit()
-
 
 def get_income(uid: int) -> float:
     cursor.execute("SELECT income FROM users WHERE user_id = ?", (uid,))
     r = cursor.fetchone()
     return float(r["income"]) if r and r["income"] is not None else 0.0
 
-
 def set_income(uid: int, v: float):
+    # lightweight write; used rarely
     cursor.execute("INSERT OR REPLACE INTO users (user_id, income) VALUES (?, ?)", (uid, v))
     conn.commit()
-
 
 def format_amount(x):
     try:
@@ -111,28 +112,26 @@ def format_amount(x):
     except Exception:
         return str(x)
 
-
 def get_limits_from_income(income: float):
     return {cat: income * pct for group in CATEGORIES.values() for cat, pct in group.items()}
 
-
 async def add_expense(uid, amount, category, ts=None, rec_id=None):
     ts = ts or datetime.now(TZ)
+    global db_lock
+    if db_lock is None:
+        db_lock = asyncio.Lock()
     async with db_lock:
         cursor.execute("INSERT INTO expenses (user_id, amount, category, timestamp, recurring_id) VALUES (?, ?, ?, ?, ?)",
                        (uid, amount, category, ts.isoformat(), rec_id))
         conn.commit()
 
-
 def get_expenses(uid, limit=10):
     cursor.execute("SELECT id, amount, category, timestamp FROM expenses WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?", (uid, limit))
     return cursor.fetchall()
 
-
 def delete_expense(eid):
     cursor.execute("DELETE FROM expenses WHERE id = ?", (eid,))
     conn.commit()
-
 
 def check_limits(uid, category, amount):
     limits = get_limits_from_income(get_income(uid))
@@ -154,7 +153,6 @@ def check_limits(uid, category, amount):
         msgs.append(f"⚠️ Ты израсходовал более 90% лимита по '{category}'!")
     return msgs
 
-
 def format_stats(uid: int) -> str:
     income = get_income(uid)
     limits = get_limits_from_income(income)
@@ -175,9 +173,22 @@ def format_stats(uid: int) -> str:
         text += "\n"
     return text
 
-# ---------------- Scheduler ----------------
+# ---------------- Scheduler (create but do NOT add jobs here) ----------------
 scheduler = AsyncIOScheduler(timezone=TZ)
+def _add_scheduler_jobs_once():
+    """Add scheduled jobs. Called on startup to avoid 'tentative' messages at import time."""
+    try:
+        # Prevent duplicate IDs if accidentally called twice
+        if not scheduler.get_job("daily_reminders"):
+            scheduler.add_job(daily_reminders, CronTrigger(hour=9, minute=0), id="daily_reminders")
+        if not scheduler.get_job("weekly_report"):
+            scheduler.add_job(weekly_report, CronTrigger(day_of_week='mon', hour=9, minute=0), id="weekly_report")
+        if not scheduler.get_job("process_recurring"):
+            scheduler.add_job(process_recurring, CronTrigger(hour=6, minute=0), id="process_recurring")
+    except Exception:
+        logger.exception("Failed to add scheduler jobs")
 
+# scheduled job implementations (referenced above)
 async def daily_reminders():
     cursor.execute("SELECT user_id FROM users WHERE notifications = 1")
     for (uid,) in cursor.fetchall():
@@ -205,18 +216,12 @@ async def process_recurring():
         except Exception:
             pass
 
-scheduler.add_job(daily_reminders, CronTrigger(hour=9, minute=0))
-scheduler.add_job(weekly_report, CronTrigger(day_of_week='mon', hour=9, minute=0))
-scheduler.add_job(process_recurring, CronTrigger(hour=6, minute=0))
-
 # ---------------- UI helpers ----------------
-
 def get_main_keyboard():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.add("➕ Добавить трату", "📜 История")
     kb.add("📊 Моя статистика", "ℹ️ Помощь")
     return kb
-
 
 def build_limits_table_html(income: float) -> str:
     limits = get_limits_from_income(income)
@@ -225,7 +230,7 @@ def build_limits_table_html(income: float) -> str:
     lines.append("")
     lines.append("Рекомендуемые лимиты (процент / сумма):")
     lines.append("")
-    max_cat_len = max(len(cat) for cat in limits.keys())
+    max_cat_len = max(len(cat) for cat in limits.keys()) if limits else 0
     for group, cats in CATEGORIES.items():
         lines.append(f"{group}:")
         for cat, pct in cats.items():
@@ -252,7 +257,6 @@ async def start(msg: types.Message):
     )
     await msg.reply(welcome)
 
-
 @dp.message_handler(state=IncomeState.income)
 async def set_income_handler(msg: types.Message, state: FSMContext):
     try:
@@ -274,12 +278,10 @@ async def set_income_handler(msg: types.Message, state: FSMContext):
     kb = get_main_keyboard()
     await msg.reply(full_msg, reply_markup=kb)
 
-
 @dp.message_handler(Text(equals="➕ Добавить трату"))
 async def add_expense_cmd(msg: types.Message):
     await msg.reply("💸 Введи сумму траты:")
     await ExpenseState.amount.set()
-
 
 @dp.message_handler(state=ExpenseState.amount)
 async def expense_amount(msg: types.Message, state: FSMContext):
@@ -294,7 +296,6 @@ async def expense_amount(msg: types.Message, state: FSMContext):
     except Exception:
         await msg.reply("❌ Неверная сумма")
 
-
 @dp.callback_query_handler(lambda c: c.data.startswith('cat_'), state=ExpenseState.category)
 async def expense_category(cb: types.CallbackQuery, state: FSMContext):
     cat = cb.data[4:]
@@ -306,12 +307,10 @@ async def expense_category(cb: types.CallbackQuery, state: FSMContext):
     try:
         await cb.message.edit_text(f"✅ Добавлено: {format_amount(amount)} ₽ — {cat}")
     except Exception:
-        # if editing fails, answer normally
         await bot.send_message(uid, f"✅ Добавлено: {format_amount(amount)} ₽ — {cat}")
     if warnings:
         await bot.send_message(uid, "\n".join(warnings))
     await state.finish()
-
 
 @dp.message_handler(Text(equals="📜 История"))
 async def history(msg: types.Message):
@@ -328,7 +327,6 @@ async def history(msg: types.Message):
         kb = InlineKeyboardMarkup().add(InlineKeyboardButton("❌ Удалить", callback_data=f"del_{e['id']}"))
         await msg.reply(f"{dt} | {e['amount']:,.0f} ₽ | {e['category']}", reply_markup=kb)
 
-
 @dp.callback_query_handler(lambda c: c.data.startswith('del_'))
 async def delete_expense_cb(cb: types.CallbackQuery):
     eid = int(cb.data[4:])
@@ -339,11 +337,9 @@ async def delete_expense_cb(cb: types.CallbackQuery):
     except Exception:
         pass
 
-
 @dp.message_handler(Text(equals="📊 Моя статистика"))
 async def stats(msg: types.Message):
     await msg.reply(format_stats(msg.from_user.id))
-
 
 @dp.message_handler(Text(equals="ℹ️ Помощь"))
 async def help_cmd(msg: types.Message):
@@ -353,7 +349,6 @@ async def help_cmd(msg: types.Message):
         "/add_recurring — добавить регулярный расход\n"
         "/notify — включить/выключить уведомления\n"
     )
-
 
 @dp.message_handler(commands=['notify'])
 async def toggle_notify(msg: types.Message):
@@ -366,12 +361,10 @@ async def toggle_notify(msg: types.Message):
     conn.commit()
     await msg.reply("🔔 Уведомления включены" if new_val else "🔕 Уведомления отключены")
 
-
 @dp.message_handler(commands=['add_recurring'])
 async def add_recurring(msg: types.Message):
     await msg.reply("Введи сумму регулярного расхода:")
     await RecurringState.amount.set()
-
 
 @dp.message_handler(state=RecurringState.amount)
 async def recurring_amount(msg: types.Message, state: FSMContext):
@@ -386,14 +379,12 @@ async def recurring_amount(msg: types.Message, state: FSMContext):
     except Exception:
         await msg.reply("❌ Неверная сумма")
 
-
 @dp.callback_query_handler(lambda c: c.data.startswith('rec_'), state=RecurringState.category)
 async def recurring_category(cb: types.CallbackQuery, state: FSMContext):
     cat = cb.data[4:]
     await state.update_data(category=cat)
     await cb.message.edit_text("Укажи день месяца (1–28):")
     await RecurringState.day.set()
-
 
 @dp.message_handler(state=RecurringState.day)
 async def recurring_day(msg: types.Message, state: FSMContext):
@@ -409,7 +400,6 @@ async def recurring_day(msg: types.Message, state: FSMContext):
         await state.finish()
     except Exception:
         await msg.reply("❌ Укажи число от 1 до 28")
-
 
 @dp.message_handler(commands=['report'])
 async def report_cmd(msg: types.Message):
@@ -459,7 +449,6 @@ async def webhook_worker():
         except Exception:
             logger.exception("Unexpected exception in webhook worker; continuing")
 
-
 async def handle_webhook(request: web.Request):
     try:
         data = await request.json()
@@ -473,24 +462,28 @@ async def handle_webhook(request: web.Request):
         logger.warning("queue full - drop update")
     return web.Response(text="OK")
 
-
 async def handle_root(request: web.Request):
     return web.Response(text="OK")
 
 # ---------------- keep-alive ping ----------------
 async def keep_alive_ping():
     """Optionally ping Telegram API periodically to keep session healthy."""
-    while True:
-        try:
-            await bot.get_me()
-        except Exception:
-            logger.debug("keep_alive_ping: bot.get_me() failed")
-        await asyncio.sleep(300)
+    try:
+        while True:
+            try:
+                await bot.get_me()
+            except Exception:
+                logger.debug("keep_alive_ping: bot.get_me() failed", exc_info=True)
+            await asyncio.sleep(60)
+    except asyncio.CancelledError:
+        logger.info("keep_alive_ping cancelled")
+        raise
 
 # ---------------- polling runner -------------
 async def polling_runner(app):
     backoff = 1
     max_backoff = 60
+    logger.info("Polling runner started")
     while True:
         try:
             try:
@@ -498,20 +491,24 @@ async def polling_runner(app):
             except Exception:
                 pass
             logger.info("Starting dp.start_polling()")
-            await dp.start_polling()
+            # timeout param keeps internals responsive; dp.start_polling blocks until stop
+            await dp.start_polling(timeout=20)
             logger.info("dp.start_polling() ended normally")
             break
         except asyncio.CancelledError:
             logger.info("Polling runner cancelled")
             raise
+        except TerminatedByOtherGetUpdates:
+            logger.warning("TerminatedByOtherGetUpdates — another getUpdates instance found. Sleeping 60s before retry.")
+            await asyncio.sleep(60)
+            backoff = 1
         except Exception:
-            logger.exception("Polling crashed, will retry")
+            logger.exception("Polling crashed, will retry with backoff")
             await asyncio.sleep(backoff)
             backoff = min(max_backoff, backoff * 2)
 
 # ---------------- Startup / Cleanup ----------
 _shutdown_initiator = {"signal": None}
-
 
 def _register_signal_handlers(loop):
     def _on_signal(sig):
@@ -524,63 +521,74 @@ def _register_signal_handlers(loop):
     except NotImplementedError:
         logger.debug("Signal handlers not supported on this platform")
 
-
 async def on_startup_app(app):
-    global _updates_queue, _worker_task
+    global _updates_queue, _worker_task, db_lock
     logger.info("on_startup_app: initializing")
+    # create db_lock bound to running loop
+    db_lock = asyncio.Lock()
+
+    # create queue + worker
     _updates_queue = asyncio.Queue(maxsize=2000)
     _worker_task = asyncio.create_task(webhook_worker())
-    # start keep-alive ping only if KEEP_BOT_ALIVE is True
-    if KEEP_BOT_ALIVE:
-        app['keep_alive_ping'] = asyncio.create_task(keep_alive_ping())
-        logger.info("keep_alive_ping started (KEEP_BOT_ALIVE=True)")
 
-    # small dummy task so Render's event loop stays busy
-    app['keep_alive'] = asyncio.create_task(asyncio.sleep(3600*24))
+    # ensure bot session created inside async context (avoids DeprecationWarning)
+    try:
+        sess = await bot.get_session()
+        app['bot_session'] = sess
+        logger.info("Bot session obtained on startup")
+    except Exception:
+        logger.exception("Failed to obtain bot session on startup")
 
+    # add scheduler jobs and start scheduler
+    _add_scheduler_jobs_once()
     try:
         scheduler.start()
         logger.info("Scheduler started")
     except Exception:
         logger.exception("Failed to start scheduler")
 
-    # choose mode
+    # keep-alive ping if requested
+    if KEEP_BOT_ALIVE:
+        app['keep_alive_ping'] = asyncio.create_task(keep_alive_ping())
+        logger.info("keep_alive_ping started (KEEP_BOT_ALIVE=True)")
+
+    # small dummy to keep loop busy if needed (safe)
+    app['keep_alive'] = asyncio.create_task(asyncio.sleep(3600*24))
+
+    # choose mode: polling if forced/keepalive or webhook env not set
     if FORCE_POLLING or KEEP_BOT_ALIVE or not WEBHOOK_URL:
-        # start resilient polling in background
         try:
             await bot.delete_webhook(drop_pending_updates=True)
             logger.info("Webhook deleted (pre-polling cleanup)")
         except Exception:
-            logger.debug("No webhook to delete or delete failed")
+            logger.debug("No webhook or delete failed (ignored)")
         app['polling_task'] = asyncio.create_task(polling_runner(app))
         logger.info("Polling mode enabled")
     else:
-        # attempt webhook with retry
         webhook = WEBHOOK_URL.rstrip("/") + "/webhook"
         success = False
         for attempt in range(3):
             try:
                 await bot.set_webhook(webhook)
-                logger.info("Webhook set")
+                logger.info("Webhook set successfully: %s", webhook)
                 success = True
                 break
             except Exception:
                 logger.exception("set_webhook failed (attempt %s)", attempt + 1)
                 await asyncio.sleep(1 + attempt * 2)
         if not success:
-            logger.warning("set_webhook failed after retries - falling back to polling")
+            logger.warning("Could not set webhook after retries, falling back to polling")
             try:
                 await bot.delete_webhook(drop_pending_updates=True)
             except Exception:
                 logger.debug("delete_webhook during fallback failed")
             app['polling_task'] = asyncio.create_task(polling_runner(app))
 
-
 async def on_cleanup_app(app):
     global _updates_queue, _worker_task
     logger.info("on_cleanup: starting cleanup (initiator=%s)", _shutdown_initiator.get("signal"))
 
-    # cancel keep-alive
+    # cancel keep_alive dummy
     if app.get('keep_alive'):
         app['keep_alive'].cancel()
         try:
@@ -618,35 +626,38 @@ async def on_cleanup_app(app):
         try:
             await dp.stop_polling()
         except Exception:
-            logger.debug("dp.stop_polling() failed or not available")
+            logger.debug("dp.stop_polling() failed or not available", exc_info=True)
         polling_task.cancel()
         try:
             await polling_task
         except Exception:
             pass
+        logger.info("Polling runner stopped")
 
-    # remove webhook only if we're not keeping the bot alive
+    # delete webhook only if we will close bot
     if not KEEP_BOT_ALIVE:
         try:
             await bot.delete_webhook()
             logger.info("Webhook deleted on cleanup")
         except Exception:
-            logger.debug("Failed to delete webhook on cleanup")
+            logger.debug("Failed to delete webhook on cleanup", exc_info=True)
     else:
         logger.info("KEEP_BOT_ALIVE=True -> skipping webhook deletion")
 
     # shutdown scheduler
     try:
         scheduler.shutdown(wait=False)
+        logger.info("Scheduler shutdown")
     except Exception:
-        logger.debug("Scheduler shutdown failed")
+        logger.debug("Scheduler shutdown failed", exc_info=True)
 
     # close storage
     try:
         await dp.storage.close()
         await dp.storage.wait_closed()
+        logger.info("Storage closed")
     except Exception:
-        logger.debug("Storage close failed")
+        logger.debug("Storage close failed", exc_info=True)
 
     # close bot session & bot only if NOT KEEP_BOT_ALIVE
     if not KEEP_BOT_ALIVE:
@@ -656,16 +667,14 @@ async def on_cleanup_app(app):
                 sess = await bot.get_session()
             except Exception:
                 sess = getattr(bot, 'session', None)
-
             if sess:
                 try:
                     await sess.close()
                     logger.info('bot.session closed explicitly')
                 except Exception:
-                    logger.debug('bot.session.close() failed')
+                    logger.exception('Error while closing bot session')
         except Exception:
-            logger.exception('Error while closing bot session')
-
+            logger.exception('Failed while closing bot session')
         try:
             await bot.close()
             logger.info('Bot closed (client session closed)')
@@ -674,11 +683,12 @@ async def on_cleanup_app(app):
     else:
         logger.info('KEEP_BOT_ALIVE=True -> skipping bot.close()')
 
+    # close sqlite connection
     try:
         conn.close()
         logger.info('DB connection closed')
     except Exception:
-        pass
+        logger.debug('DB close failed', exc_info=True)
 
     logger.info('Cleanup complete')
 
@@ -693,7 +703,6 @@ async def set_webhook_handler(request: web.Request):
     except Exception as e:
         logger.exception('set_webhook_handler failed')
         return web.json_response({"ok": False, "error": str(e)})
-
 
 async def debug_handler(request: web.Request):
     info = {
@@ -712,7 +721,6 @@ async def debug_handler(request: web.Request):
     return web.json_response(info)
 
 # ---------------- Create app & run ----------------
-
 def create_app():
     app = web.Application()
     app.router.add_get('/', handle_root)
@@ -722,7 +730,6 @@ def create_app():
     app.on_startup.append(on_startup_app)
     app.on_cleanup.append(on_cleanup_app)
     return app
-
 
 if __name__ == '__main__':
     loop = asyncio.get_event_loop()
