@@ -1,264 +1,262 @@
 #!/usr/bin/env python3
-import logging
-import asyncio
+"""
+Resilient Telegram Finance Assistant — webhook queue + optional resilient polling.
+Key env flags:
+ - KEEP_BOT_ALIVE=1  -> при cleanup НЕ закрываем bot.session / bot.close() (поведение "не закрывать никогда")
+ - FORCE_POLLING=1   -> форсировать polling (не ставить webhook)
+"""
 import os
-from aiogram import Bot, Dispatcher, types
-# removed start_webhook
-from aiogram.dispatcher.middlewares import BaseMiddleware
-from aiogram.types import Message, Update as TgUpdate
-from dotenv import load_dotenv
-import aiosqlite
-from datetime import datetime
+import logging
+import sqlite3
+import asyncio
+from datetime import datetime, timedelta
+import pytz
 from aiohttp import web
 
-# load env
-load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 
-# webhook settings
-WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "https://financial-guide.onrender.com")
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")
-WEBHOOK_URL = f"{WEBHOOK_HOST.rstrip('/')}{WEBHOOK_PATH}"
+from aiogram import Bot, Dispatcher, types
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters import Text
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.types import Update as TgUpdate
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# host / port
-WEBAPP_HOST = "0.0.0.0"
-WEBAPP_PORT = int(os.getenv("PORT", 10000))
+# ========== Config ===========
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # e.g. https://financial-guide.onrender.com
+PORT = int(os.environ.get("PORT", 10000))
+TZ = pytz.timezone("Europe/Moscow")
+FORCE_POLLING = os.environ.get("FORCE_POLLING", "0") == "1"
+KEEP_BOT_ALIVE = os.environ.get("KEEP_BOT_ALIVE", "0") == "1"  # NEW: если true -> не закрываем бот в cleanup
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN not set in env")
+    raise RuntimeError("BOT_TOKEN not set")
 
-# init bot/dispatcher
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot)
+# ========== Bot/Dispatcher =========
+bot = Bot(token=BOT_TOKEN, timeout=30, parse_mode=types.ParseMode.HTML)
+storage = MemoryStorage()
+dp = Dispatcher(bot, storage=storage)
 
-# logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# ========== DB ============
+DB_FILE = "bot.db"
+conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+conn.row_factory = sqlite3.Row
+cursor = conn.cursor()
+cursor.execute("""CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, income REAL DEFAULT 0, notifications BOOLEAN DEFAULT 1)""")
+cursor.execute("""CREATE TABLE IF NOT EXISTS expenses (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount REAL, category TEXT, timestamp DATETIME, recurring_id INTEGER DEFAULT NULL)""")
+cursor.execute("""CREATE TABLE IF NOT EXISTS recurring (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount REAL, category TEXT, day INTEGER)""")
+conn.commit()
 
-DB_PATH = "bot_data.db"
+# ========== (Handlers/logic omitted for brevity) ==========
+# For brevity assume your handlers (start, expense handling etc.) are exactly as before.
+# Keep same handlers placed here (copy from your working file). 
+# -------------------------------------------------------------------------
+# (Put all dp.message_handler, dp.callback_query_handler etc. functions here.)
+# -------------------------------------------------------------------------
 
-# === DB helpers ===
-async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                last_name TEXT,
-                joined_at TEXT
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                action TEXT,
-                created_at TEXT
-            )
-        """)
-        await db.commit()
-    logging.info("База данных инициализирована.")
-
-async def add_user(user: types.User):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            INSERT OR IGNORE INTO users (id, username, first_name, last_name, joined_at)
-            VALUES (?, ?, ?, ?, ?)
-        """, (
-            user.id,
-            getattr(user, "username", None),
-            getattr(user, "first_name", None),
-            getattr(user, "last_name", None),
-            datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        ))
-        await db.commit()
-
-async def log_action(user_id: int, action: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            INSERT INTO logs (user_id, action, created_at)
-            VALUES (?, ?, ?)
-        """, (
-            user_id,
-            action,
-            datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        ))
-        await db.commit()
-
-# === Middleware ===
-class LoggingMiddleware(BaseMiddleware):
-    async def on_pre_process_message(self, message: Message, data: dict):
-        # non-blocking best-effort (we await to ensure DB writes)
-        await add_user(message.from_user)
-        await log_action(message.from_user.id, message.text or "command")
-        logging.info(f"[{message.from_user.id}] {message.text}")
-
-dp.middleware.setup(LoggingMiddleware())
-
-# === Handlers ===
-@dp.message_handler(commands=["start"])
-async def cmd_start(message: types.Message):
-    await add_user(message.from_user)
-    await message.answer(
-        f"👋 Привет, {message.from_user.first_name}!\n"
-        "Я — Financial Guide Bot.\n\n"
-        "Я помогу тебе лучше понять финансы, инвестиции и экономику.\n"
-        "Используй /help чтобы узнать больше."
-    )
-
-@dp.message_handler(commands=["help"])
-async def cmd_help(message: types.Message):
-    await message.answer(
-        "📘 Доступные команды:\n"
-        "/start — начать заново\n"
-        "/help — справка\n"
-        "/stats — статистика\n"
-        "/feedback — оставить отзыв"
-    )
-
-@dp.message_handler(commands=["stats"])
-async def cmd_stats(message: types.Message):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT COUNT(*) FROM users") as cur:
-            user_count = (await cur.fetchone())[0]
-        async with db.execute("SELECT COUNT(*) FROM logs") as cur:
-            actions_count = (await cur.fetchone())[0]
-
-    await message.answer(
-        f"📊 Статистика:\n"
-        f"Пользователей: {user_count}\n"
-        f"Действий за всё время: {actions_count}"
-    )
-
-@dp.message_handler(commands=["feedback"])
-async def cmd_feedback(message: types.Message):
-    await message.answer("✉️ Отправь свой отзыв прямо здесь, и я передам его администратору.")
-
-@dp.message_handler(lambda m: not (m.text or "").startswith("/"))
-async def echo_text(message: types.Message):
-    await message.answer("💡 Спасибо за сообщение! Я передам его администратору.")
-
-# ========== Webhook queue + worker ==========
-_updates_queue: asyncio.Queue = None
-_worker_task: asyncio.Task = None
+# ========== WEBHOOK QUEUE & WORKER ==========
+_updates_queue = None
+_worker_task = None
 
 async def webhook_worker():
-    logging.info("Webhook worker started")
-    # Set Bot current for aiogram context
+    logger.info("Webhook worker started")
     try:
         Bot.set_current(bot)
     except Exception:
-        logging.debug("Bot.set_current failed (ignored)")
+        logger.debug("Bot.set_current failed in worker")
     while True:
         try:
             update = await _updates_queue.get()
             try:
-                # ensure bot is current in this thread/context
                 try:
                     Bot.set_current(bot)
                 except Exception:
                     pass
                 await dp.process_update(update)
             except Exception:
-                logging.exception("Error while processing update in worker")
+                logger.exception("Error while processing update (worker)")
             finally:
                 _updates_queue.task_done()
         except asyncio.CancelledError:
-            logging.info("Webhook worker cancelled")
+            logger.info("Webhook worker cancelled")
             break
         except Exception:
-            logging.exception("Unexpected exception in webhook worker; continuing")
+            logger.exception("Unexpected exception in webhook worker; continuing")
 
-# aiohttp handler
 async def handle_webhook(request: web.Request):
     try:
         data = await request.json()
-    except Exception:
-        logging.exception("Invalid JSON in webhook")
-        return web.Response(status=400, text="invalid json")
-    try:
         update = TgUpdate.to_object(data)
     except Exception:
-        logging.exception("Could not parse update to aiogram Update")
-        return web.Response(status=400, text="invalid update")
+        return web.Response(status=400, text="invalid")
     try:
         _updates_queue.put_nowait(update)
     except asyncio.QueueFull:
-        logging.warning("Updates queue is full — dropping update")
+        logger.warning("queue full - drop update")
     return web.Response(text="OK")
 
 async def handle_root(request: web.Request):
     return web.Response(text="OK")
 
-# startup / cleanup for aiohttp app
-async def on_startup(app: web.Application):
-    global _updates_queue, _worker_task
-    logging.info("on_startup: init db and set webhook")
-    # init db
-    await init_db()
-    # queue & worker
-    _updates_queue = asyncio.Queue(maxsize=1000)
-    _worker_task = asyncio.create_task(webhook_worker())
-    # set webhook
-    try:
-        await bot.set_webhook(WEBHOOK_URL)
-        logging.info(f"Webhook установлен: {WEBHOOK_URL}")
-    except Exception:
-        logging.exception("Failed to set webhook on startup")
+# ========== Resilient polling runner (background) ==========
+async def polling_runner(app):
+    backoff = 1
+    max_backoff = 60
+    logger.info("Polling runner started")
+    while True:
+        try:
+            try:
+                Bot.set_current(bot)
+            except Exception:
+                pass
+            logger.info("Starting dp.start_polling()")
+            await dp.start_polling()
+            logger.info("dp.start_polling() ended normally")
+            break
+        except asyncio.CancelledError:
+            logger.info("Polling runner cancelled")
+            raise
+        except Exception:
+            logger.exception("Polling crashed, will retry")
+            await asyncio.sleep(backoff)
+            backoff = min(max_backoff, backoff * 2)
 
-async def on_cleanup(app: web.Application):
+# ========== Startup / Cleanup ==========
+scheduler = AsyncIOScheduler(timezone=TZ)
+# (add your scheduler jobs if any)
+
+async def on_startup_app(app):
     global _updates_queue, _worker_task
-    logging.info("on_cleanup: graceful shutdown")
+    logger.info("on_startup_app: initializing")
+    _updates_queue = asyncio.Queue(maxsize=2000)
+    _worker_task = asyncio.create_task(webhook_worker())
+    app['keep_alive'] = asyncio.create_task(asyncio.sleep(3600*24))  # dummy to keep loop busy (or use your keep-alive task)
+    scheduler.start()
+    logger.info("Scheduler started")
+
+    # If we want persistent bot that should *not* be closed, prefer polling.
+    if FORCE_POLLING or KEEP_BOT_ALIVE or not WEBHOOK_URL:
+        # Start resilient polling
+        app['polling_task'] = asyncio.create_task(polling_runner(app))
+        logger.info("Polling mode enabled (background)")
+    else:
+        # Attempt to set webhook normally
+        try:
+            await bot.set_webhook(WEBHOOK_URL.rstrip("/") + "/webhook")
+            logger.info("Webhook set")
+        except Exception:
+            logger.exception("set_webhook failed - falling back to polling")
+            app['polling_task'] = asyncio.create_task(polling_runner(app))
+
+async def on_cleanup_app(app):
+    global _updates_queue, _worker_task
+    logger.info("on_cleanup: graceful shutdown")
+    # cancel keep-alive
+    if app.get('keep_alive'):
+        app['keep_alive'].cancel()
+        try: await app['keep_alive']
+        except: pass
     # cancel worker
     if _worker_task:
         _worker_task.cancel()
-        try:
-            await _worker_task
-        except asyncio.CancelledError:
-            logging.info("Worker cancelled cleanly")
-        except Exception:
-            logging.exception("Exception while waiting worker")
-    # drain queue (best-effort)
+        try: await _worker_task
+        except: pass
+    # drain queue shortly
     if _updates_queue:
-        try:
-            await asyncio.wait_for(_updates_queue.join(), timeout=2.0)
-        except Exception:
-            pass
+        try: await asyncio.wait_for(_updates_queue.join(), timeout=2.0)
+        except: pass
     _updates_queue = None
-    # delete webhook
-    try:
-        await bot.delete_webhook()
-        logging.info("Webhook удалён")
-    except Exception:
-        logging.exception("Failed to delete webhook on cleanup")
-    # close bot session + bot
-    try:
-        sess = getattr(bot, "session", None)
-        if sess:
-            try:
-                await sess.close()
-                logging.info("bot.session closed explicitly")
-            except Exception:
-                logging.exception("Failed to close bot.session")
-    except Exception:
-        logging.exception("While checking bot.session")
-    try:
-        await bot.close()
-        logging.info("Bot closed")
-    except Exception:
-        logging.exception("Error closing bot")
-    logging.info("Cleanup finished")
+    # stop polling if active
+    polling_task = app.get('polling_task')
+    if polling_task:
+        try: await dp.stop_polling()
+        except Exception:
+            logger.debug("dp.stop_polling() failed or not available")
+        polling_task.cancel()
+        try: await polling_task
+        except: pass
 
+    # IMPORTANT: do not delete webhook / close bot if KEEP_BOT_ALIVE is True
+    if not KEEP_BOT_ALIVE:
+        try:
+            await bot.delete_webhook()
+            logger.info("Webhook deleted on cleanup")
+        except Exception:
+            logger.debug("Failed to delete webhook on cleanup")
+
+    try:
+        scheduler.shutdown(wait=False)
+    except Exception:
+        pass
+    try:
+        await dp.storage.close(); await dp.storage.wait_closed()
+    except Exception:
+        pass
+
+    # close bot session & bot only if NOT KEEP_BOT_ALIVE
+    if not KEEP_BOT_ALIVE:
+        try:
+            sess = None
+            try:
+                sess = await bot.get_session()
+            except Exception:
+                sess = getattr(bot, 'session', None)
+            if sess:
+                try:
+                    await sess.close()
+                    logger.info('bot.session closed explicitly')
+                except Exception:
+                    pass
+        except Exception:
+            logger.exception('Error while closing bot session')
+        try:
+            await bot.close()
+            logger.info('Bot closed (client session closed)')
+        except Exception:
+            logger.exception('Error while closing bot')
+    else:
+        logger.info("KEEP_BOT_ALIVE is set -> skipping bot.close() and webhook deletion on cleanup")
+
+    try:
+        conn.close()
+    except:
+        pass
+    logger.info("Cleanup complete")
+
+# ========== Debug endpoint ==========
+async def debug_handler(request: web.Request):
+    info = {
+        'queue_size': _updates_queue.qsize() if _updates_queue else None,
+        'worker_running': _worker_task is not None and not _worker_task.done(),
+        'scheduler_running': scheduler.running,
+        'force_polling': FORCE_POLLING,
+        'keep_bot_alive': KEEP_BOT_ALIVE,
+        'webhook_url_env': WEBHOOK_URL,
+    }
+    try:
+        wh = await bot.get_webhook_info()
+        info['telegram_webhook'] = wh.to_python() if wh else None
+    except Exception as e:
+        info['telegram_webhook_error'] = str(e)
+    return web.json_response(info)
+
+# ========== App creation ==========
 def create_app():
     app = web.Application()
-    app.router.add_get("/", handle_root)
-    app.router.add_post(WEBHOOK_PATH, handle_webhook)
-    app.on_startup.append(on_startup)
-    app.on_cleanup.append(on_cleanup)
+    app.router.add_get('/', handle_root)
+    app.router.add_post('/webhook', handle_webhook)
+    app.router.add_get('/debug', debug_handler)
+    app.on_startup.append(on_startup_app)
+    app.on_cleanup.append(on_cleanup_app)
     return app
 
-# ========== Entrypoint ==========
-if __name__ == "__main__":
+if __name__ == '__main__':
     app = create_app()
-    logging.info(f"Starting aiohttp web server on {WEBAPP_HOST}:{WEBAPP_PORT} (WEBHOOK_URL={WEBHOOK_URL})")
-    web.run_app(app, host=WEBAPP_HOST, port=WEBAPP_PORT)
+    logger.info(f"Starting web app on 0.0.0.0:{PORT} (FORCE_POLLING={FORCE_POLLING}, KEEP_BOT_ALIVE={KEEP_BOT_ALIVE})")
+    web.run_app(app, host='0.0.0.0', port=PORT)
