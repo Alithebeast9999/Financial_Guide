@@ -185,11 +185,9 @@ def make_web_app():
     async def health_handler(request):
         return web.json_response({"ok": True, "uptime": True})
 
-    # Accept both GET and HEAD (Render/UptimeRobot may use HEAD)
+    # Регистрируем только GET — aiohttp сам обслужит HEAD для GET.
     app.router.add_get("/", root_handler)
-    app.router.add_head("/", root_handler)
     app.router.add_get("/health", health_handler)
-    app.router.add_head("/health", health_handler)
 
     return app
 
