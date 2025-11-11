@@ -131,28 +131,48 @@ async def polling_runner(app):
 scheduler = AsyncIOScheduler(timezone=TZ)
 # (add your scheduler jobs if any)
 
+# ... (rest of imports and config unchanged)
+
+# In on_startup_app, add delete_webhook before polling to prevent conflicts
 async def on_startup_app(app):
     global _updates_queue, _worker_task
     logger.info("on_startup_app: initializing")
     _updates_queue = asyncio.Queue(maxsize=2000)
     _worker_task = asyncio.create_task(webhook_worker())
-    app['keep_alive'] = asyncio.create_task(asyncio.sleep(3600*24))  # dummy to keep loop busy (or use your keep-alive task)
+    app['keep_alive'] = asyncio.create_task(asyncio.sleep(3600*24))  # Optional, can remove
     scheduler.start()
     logger.info("Scheduler started")
-
-    # If we want persistent bot that should *not* be closed, prefer polling.
+    
     if FORCE_POLLING or KEEP_BOT_ALIVE or not WEBHOOK_URL:
-        # Start resilient polling
+        # Polling mode: Always delete webhook first to avoid 409 conflict
+        try:
+            await bot.delete_webhook(drop_pending_updates=True)  # Add this: Clears any existing webhook and pending updates
+            logger.info("Webhook deleted (pre-polling cleanup)")
+        except Exception:
+            logger.exception("Failed to delete webhook before polling")
         app['polling_task'] = asyncio.create_task(polling_runner(app))
         logger.info("Polling mode enabled (background)")
     else:
-        # Attempt to set webhook normally
+        # Webhook mode
         try:
             await bot.set_webhook(WEBHOOK_URL.rstrip("/") + "/webhook")
-            logger.info("Webhook set")
-        except Exception:
+            logger.info("Webhook set successfully")
+        except Exception as e:
             logger.exception("set_webhook failed - falling back to polling")
+            # Add fallback fix: Delete webhook before polling
+            try:
+                await bot.delete_webhook(drop_pending_updates=True)
+                logger.info("Webhook deleted during fallback")
+            except Exception:
+                logger.exception("Failed to delete webhook during fallback")
             app['polling_task'] = asyncio.create_task(polling_runner(app))
+
+# ... (rest of code unchanged, including on_cleanup_app, which is fine)
+
+if __name__ == '__main__':
+    app = create_app()  # Still run the web app (for pinger/health checks)
+    logger.info(f"Starting web app on 0.0.0.0:{PORT} (FORCE_POLLING={FORCE_POLLING}, KEEP_BOT_ALIVE={KEEP_BOT_ALIVE})")
+    web.run_app(app, host='0.0.0.0', port=PORT)
 
 async def on_cleanup_app(app):
     global _updates_queue, _worker_task
