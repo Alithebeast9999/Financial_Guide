@@ -3,6 +3,7 @@
 Resilient Telegram Finance Assistant (main.py)
 Integrated: webhook queue + worker, resilient polling fallback, KEEP_BOT_ALIVE option,
 scheduler jobs created on startup, debug & admin endpoints.
+
 Environment variables:
  - BOT_TOKEN (required)
  - WEBHOOK_URL (optional)
@@ -64,7 +65,7 @@ cursor.execute("""CREATE TABLE IF NOT EXISTS recurring (id INTEGER PRIMARY KEY A
 conn.commit()
 
 # db_lock will be created on startup (bound to running loop)
-db_lock = None  # type: asyncio.Lock | None
+db_lock = None  # assigned in on_startup_app
 
 # ---------------- Categories & states -------------
 CATEGORIES = {
@@ -90,7 +91,6 @@ class RecurringState(StatesGroup):
 async def ensure_user(uid: int):
     global db_lock
     if db_lock is None:
-        # safety: create local lock if missing
         db_lock = asyncio.Lock()
     async with db_lock:
         cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (uid,))
@@ -102,7 +102,6 @@ def get_income(uid: int) -> float:
     return float(r["income"]) if r and r["income"] is not None else 0.0
 
 def set_income(uid: int, v: float):
-    # lightweight write; used rarely
     cursor.execute("INSERT OR REPLACE INTO users (user_id, income) VALUES (?, ?)", (uid, v))
     conn.commit()
 
@@ -173,22 +172,10 @@ def format_stats(uid: int) -> str:
         text += "\n"
     return text
 
-# ---------------- Scheduler (create but do NOT add jobs here) ----------------
+# ---------------- Scheduler ----------------
 scheduler = AsyncIOScheduler(timezone=TZ)
-def _add_scheduler_jobs_once():
-    """Add scheduled jobs. Called on startup to avoid 'tentative' messages at import time."""
-    try:
-        # Prevent duplicate IDs if accidentally called twice
-        if not scheduler.get_job("daily_reminders"):
-            scheduler.add_job(daily_reminders, CronTrigger(hour=9, minute=0), id="daily_reminders")
-        if not scheduler.get_job("weekly_report"):
-            scheduler.add_job(weekly_report, CronTrigger(day_of_week='mon', hour=9, minute=0), id="weekly_report")
-        if not scheduler.get_job("process_recurring"):
-            scheduler.add_job(process_recurring, CronTrigger(hour=6, minute=0), id="process_recurring")
-    except Exception:
-        logger.exception("Failed to add scheduler jobs")
 
-# scheduled job implementations (referenced above)
+# jobs will be added on startup (see _add_scheduler_jobs_once)
 async def daily_reminders():
     cursor.execute("SELECT user_id FROM users WHERE notifications = 1")
     for (uid,) in cursor.fetchall():
@@ -216,7 +203,20 @@ async def process_recurring():
         except Exception:
             pass
 
+def _add_scheduler_jobs_once():
+    try:
+        if not scheduler.get_job("daily_reminders"):
+            scheduler.add_job(daily_reminders, CronTrigger(hour=9, minute=0), id="daily_reminders")
+        if not scheduler.get_job("weekly_report"):
+            scheduler.add_job(weekly_report, CronTrigger(day_of_week='mon', hour=9, minute=0), id="weekly_report")
+        if not scheduler.get_job("process_recurring"):
+            scheduler.add_job(process_recurring, CronTrigger(hour=6, minute=0), id="process_recurring")
+    except Exception:
+        logger.exception("Failed to add scheduler jobs")
+
 # ---------------- UI helpers ----------------
+MAIN_BUTTONS = {"➕ Добавить трату", "📜 История", "📊 Моя статистика", "ℹ️ Помощь"}
+
 def get_main_keyboard():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.add("➕ Добавить трату", "📜 История")
@@ -244,6 +244,7 @@ def build_limits_table_html(income: float) -> str:
     return pre_block
 
 # ---------------- Handlers ----------------
+
 @dp.message_handler(commands=['start'])
 async def start(msg: types.Message):
     uid = msg.from_user.id
@@ -252,17 +253,54 @@ async def start(msg: types.Message):
         "<b>Привет! Я — твой финансовый помощник.</b>\n\n"
         "Я помогу тебе отслеживать расходы, планировать бюджет, "
         "настраивать регулярные платежи и вовремя предупреждать о превышениях лимитов.\n\n"
-        "Чтобы начать — введите ваш ежемесячный доход (например: <b>(50 000)</b>)\n\n"
+        "Чтобы начать — введите ваш ежемесячный доход (например: <b>50 000</b>)\n\n"
         "После ввода дохода я рассчитую рекомендованные лимиты по категориям и покажу подсказки по кнопкам внизу."
     )
-    await msg.reply(welcome)
+    kb = get_main_keyboard()
+    # Устанавливаем state для ввода дохода — это исправляет проблему "после ввода дохода ничего не происходит"
+    await IncomeState.income.set()
+    await msg.reply(welcome, reply_markup=kb)
 
+@dp.message_handler(commands=['cancel'], state="*")
+async def cmd_cancel(msg: types.Message, state: FSMContext):
+    cur = await state.get_state()
+    if cur is None:
+        await msg.reply("Нечего отменять.")
+        return
+    await state.finish()
+    await msg.reply("Действие отменено. Можешь использовать кнопки ниже.", reply_markup=get_main_keyboard())
+
+# Income input handler — игнорируем команды и кнопки, а если пришла команда — обрабатываем её
 @dp.message_handler(state=IncomeState.income)
 async def set_income_handler(msg: types.Message, state: FSMContext):
+    text = msg.text or ""
+    # Allow user to press main buttons or commands — in that case, finish state and route
+    if text.startswith("/"):
+        # If user typed /start while in income, re-run start flow
+        await state.finish()
+        if text.startswith("/start"):
+            await start(msg)
+        else:
+            await msg.reply("Команда выполнена. Если вы хотели ввести доход — введите число.")
+        return
+    if text in MAIN_BUTTONS:
+        await state.finish()
+        # route to the appropriate handler
+        if text == "📜 История":
+            await history(msg)
+        elif text == "📊 Моя статистика":
+            await stats(msg)
+        elif text == "ℹ️ Помощь":
+            await help_cmd(msg)
+        elif text == "➕ Добавить трату":
+            await add_expense_cmd(msg)
+        return
+
+    # Try parse income
     try:
-        income = float(msg.text.replace(" ", "").replace(",", "."))
+        income = float(text.replace(" ", "").replace(",", "."))
     except Exception:
-        await msg.reply("❌ Неверный формат дохода. Пример: 50 000")
+        await msg.reply("❌ Неверный формат дохода. Введите число, например: 50 000 (или нажмите /cancel).")
         return
     set_income(msg.from_user.id, income)
     await state.finish()
@@ -280,23 +318,49 @@ async def set_income_handler(msg: types.Message, state: FSMContext):
 
 @dp.message_handler(Text(equals="➕ Добавить трату"))
 async def add_expense_cmd(msg: types.Message):
-    await msg.reply("💸 Введи сумму траты:")
+    await msg.reply("💸 Введи сумму траты (например: 450): (или /cancel чтобы отменить)")
     await ExpenseState.amount.set()
 
+# Expense amount handler — robustly handle other buttons/commands
 @dp.message_handler(state=ExpenseState.amount)
 async def expense_amount(msg: types.Message, state: FSMContext):
+    text = msg.text or ""
+    # If user pressed a command — finish state and route
+    if text.startswith("/"):
+        await state.finish()
+        if text.startswith("/start"):
+            await start(msg)
+        else:
+            await msg.reply("Команда зарегистрирована. Если вы хотели ввести сумму — попробуйте снова.", reply_markup=get_main_keyboard())
+        return
+    # If user pressed main keyboard buttons — finish state and route
+    if text in MAIN_BUTTONS:
+        await state.finish()
+        if text == "📜 История":
+            await history(msg)
+        elif text == "📊 Моя статистика":
+            await stats(msg)
+        elif text == "ℹ️ Помощь":
+            await help_cmd(msg)
+        elif text == "➕ Добавить трату":
+            # start over
+            await add_expense_cmd(msg)
+        return
+
+    # Otherwise try parse number
     try:
-        amount = float(msg.text.replace(" ", "").replace(",", "."))
+        amount = float(text.replace(" ", "").replace(",", "."))
         await state.update_data(amount=amount)
         kb = InlineKeyboardMarkup(row_width=2)
         for cat in ALL_CATEGORIES:
             kb.insert(InlineKeyboardButton(cat, callback_data=f"cat_{cat}"))
+        # Ask to choose category
         await msg.reply("Выбери категорию:", reply_markup=kb)
         await ExpenseState.category.set()
     except Exception:
-        await msg.reply("❌ Неверная сумма")
+        await msg.reply("❌ Неверная сумма. Введите число, например: 450. Или нажмите /cancel, чтобы отменить.")
 
-@dp.callback_query_handler(lambda c: c.data.startswith('cat_'), state=ExpenseState.category)
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith('cat_'), state=ExpenseState.category)
 async def expense_category(cb: types.CallbackQuery, state: FSMContext):
     cat = cb.data[4:]
     data = await state.get_data()
@@ -327,7 +391,7 @@ async def history(msg: types.Message):
         kb = InlineKeyboardMarkup().add(InlineKeyboardButton("❌ Удалить", callback_data=f"del_{e['id']}"))
         await msg.reply(f"{dt} | {e['amount']:,.0f} ₽ | {e['category']}", reply_markup=kb)
 
-@dp.callback_query_handler(lambda c: c.data.startswith('del_'))
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith('del_'))
 async def delete_expense_cb(cb: types.CallbackQuery):
     eid = int(cb.data[4:])
     delete_expense(eid)
@@ -348,6 +412,7 @@ async def help_cmd(msg: types.Message):
         "/report month — отчёт за месяц\n"
         "/add_recurring — добавить регулярный расход\n"
         "/notify — включить/выключить уведомления\n"
+        "/cancel — отменить текущее действие"
     )
 
 @dp.message_handler(commands=['notify'])
@@ -363,13 +428,33 @@ async def toggle_notify(msg: types.Message):
 
 @dp.message_handler(commands=['add_recurring'])
 async def add_recurring(msg: types.Message):
-    await msg.reply("Введи сумму регулярного расхода:")
+    await msg.reply("Введи сумму регулярного расхода (или /cancel):")
     await RecurringState.amount.set()
 
 @dp.message_handler(state=RecurringState.amount)
 async def recurring_amount(msg: types.Message, state: FSMContext):
+    text = msg.text or ""
+    if text.startswith("/"):
+        await state.finish()
+        if text.startswith("/start"):
+            await start(msg)
+        else:
+            await msg.reply("Команда выполнена. Если вы хотели ввести сумму — введите число.")
+        return
+    if text in MAIN_BUTTONS:
+        await state.finish()
+        if text == "📜 История":
+            await history(msg)
+        elif text == "📊 Моя статистика":
+            await stats(msg)
+        elif text == "ℹ️ Помощь":
+            await help_cmd(msg)
+        elif text == "➕ Добавить трату":
+            await add_expense_cmd(msg)
+        return
+
     try:
-        amt = float(msg.text.replace(" ", "").replace(",", "."))
+        amt = float(text.replace(" ", "").replace(",", "."))
         await state.update_data(amount=amt)
         kb = InlineKeyboardMarkup(row_width=2)
         for cat in ALL_CATEGORIES:
@@ -377,9 +462,9 @@ async def recurring_amount(msg: types.Message, state: FSMContext):
         await msg.reply("Выбери категорию:", reply_markup=kb)
         await RecurringState.category.set()
     except Exception:
-        await msg.reply("❌ Неверная сумма")
+        await msg.reply("❌ Неверная сумма. Введите число или /cancel.")
 
-@dp.callback_query_handler(lambda c: c.data.startswith('rec_'), state=RecurringState.category)
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith('rec_'), state=RecurringState.category)
 async def recurring_category(cb: types.CallbackQuery, state: FSMContext):
     cat = cb.data[4:]
     await state.update_data(category=cat)
@@ -388,8 +473,28 @@ async def recurring_category(cb: types.CallbackQuery, state: FSMContext):
 
 @dp.message_handler(state=RecurringState.day)
 async def recurring_day(msg: types.Message, state: FSMContext):
+    text = msg.text or ""
+    if text.startswith("/"):
+        await state.finish()
+        if text.startswith("/start"):
+            await start(msg)
+        else:
+            await msg.reply("Команда выполнена. Если вы хотели указать день — введите число.")
+        return
+    if text in MAIN_BUTTONS:
+        await state.finish()
+        if text == "📜 История":
+            await history(msg)
+        elif text == "📊 Моя статистика":
+            await stats(msg)
+        elif text == "ℹ️ Помощь":
+            await help_cmd(msg)
+        elif text == "➕ Добавить трату":
+            await add_expense_cmd(msg)
+        return
+
     try:
-        day = int(msg.text)
+        day = int(text)
         if not (1 <= day <= 28):
             raise ValueError
         data = await state.get_data()
@@ -399,7 +504,7 @@ async def recurring_day(msg: types.Message, state: FSMContext):
         await msg.reply(f"🔁 Регулярный расход сохранён: {format_amount(data['amount'])} ₽ — {data['category']} (каждое {day}-е число)")
         await state.finish()
     except Exception:
-        await msg.reply("❌ Укажи число от 1 до 28")
+        await msg.reply("❌ Укажи число от 1 до 28 или /cancel")
 
 @dp.message_handler(commands=['report'])
 async def report_cmd(msg: types.Message):
@@ -491,7 +596,7 @@ async def polling_runner(app):
             except Exception:
                 pass
             logger.info("Starting dp.start_polling()")
-            # timeout param keeps internals responsive; dp.start_polling blocks until stop
+            # dp.start_polling blocks until stop; pass timeout to keep internals responsive
             await dp.start_polling(timeout=20)
             logger.info("dp.start_polling() ended normally")
             break
