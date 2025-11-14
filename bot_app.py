@@ -1,4 +1,5 @@
-# bot_app.py
+#!/usr/bin/env python3
+# bot_app.py — handlers and DB helpers for Financial Guide
 import os
 import logging
 import sqlite3
@@ -73,20 +74,45 @@ async def ensure_user(uid: int):
         cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (uid,))
         conn.commit()
 
+async def user_exists(uid: int) -> bool:
+    """Return True if user row exists."""
+    global db_lock
+    if db_lock is None:
+        db_lock = asyncio.Lock()
+    async with db_lock:
+        cursor.execute("SELECT 1 FROM users WHERE user_id = ? LIMIT 1", (uid,))
+        return bool(cursor.fetchone())
+
+async def clear_user_data(uid: int):
+    """Remove user's expenses, recurring and user row. Uses db_lock."""
+    global db_lock
+    if db_lock is None:
+        db_lock = asyncio.Lock()
+    async with db_lock:
+        cursor.execute("DELETE FROM expenses WHERE user_id = ?", (uid,))
+        cursor.execute("DELETE FROM recurring WHERE user_id = ?", (uid,))
+        cursor.execute("DELETE FROM users WHERE user_id = ?", (uid,))
+        conn.commit()
+    logger.info("User %s data cleared (expenses, recurring, users).", uid)
+
+
 def get_income(uid: int) -> float:
     cursor.execute("SELECT income FROM users WHERE user_id = ?", (uid,))
     r = cursor.fetchone()
     return float(r["income"]) if r and r["income"] is not None else 0.0
 
+
 def set_income(uid: int, v: float):
     cursor.execute("INSERT OR REPLACE INTO users (user_id, income) VALUES (?, ?)", (uid, v))
     conn.commit()
+
 
 def format_amount(x):
     try:
         return f"{x:,.0f}".replace(",", " ")
     except Exception:
         return str(x)
+
 
 def get_limits_from_income(income: float):
     return {cat: income * pct for group in CATEGORIES.values() for cat, pct in group.items()}
@@ -101,13 +127,16 @@ async def add_expense(uid, amount, category, ts=None, rec_id=None):
                        (uid, amount, category, ts.isoformat(), rec_id))
         conn.commit()
 
+
 def get_expenses(uid, limit=10):
     cursor.execute("SELECT id, amount, category, timestamp FROM expenses WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?", (uid, limit))
     return cursor.fetchall()
 
+
 def delete_expense(eid):
     cursor.execute("DELETE FROM expenses WHERE id = ?", (eid,))
     conn.commit()
+
 
 def check_limits(uid, category, amount):
     limits = get_limits_from_income(get_income(uid))
@@ -128,6 +157,7 @@ def check_limits(uid, category, amount):
     elif cat_spent + amount > 0.9 * limits[category]:
         msgs.append(f"⚠️ Ты израсходовал более 90% лимита по '{category}'!")
     return msgs
+
 
 def format_stats(uid: int) -> str:
     income = get_income(uid)
@@ -197,6 +227,7 @@ def get_main_keyboard():
     kb.add("📊 Моя статистика", "ℹ️ Помощь")
     return kb
 
+
 def build_limits_table_html(income: float) -> str:
     limits = get_limits_from_income(income)
     lines = []
@@ -244,6 +275,61 @@ async def cmd_cancel(msg: types.Message, state: FSMContext):
         return
     await state.finish()
     await msg.reply("Действие отменено. Можешь использовать кнопки ниже.", reply_markup=get_main_keyboard())
+
+# Restart with confirmation (added)
+@dp.message_handler(commands=['restart'])
+async def cmd_restart(msg: types.Message, state: FSMContext):
+    """Ask user to confirm restart. Confirmation handled via inline buttons."""
+    uid = msg.from_user.id
+    # finish any state to avoid conflicts
+    try:
+        await state.finish()
+    except Exception:
+        pass
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("Удалить навсегда", callback_data=f"restart_yes:{uid}"),
+        InlineKeyboardButton("Отмена", callback_data=f"restart_no:{uid}")
+    )
+    await msg.reply("⚠️ Вы действительно хотите удалить все ваши данные? Это действие необратимо.", reply_markup=kb)
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith('restart_'))
+async def restart_callback(cb: types.CallbackQuery):
+    data = cb.data
+    # callback_data format: restart_yes:<uid> or restart_no:<uid>
+    try:
+        action, uid_s = data.split(":", 1)
+        target_uid = int(uid_s)
+    except Exception:
+        await cb.answer("Неверные данные.", show_alert=True)
+        return
+
+    # Only the initiating user can confirm/cancel
+    if cb.from_user.id != target_uid:
+        await cb.answer("Это подтверждение не для вас.", show_alert=True)
+        return
+
+    if action == 'restart_yes':
+        # clear data
+        await clear_user_data(target_uid)
+        # recreate user skeleton and prompt for income
+        await ensure_user(target_uid)
+        await cb.message.edit_text("♻️ Все данные удалены. Начнём с чистого листа. Введите ежемесячный доход (например: 50 000).")
+        # set Income state for that user
+        try:
+            state = dp.current_state(user=target_uid)
+            await state.set_state(IncomeState.income.state)
+        except Exception:
+            logger.debug("Failed to set IncomeState after restart for %s", target_uid)
+        await cb.answer("Данные удалены.")
+    else:
+        # cancel
+        try:
+            await cb.message.edit_text("Отмена удаления данных. Ваши данные сохранены.")
+        except Exception:
+            pass
+        await cb.answer("Отменено")
 
 @dp.message_handler(state=IncomeState.income)
 async def set_income_handler(msg: types.Message, state: FSMContext):
@@ -374,7 +460,8 @@ async def help_cmd(msg: types.Message):
         "/report month — отчёт за месяц\n"
         "/add_recurring — добавить регулярный расход\n"
         "/notify — включить/выключить уведомления\n"
-        "/cancel — отменить текущее действие"
+        "/cancel — отменить текущее действие\n"
+        "/restart — удалить все ваши данные (будет подтверждение)"
     )
 
 @dp.message_handler(commands=['notify'])
