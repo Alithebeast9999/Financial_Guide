@@ -30,7 +30,7 @@ _worker_task = None
 async def webhook_worker():
     logger.info("Webhook worker started")
     try:
-        bot_app.Bot.set_current(bot)  # Bot class available via bot_app import
+        bot_app.Bot.set_current(bot)
     except Exception:
         logger.debug("Bot.set_current failed in worker")
     while True:
@@ -86,36 +86,28 @@ async def keep_alive_ping():
 
 async def ensure_no_webhook_before_polling(max_retries: int = 6, base_sleep: float = 0.8) -> bool:
     """
-    Make sure Telegram webhook is not set before we start polling.
-    Returns True if webhook is absent (or removed), False otherwise.
+    Ensure Telegram webhook is not set before polling.
+    Returns True if webhook absent (or removed), False otherwise.
     """
     logger.info("Ensuring no webhook is set before polling (max_retries=%s)", max_retries)
     for attempt in range(max_retries):
         try:
             wh = await bot.get_webhook_info()
-            # aiogram's WebhookInfo may have attribute 'url' or require to_python
-            url = None
-            if wh is None:
-                url = ""
-            else:
+            url = ""
+            if wh:
                 try:
-                    url = getattr(wh, "url", None)
-                    if url is None:
-                        # fallback to dict
-                        js = wh.to_python()
-                        url = js.get("url") if isinstance(js, dict) else ""
+                    url = getattr(wh, "url", None) or (wh.to_python().get("url") if hasattr(wh, "to_python") else "")
                 except Exception:
                     url = ""
             if not url:
                 logger.info("No webhook set (checked attempt %s).", attempt + 1)
                 return True
-            # If present, try to delete and wait a bit
+            # There is a webhook -> request deletion
             try:
                 await bot.delete_webhook(drop_pending_updates=True)
-                logger.info("Requested webhook deletion (attempt %s). Waiting...", attempt + 1)
+                logger.info("Requested webhook deletion (attempt %s).", attempt + 1)
             except Exception:
                 logger.debug("delete_webhook attempt failed (attempt %s).", attempt + 1, exc_info=True)
-            # wait a little longer with linear backoff
             await asyncio.sleep(base_sleep * (1 + attempt))
         except Exception:
             logger.exception("Failed to check/delete webhook (attempt %s).", attempt + 1)
@@ -144,7 +136,7 @@ async def polling_runner(app):
     backoff = 1
     max_backoff = 60
     terminated_count = 0
-    max_terminated_before_pause = 5
+    terminated_threshold_to_switch = 3  # after this, attempt switch to webhook (if WEBHOOK_URL present)
     logger.info("Polling runner started")
     while True:
         try:
@@ -153,6 +145,7 @@ async def polling_runner(app):
             except Exception:
                 pass
             logger.info("Starting dp.start_polling()")
+            # aiogram dp.start_polling() usually blocks until cancelled or error
             await dp.start_polling(timeout=20)
             logger.info("dp.start_polling() ended normally")
             break
@@ -161,24 +154,25 @@ async def polling_runner(app):
             raise
         except TerminatedByOtherGetUpdates:
             terminated_count += 1
-            logger.warning(
-                "TerminatedByOtherGetUpdates encountered (count=%s). Another getUpdates exists.",
-                terminated_count,
-            )
-            # If we see this repeatedly, back off longer to avoid thrashing.
-            if terminated_count >= max_terminated_before_pause:
-                logger.warning(
-                    "Too many consecutive TerminatedByOtherGetUpdates errors (%s). "
-                    "Pausing polling for 5 minutes to allow external getUpdates to stop.",
-                    terminated_count,
-                )
-                await asyncio.sleep(300)  # 5 minutes
-                terminated_count = 0
-                backoff = 1
-            else:
-                # short sleep and retry
-                await asyncio.sleep(60)
-                backoff = 1
+            logger.warning("TerminatedByOtherGetUpdates encountered (count=%s).", terminated_count)
+            # If we see several, and WEBHOOK_URL exists, attempt to switch to webhook mode:
+            if terminated_count >= terminated_threshold_to_switch and WEBHOOK_URL:
+                webhook = WEBHOOK_URL.rstrip("/") + "/webhook"
+                try:
+                    logger.info("Attempting to set webhook '%s' after %s Terminated errors.", webhook, terminated_count)
+                    await bot.set_webhook(webhook)
+                    logger.info("Webhook set successfully; stopping polling runner to let webhook handle updates.")
+                    # break to stop polling runner; webhook worker + aiohttp will handle updates
+                    break
+                except Exception:
+                    logger.exception("Failed to set webhook during TerminatedByOtherGetUpdates handling; will wait and retry polling")
+                    # increase backoff to avoid thrash
+                    await asyncio.sleep(60)
+                    backoff = min(max_backoff, backoff * 2)
+                    continue
+            # otherwise short sleep and retry
+            await asyncio.sleep(60)
+            backoff = 1
         except Exception:
             logger.exception("Polling crashed, will retry")
             await asyncio.sleep(backoff)
@@ -205,7 +199,7 @@ async def on_startup_app(app):
     global _updates_queue, _worker_task
     logger.info("on_startup_app: initializing")
 
-    # Initialize bot_app internals (db_lock, scheduler jobs, etc.)
+    # Initialize bot_app internals (db_lock, scheduler jobs, etc.) if available
     init_fn = getattr(bot_app, "init_app_for_runtime", None)
     if init_fn is None:
         logger.warning("bot_app.init_app_for_runtime not found — skipping optional bot_app runtime init")
@@ -245,18 +239,17 @@ async def on_startup_app(app):
 
     # choose mode
     if FORCE_POLLING or KEEP_BOT_ALIVE or not WEBHOOK_URL:
-        # Ensure webhook is actually removed before polling to avoid TerminatedByOtherGetUpdates
+        # Ensure webhook removed before polling
         try:
             ok = await ensure_no_webhook_before_polling()
             if not ok:
                 logger.warning(
-                    "Webhook may still be present at Telegram side. Polling will still be started, "
-                    "but you may see TerminatedByOtherGetUpdates until webhook is cleared."
+                    "Webhook may still be present on Telegram side. Polling will still be started, "
+                    "but TerminatedByOtherGetUpdates may occur until webhook is cleared."
                 )
         except Exception:
             logger.exception("ensure_no_webhook_before_polling failed (continuing)")
 
-        # avoid starting multiple polling tasks
         if app.get('polling_task') and not app['polling_task'].done():
             logger.info("Polling task already running - skipping starting another one.")
         else:
