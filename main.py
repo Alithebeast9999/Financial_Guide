@@ -322,4 +322,124 @@ async def on_cleanup_app(app):
     # stop polling if active
     polling_task = app.get('polling_task')
     if polling_task:
-        tr
+        try:
+            await dp.stop_polling()
+        except Exception:
+            logger.debug("dp.stop_polling() failed or not available", exc_info=True)
+        polling_task.cancel()
+        try:
+            await polling_task
+        except Exception:
+            pass
+
+    # delete webhook only if NOT KEEP_BOT_ALIVE
+    if not KEEP_BOT_ALIVE:
+        try:
+            await bot.delete_webhook()
+            logger.info("Webhook deleted on cleanup")
+        except Exception:
+            logger.debug("Failed to delete webhook on cleanup", exc_info=True)
+    else:
+        logger.info("KEEP_BOT_ALIVE=True -> skipping webhook deletion")
+
+    # shutdown scheduler
+    try:
+        scheduler.shutdown(wait=False)
+        logger.info("Scheduler shutdown")
+    except Exception:
+        logger.debug("Scheduler shutdown failed", exc_info=True)
+
+    # close storage
+    try:
+        await dp.storage.close()
+        await dp.storage.wait_closed()
+        logger.info("Storage closed")
+    except Exception:
+        logger.debug("Storage close failed", exc_info=True)
+
+    # close bot session & bot only if NOT KEEP_BOT_ALIVE
+    if not KEEP_BOT_ALIVE:
+        try:
+            sess = None
+            try:
+                sess = await bot.get_session()
+            except Exception:
+                sess = getattr(bot, 'session', None)
+            if sess:
+                try:
+                    await sess.close()
+                    logger.info('bot.session closed explicitly')
+                except Exception:
+                    logger.exception('Error while closing bot session')
+        except Exception:
+            logger.exception('Failed while closing bot session')
+        try:
+            await bot.close()
+            logger.info('Bot closed (client session closed)')
+        except Exception:
+            logger.exception('Error while closing bot')
+    else:
+        logger.info('KEEP_BOT_ALIVE=True -> skipping bot.close()')
+
+    # close sqlite connection from bot_app if present
+    try:
+        maybe_conn = getattr(bot_app, "conn", None)
+        if maybe_conn:
+            try:
+                maybe_conn.close()
+                logger.info('DB connection closed (bot_app.conn)')
+            except Exception:
+                logger.debug('DB close (bot_app.conn) failed', exc_info=True)
+    except Exception:
+        logger.debug('bot_app.conn check failed', exc_info=True)
+
+    logger.info('Cleanup complete')
+
+
+# Admin endpoints
+async def set_webhook_handler(request: web.Request):
+    if not WEBHOOK_URL:
+        return web.json_response({"ok": False, "error": "WEBHOOK_URL not configured"}, status=400)
+    webhook = WEBHOOK_URL.rstrip("/") + "/webhook"
+    try:
+        await bot.set_webhook(webhook)
+        return web.json_response({"ok": True, "webhook": webhook})
+    except Exception as e:
+        logger.exception('set_webhook_handler failed')
+        return web.json_response({"ok": False, "error": str(e)})
+
+
+async def debug_handler(request: web.Request):
+    info = {
+        'queue_size': _updates_queue.qsize() if _updates_queue else None,
+        'worker_running': _worker_task is not None and not _worker_task.done(),
+        'scheduler_running': scheduler.running,
+        'force_polling': FORCE_POLLING,
+        'keep_bot_alive': KEEP_BOT_ALIVE,
+        'webhook_url_env': WEBHOOK_URL,
+    }
+    try:
+        wh = await bot.get_webhook_info()
+        info['telegram_webhook'] = wh.to_python() if wh else None
+    except Exception as e:
+        info['telegram_webhook_error'] = str(e)
+    return web.json_response(info)
+
+
+def create_app():
+    app = web.Application()
+    app.router.add_get('/', handle_root)
+    app.router.add_post('/webhook', handle_webhook)
+    app.router.add_post('/set_webhook', set_webhook_handler)
+    app.router.add_get('/debug', debug_handler)
+    app.on_startup.append(on_startup_app)
+    app.on_cleanup.append(on_cleanup_app)
+    return app
+
+
+if __name__ == '__main__':
+    loop = asyncio.get_event_loop()
+    _register_signal_handlers(loop)
+    app = create_app()
+    logger.info(f"Starting web app on 0.0.0.0:{PORT} (FORCE_POLLING={FORCE_POLLING}, KEEP_BOT_ALIVE={KEEP_BOT_ALIVE})")
+    web.run_app(app, host='0.0.0.0', port=PORT)
