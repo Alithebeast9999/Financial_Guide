@@ -90,6 +90,7 @@ async def polling_runner(app):
             except Exception:
                 pass
             logger.info("Starting dp.start_polling()")
+            # timeout argument differs between aiogram versions; keep default behavior
             await dp.start_polling(timeout=20)
             logger.info("dp.start_polling() ended normally")
             break
@@ -123,7 +124,22 @@ async def on_startup_app(app):
     logger.info("on_startup_app: initializing")
 
     # Initialize bot_app internals (db_lock, scheduler jobs, etc.)
-    await bot_app.init_app_for_runtime(app)
+    init_fn = getattr(bot_app, "init_app_for_runtime", None)
+    if init_fn is None:
+        logger.warning("bot_app.init_app_for_runtime not found — skipping optional bot_app runtime init")
+    else:
+        try:
+            if asyncio.iscoroutinefunction(init_fn):
+                logger.info("Calling bot_app.init_app_for_runtime (async)...")
+                await init_fn(app)
+            else:
+                # sync function: run in executor to avoid blocking event loop
+                logger.info("Calling bot_app.init_app_for_runtime (sync) in executor...")
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, init_fn, app)
+            logger.info("bot_app.init_app_for_runtime completed")
+        except Exception:
+            logger.exception("bot_app.init_app_for_runtime raised an exception (continuing startup)")
 
     # Queue + worker for webhook handling
     _updates_queue = asyncio.Queue(maxsize=2000)
@@ -273,12 +289,17 @@ async def on_cleanup_app(app):
     else:
         logger.info('KEEP_BOT_ALIVE=True -> skipping bot.close()')
 
-    # close sqlite connection
+    # close sqlite connection from bot_app if present
     try:
-        bot_app.conn.close()
-        logger.info('DB connection closed')
+        maybe_conn = getattr(bot_app, "conn", None)
+        if maybe_conn:
+            try:
+                maybe_conn.close()
+                logger.info('DB connection closed (bot_app.conn)')
+            except Exception:
+                logger.debug('DB close (bot_app.conn) failed', exc_info=True)
     except Exception:
-        logger.debug('DB close failed', exc_info=True)
+        logger.debug('bot_app.conn check failed', exc_info=True)
 
     logger.info('Cleanup complete')
 
