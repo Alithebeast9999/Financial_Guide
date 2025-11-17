@@ -1,3 +1,4 @@
+Добавь подтверждение для  рестарт и внеси соответствующие изменения в мой код.
 # bot_app.py
 import os
 import logging
@@ -105,13 +106,7 @@ def get_expenses(uid, limit=10):
     cursor.execute("SELECT id, amount, category, timestamp FROM expenses WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?", (uid, limit))
     return cursor.fetchall()
 
-def
-delete
-()
-
-def
-delete_expens
-e(eid):
+def delete_expense(eid):
     cursor.execute("DELETE FROM expenses WHERE id = ?", (eid,))
     conn.commit()
 
@@ -198,7 +193,7 @@ def _add_scheduler_jobs_once():
 
 # ---------------- UI helpers ----------------
 def get_main_keyboard():
-kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.add("➕ Добавить трату", "📜 История")
     kb.add("📊 Моя статистика", "ℹ️ Помощь")
     return kb
@@ -294,12 +289,9 @@ async def set_income_handler(msg: types.Message, state: FSMContext):
 @dp.message_handler(lambda m: m.text == "➕ Добавить трату")
 async def add_expense_cmd(msg: types.Message):
     await msg.reply("💸 Введи сумму траты (например: 450): (или /cancel чтобы отменить)")
-    await
-ExpenseState.amount.set()
+    await ExpenseState.amount.set()
 
-@dp.m
-essage_handler
-(state=ExpenseState.amount)
+@dp.message_handler(state=ExpenseState.amount)
 async def expense_amount(msg: types.Message, state: FSMContext):
     text = msg.text or ""
     if text.startswith("/"):
@@ -402,8 +394,7 @@ async def add_recurring(msg: types.Message):
     await msg.reply("Введи сумму регулярного расхода (или /cancel):")
     await RecurringState.amount.set()
 
-@dp.message_handler(state=RecurringS
-tate.amount)
+@dp.message_handler(state=RecurringState.amount)
 async def recurring_amount(msg: types.Message, state: FSMContext):
     text = msg.text or ""
     if text.startswith("/"):
@@ -507,7 +498,7 @@ async def init_app_for_runtime(app):
     _add_scheduler_jobs_once()
     try:
         scheduler.start()
-logger.info("Scheduler started (bot_app)")
+        logger.info("Scheduler started (bot_app)")
     except Exception:
         logger.exception("Failed to start scheduler (bot_app)")
 
@@ -529,4 +520,4 @@ logger.info("Scheduler started (bot_app)")
         logger.debug("DB ensure tables failed (ignored)")
 
 # Exported names for main.py convenience
-all = ("bot", "dp", "scheduler", "init_app_for_runtime", "get_main_keyboard", "format_stats")
+__all__ = ("bot", "dp", "scheduler", "init_app_for_runtime", "get_main_keyboard", "format_stats")
