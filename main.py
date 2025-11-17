@@ -3,6 +3,8 @@ import os
 import logging
 import asyncio
 import signal
+import inspect
+import aiohttp
 from aiohttp import web
 
 from aiogram.utils.exceptions import TerminatedByOtherGetUpdates
@@ -29,8 +31,8 @@ _worker_task = None
 async def webhook_worker():
     logger.info("Webhook worker started")
     try:
-        # prefer instance method if available, fallback to classmethod
         try:
+            # prefer instance method; fallback to class method
             bot.set_current(bot)
         except Exception:
             try:
@@ -96,7 +98,6 @@ async def ensure_no_webhook(max_retries=6, delay=1.0):
             wh = await bot.get_webhook_info()
             url = None
             try:
-                # wh may be None or have attribute 'url' or method to_python
                 url = getattr(wh, "url", None)
                 if url is None and hasattr(wh, "to_python"):
                     url = wh.to_python().get("url")
@@ -132,7 +133,6 @@ async def polling_runner(app):
                 except Exception:
                     pass
             logger.info("Starting dp.start_polling()")
-            # make sure webhook is not set — attempt removal
             try:
                 await ensure_no_webhook()
             except Exception:
@@ -144,7 +144,6 @@ async def polling_runner(app):
             logger.info("Polling runner cancelled")
             raise
         except TerminatedByOtherGetUpdates:
-            # another getUpdates exists for same token — attempt recovery:
             logger.warning(
                 "TerminatedByOtherGetUpdates — another getUpdates exists. "
                 "Attempting webhook deletion and sleeping before retry."
@@ -153,8 +152,7 @@ async def polling_runner(app):
                 await bot.delete_webhook(drop_pending_updates=True)
                 logger.info("delete_webhook called to recover from TerminatedByOtherGetUpdates")
             except Exception:
-                logger.debug("delete_webhook during TerminatedByOtherGetUpdates recovery failed", exc_info=True)
-            # sleep longer to let the other client finish
+                logger.debug("delete_webhook during recovery failed", exc_info=True)
             await asyncio.sleep(60)
             backoff = 1
         except Exception:
@@ -175,6 +173,17 @@ def _register_signal_handlers(loop):
     except NotImplementedError:
         logger.debug("Signal handlers not supported on this platform")
 
+async def _close_if_session(obj, name_hint=None):
+    """Close object if it's an aiohttp.ClientSession (async)."""
+    if isinstance(obj, aiohttp.ClientSession):
+        try:
+            await obj.close()
+            logger.info("Closed aiohttp.ClientSession %s", name_hint or "")
+            return True
+        except Exception:
+            logger.exception("Failed to close aiohttp.ClientSession %s", name_hint or "")
+    return False
+
 async def on_startup_app(app):
     global _updates_queue, _worker_task
     logger.info("on_startup_app: initializing")
@@ -194,11 +203,17 @@ async def on_startup_app(app):
     app['updates_queue'] = _updates_queue
     _worker_task = asyncio.create_task(webhook_worker())
 
-    # obtain bot session inside async context to avoid DeprecationWarning
+    # obtain and store bot session inside async context to close later
     try:
         sess = await bot.get_session()
-        app['bot_session'] = sess
-        logger.info("Bot session ready")
+        # ensure it's aiohttp.ClientSession
+        if isinstance(sess, aiohttp.ClientSession):
+            app['bot_session'] = sess
+            logger.info("Bot session ready and saved to app['bot_session']")
+        else:
+            # If get_session returned something else, still keep it for inspection
+            app['bot_session'] = sess
+            logger.info("Bot.get_session returned object (saved) — type=%s", type(sess))
     except Exception:
         logger.exception("Failed to get bot session on startup (non-fatal)")
 
@@ -212,7 +227,6 @@ async def on_startup_app(app):
 
     # choose mode
     if FORCE_POLLING or KEEP_BOT_ALIVE or not WEBHOOK_URL:
-        # ensure webhook removed before polling (best-effort)
         try:
             await ensure_no_webhook(max_retries=6)
             logger.info("Ensuring no webhook is set before polling (max_retries=6)")
@@ -280,7 +294,6 @@ async def on_cleanup_app(app):
     polling_task = app.get('polling_task')
     if polling_task:
         try:
-            # attempt graceful stop of dispatcher
             try:
                 await dp.stop_polling()
             except Exception:
@@ -315,29 +328,80 @@ async def on_cleanup_app(app):
     except Exception:
         logger.debug("Storage close failed", exc_info=True)
 
-    # close bot session & bot
+    # --- Aggressive session cleanup (fix Unclosed client session) ---
+    # 1) close saved app['bot_session'] if it exists
     try:
-        # prefer stored session
-        sess = app.get('bot_session')
-        if not sess:
-            try:
-                sess = await bot.get_session()
-            except Exception:
-                sess = getattr(bot, 'session', None)
-        if sess:
-            try:
-                await sess.close()
-                logger.info('bot.session closed explicitly')
-            except Exception:
-                logger.exception('Error while closing bot session')
+        bot_sess = app.get('bot_session')
+        closed_any = False
+        if bot_sess:
+            if isinstance(bot_sess, aiohttp.ClientSession):
+                try:
+                    await bot_sess.close()
+                    logger.info("Closed app['bot_session']")
+                    closed_any = True
+                except Exception:
+                    logger.exception("Failed to close app['bot_session']")
+            else:
+                logger.info("app['bot_session'] exists but is not aiohttp.ClientSession: %s", type(bot_sess))
     except Exception:
-        logger.exception('Failed while closing bot session')
+        logger.exception("Error while closing app['bot_session']")
 
+    # 2) try to find session objects attached to bot instance (common names)
+    try:
+        session_attrs = ['session', '_session', 'client_session', '_client_session', 'sess', '_sess']
+        for attr in session_attrs:
+            sess = getattr(bot, attr, None)
+            if isinstance(sess, aiohttp.ClientSession):
+                try:
+                    await sess.close()
+                    logger.info("Closed bot.%s session", attr)
+                    closed_any = True
+                except Exception:
+                    logger.exception("Failed to close bot.%s", attr)
+    except Exception:
+        logger.exception("Error while inspecting bot for session attributes")
+
+    # 3) search bot_app module for any ClientSession instances (best-effort)
+    try:
+        for name, val in vars(bot_app).items():
+            if isinstance(val, aiohttp.ClientSession):
+                try:
+                    await val.close()
+                    logger.info("Closed bot_app.%s ClientSession", name)
+                    closed_any = True
+                except Exception:
+                    logger.exception("Failed to close bot_app.%s ClientSession", name)
+    except Exception:
+        logger.debug("Scanning bot_app for sessions failed", exc_info=True)
+
+    # 4) finally call bot.close() which should close internal session(s)
     try:
         await bot.close()
-        logger.info('Bot closed (client session closed)')
+        logger.info('Bot closed (await bot.close())')
     except Exception:
-        logger.exception('Error while closing bot')
+        logger.exception('Error while awaiting bot.close()')
+
+    # 5) after bot.close() try again to find stray aiohttp sessions in globals (last resort)
+    try:
+        # walk module globals in current process (limited check) - do not over-scan to avoid noise
+        possible = []
+        mod_names = ['bot_app']
+        for modname in mod_names:
+            mod = globals().get(modname)
+            if mod:
+                for k, v in getattr(mod, '__dict__', {}).items():
+                    if isinstance(v, aiohttp.ClientSession):
+                        try:
+                            await v.close()
+                            logger.info("Closed %s.%s ClientSession (post bot.close)", modname, k)
+                            closed_any = True
+                        except Exception:
+                            logger.exception("Failed to close %s.%s ClientSession", modname, k)
+    except Exception:
+        logger.debug("Final scan for ClientSession failed", exc_info=True)
+
+    if not closed_any:
+        logger.info("No aiohttp.ClientSession explicitly closed in cleanup (either already closed or none found).")
 
     # close sqlite connection
     try:
