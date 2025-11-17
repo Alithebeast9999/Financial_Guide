@@ -30,7 +30,13 @@ _worker_task = None
 async def webhook_worker():
     logger.info("Webhook worker started")
     try:
-        bot_app.Bot.set_current(bot)
+        # prefer using aiogram.Bot.set_current if available via bot_app
+        try:
+            bot_app.Bot.set_current(bot)
+        except Exception:
+            # fallback to direct Bot
+            from aiogram import Bot as AiogramBot  # local import fallback
+            AiogramBot.set_current(bot)
     except Exception:
         logger.debug("Bot.set_current failed in worker")
     while True:
@@ -133,8 +139,16 @@ async def ensure_no_webhook_before_polling(max_retries: int = 6, base_sleep: flo
 
 
 async def polling_runner(app):
+    """
+    Robust polling loop:
+    - Exponential backoff for generic crashes
+    - Larger, exponential backoff for TerminatedByOtherGetUpdates
+    - After several Terminateds, try switching to webhook-mode (if WEBHOOK_URL set)
+    """
     backoff = 1
     max_backoff = 60
+    term_backoff = 60
+    max_term_backoff = 3600  # up to 1 hour
     terminated_count = 0
     terminated_threshold_to_switch = 3  # after this, attempt switch to webhook (if WEBHOOK_URL present)
     logger.info("Polling runner started")
@@ -145,7 +159,7 @@ async def polling_runner(app):
             except Exception:
                 pass
             logger.info("Starting dp.start_polling()")
-            # aiogram dp.start_polling() usually blocks until cancelled or error
+            # dp.start_polling blocks until canceled or error
             await dp.start_polling(timeout=20)
             logger.info("dp.start_polling() ended normally")
             break
@@ -154,27 +168,25 @@ async def polling_runner(app):
             raise
         except TerminatedByOtherGetUpdates:
             terminated_count += 1
-            logger.warning("TerminatedByOtherGetUpdates encountered (count=%s).", terminated_count)
-            # If we see several, and WEBHOOK_URL exists, attempt to switch to webhook mode:
+            logger.warning("TerminatedByOtherGetUpdates encountered (count=%s). Going into term-backoff %ss.", terminated_count, term_backoff)
+            # If many Terminateds and WEBHOOK_URL exists, attempt to set webhook and stop polling
             if terminated_count >= terminated_threshold_to_switch and WEBHOOK_URL:
                 webhook = WEBHOOK_URL.rstrip("/") + "/webhook"
                 try:
                     logger.info("Attempting to set webhook '%s' after %s Terminated errors.", webhook, terminated_count)
                     await bot.set_webhook(webhook)
                     logger.info("Webhook set successfully; stopping polling runner to let webhook handle updates.")
-                    # break to stop polling runner; webhook worker + aiohttp will handle updates
                     break
                 except Exception:
-                    logger.exception("Failed to set webhook during TerminatedByOtherGetUpdates handling; will wait and retry polling")
-                    # increase backoff to avoid thrash
-                    await asyncio.sleep(60)
-                    backoff = min(max_backoff, backoff * 2)
-                    continue
-            # otherwise short sleep and retry
-            await asyncio.sleep(60)
+                    logger.exception("Failed to set webhook during TerminatedByOtherGetUpdates handling; will backoff and retry polling")
+                    # fall through to wait and retry later
+            # backoff increase (so we don't hammer Telegram)
+            await asyncio.sleep(term_backoff)
+            term_backoff = min(max_term_backoff, term_backoff * 2)
+            # reset small generic backoff
             backoff = 1
         except Exception:
-            logger.exception("Polling crashed, will retry")
+            logger.exception("Polling crashed, will retry with exponential backoff (generic)")
             await asyncio.sleep(backoff)
             backoff = min(max_backoff, backoff * 2)
 
