@@ -1,4 +1,4 @@
-# main.py  (patched)
+# main.py — hardened against TerminatedByOtherGetUpdates and session leaks
 import os
 import logging
 import asyncio
@@ -7,7 +7,7 @@ from aiohttp import web
 
 from aiogram.utils.exceptions import TerminatedByOtherGetUpdates
 
-import bot_app  # <- содержит bot, dp, scheduler, handlers
+import bot_app  # contains bot, dp, scheduler, handlers
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -22,9 +22,12 @@ dp = bot_app.dp
 scheduler = bot_app.scheduler
 conn = getattr(bot_app, "conn", None)
 
+# runtime
 _updates_queue = None
 _worker_task = None
-_polling_task = None
+
+# If conflict happens, set this True to avoid tight-looping retries
+_polling_conflict_detected = False
 
 async def webhook_worker():
     logger.info("Webhook worker started")
@@ -98,6 +101,7 @@ async def ensure_no_webhook_before_polling(max_retries: int = 6, base_sleep: flo
         except Exception:
             logger.exception("Failed to check/delete webhook (attempt %s).", attempt)
         await asyncio.sleep(base_sleep * attempt)
+    # final check
     try:
         wh = await bot.get_webhook_info()
         url = ""
@@ -112,12 +116,40 @@ async def ensure_no_webhook_before_polling(max_retries: int = 6, base_sleep: flo
         logger.exception("Final webhook check failed")
         return False
 
+async def _close_bot_sessions():
+    """
+    Robustly close any aiohttp ClientSession attached to the bot.
+    """
+    try:
+        # preferred: await bot.get_session() (aiogram API)
+        sess = None
+        try:
+            sess = await bot.get_session()
+        except Exception:
+            sess = getattr(bot, 'session', None) or getattr(bot, '_session', None) or getattr(bot, '__session', None)
+        if sess:
+            # if it's an aiohttp.ClientSession, close it
+            try:
+                if hasattr(sess, "closed"):
+                    if not sess.closed:
+                        await sess.close()
+                        logger.info("Closed bot aiohttp session (await).")
+                else:
+                    # fallback: try calling close (may be coroutine)
+                    res = sess.close()
+                    if asyncio.iscoroutine(res):
+                        await res
+                        logger.info("Closed bot aiohttp session (coroutine close).")
+            except Exception:
+                logger.exception("Error while closing bot session.")
+    except Exception:
+        logger.exception("Unexpected error when trying to close bot sessions.")
+
 async def polling_runner(app):
     """
-    Start polling. If Telegram returns TerminatedByOtherGetUpdates -> stop polling (don't loop forever).
+    Start polling. If TerminatedByOtherGetUpdates is raised, mark conflict and stop (no tight retry).
     """
-    backoff = 1
-    max_backoff = 60
+    global _polling_conflict_detected
     logger.info("Polling runner started")
     try:
         try:
@@ -131,10 +163,9 @@ async def polling_runner(app):
         logger.info("Polling runner cancelled")
         raise
     except TerminatedByOtherGetUpdates:
-        # **IMPORTANT**: Telegram says another getUpdates is active (or webhook set).
-        # Stop polling to avoid infinite error flood and session leaks.
-        logger.error("TerminatedByOtherGetUpdates detected — another client or webhook is active. Stopping polling runner.")
-        # optionally try to switch to webhook if configured
+        logger.error("TerminatedByOtherGetUpdates detected — another getUpdates client or webhook is active. Stopping polling runner.")
+        _polling_conflict_detected = True
+        # Try to set webhook if configured (best-effort)
         if WEBHOOK_URL:
             try:
                 webhook = WEBHOOK_URL.rstrip("/") + "/webhook"
@@ -142,10 +173,16 @@ async def polling_runner(app):
                 logger.info("Attempted to set webhook automatically: %s", webhook)
             except Exception:
                 logger.exception("Automatic set_webhook failed (ignored).")
+        # Ensure we close sessions proactively to avoid leaks
+        try:
+            await _close_bot_sessions()
+        except Exception:
+            logger.exception("Error while closing sessions after TerminatedByOtherGetUpdates.")
         return
     except Exception:
-        logger.exception("Polling crashed with an unexpected error; will retry using backoff.")
-        # fallback retry logic (keeps a reasonable backoff)
+        logger.exception("Polling crashed unexpectedly; entering retry loop with backoff.")
+        backoff = 1
+        max_backoff = 60
         while True:
             try:
                 await asyncio.sleep(backoff)
@@ -160,6 +197,7 @@ async def polling_runner(app):
                 raise
             except TerminatedByOtherGetUpdates:
                 logger.error("TerminatedByOtherGetUpdates detected during retry — stopping polling runner.")
+                _polling_conflict_detected = True
                 if WEBHOOK_URL:
                     try:
                         webhook = WEBHOOK_URL.rstrip("/") + "/webhook"
@@ -167,9 +205,14 @@ async def polling_runner(app):
                         logger.info("Attempted to set webhook automatically: %s", webhook)
                     except Exception:
                         logger.exception("Automatic set_webhook failed (ignored).")
+                try:
+                    await _close_bot_sessions()
+                except Exception:
+                    logger.exception("Error while closing sessions after conflict.")
                 return
             except Exception:
-                logger.exception("Retry of dp.start_polling failed; will wait and retry again.")
+                logger.exception("Retry of dp.start_polling failed; will try again.")
+
     logger.info("Polling runner finished (exiting)")
 
 _shutdown_initiator = {"signal": None}
@@ -185,30 +228,11 @@ def _register_signal_handlers(loop):
     except NotImplementedError:
         logger.debug("Signal handlers not supported on this platform")
 
-async def _close_bot_sessions():
-    """
-    Try to robustly close any aiohttp.ClientSession attached to the Bot.
-    """
-    try:
-        # prefer await bot.get_session() if available
-        sess = None
-        try:
-            sess = await bot.get_session()
-        except Exception:
-            sess = getattr(bot, 'session', None) or getattr(bot, '_session', None) or getattr(bot, '__session', None)
-        if sess:
-            try:
-                if not sess.closed:
-                    await sess.close()
-            except Exception:
-                logger.exception("Error while closing bot session.")
-    except Exception:
-        logger.exception("Unexpected error when trying to close bot sessions.")
-
 async def on_startup_app(app):
-    global _updates_queue, _worker_task, _polling_task
+    global _updates_queue, _worker_task
     logger.info("on_startup_app: initializing")
 
+    # optional per-app init
     init_fn = getattr(bot_app, "init_app_for_runtime", None)
     if init_fn:
         try:
@@ -237,6 +261,12 @@ async def on_startup_app(app):
         logger.info("keep_alive_ping started (KEEP_BOT_ALIVE=True)")
 
     app['keep_alive'] = asyncio.create_task(asyncio.sleep(3600 * 24))
+
+    # choose mode
+    # if conflict previously detected, skip polling to avoid immediate repeated Terminateds
+    if _polling_conflict_detected:
+        logger.warning("Polling previously conflicted with another client; skipping polling startup. Consider using webhook.")
+        return
 
     if FORCE_POLLING or KEEP_BOT_ALIVE or not WEBHOOK_URL:
         try:
@@ -319,6 +349,7 @@ async def on_cleanup_app(app):
         except Exception:
             pass
 
+    # Best-effort delete webhook (safe)
     try:
         await bot.delete_webhook()
         logger.info("Webhook deletion requested during cleanup (best-effort).")
@@ -338,7 +369,26 @@ async def on_cleanup_app(app):
     except Exception:
         logger.debug("Storage close failed", exc_info=True)
 
-    # robustly close bot aiohttp sessions
+    # robustly close bot sessions and client sessions to avoid "Unclosed client session"
+    try:
+        # close session stored in app as well
+        app_sess = app.get('bot_session')
+        if app_sess:
+            try:
+                if hasattr(app_sess, "closed"):
+                    if not app_sess.closed:
+                        await app_sess.close()
+                        logger.info("Closed app['bot_session']")
+                else:
+                    res = app_sess.close()
+                    if asyncio.iscoroutine(res):
+                        await res
+                        logger.info("Closed app['bot_session'] (coroutine close)")
+            except Exception:
+                logger.exception("Failed to close app['bot_session']")
+    except Exception:
+        logger.exception("Error while closing app-stored bot session (ignored)")
+
     try:
         await _close_bot_sessions()
     except Exception:
@@ -375,10 +425,11 @@ async def debug_handler(request: web.Request):
     info = {
         'queue_size': _updates_queue.qsize() if _updates_queue else None,
         'worker_running': _worker_task is not None and not _worker_task.done(),
-        'scheduler_running': scheduler.running,
+        'scheduler_running': getattr(scheduler, 'running', None),
         'force_polling': FORCE_POLLING,
         'keep_bot_alive': KEEP_BOT_ALIVE,
         'webhook_url_env': WEBHOOK_URL,
+        'polling_conflict_detected': _polling_conflict_detected,
     }
     try:
         wh = await bot.get_webhook_info()
