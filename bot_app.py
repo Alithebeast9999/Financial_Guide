@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
 Resilient Telegram Finance Assistant — webhook queue + optional resilient polling.
-Исправление: polling НЕ запускается автоматически при KEEP_BOT_ALIVE=True (чтобы избежать TerminatedByOtherGetUpdates).
+Исправления:
+ - db_lock создаётся на старте (on_startup_app), а не на уровне импорта
+ - webhook worker выставляет Dispatcher.set_current(dp) и Bot.set_current(bot) перед обработкой
+ - safe shutdown для scheduler (проверка наличия loop)
+ - KEEP_BOT_ALIVE не принуждает polling автоматически
 """
 import os
 import logging
@@ -17,26 +21,24 @@ from apscheduler.triggers.cron import CronTrigger
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
-from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.types import Update as TgUpdate
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# для детектирования специфичного исключения polling-а
 from aiogram.utils.exceptions import TerminatedByOtherGetUpdates
+from aiogram import Bot as AiogramBot
+from aiogram.dispatcher.dispatcher import Dispatcher as AiogramDispatcher
 
 # ---------------- Config ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # e.g. https://financial-guide.onrender.com
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 PORT = int(os.environ.get("PORT", 10000))
 TZ = pytz.timezone("Europe/Moscow")
 
-# Controls
 FORCE_POLLING = os.environ.get("FORCE_POLLING", "0") == "1"
-# Default keep-alive ON: bot won't be closed on cleanup unless KEEP_BOT_ALIVE is explicitly "0"
 KEEP_BOT_ALIVE = os.environ.get("KEEP_BOT_ALIVE", "1") != "0"
 
 if not BOT_TOKEN:
@@ -57,8 +59,8 @@ cursor.execute("""CREATE TABLE IF NOT EXISTS expenses (id INTEGER PRIMARY KEY AU
 cursor.execute("""CREATE TABLE IF NOT EXISTS recurring (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount REAL, category TEXT, day INTEGER)""")
 conn.commit()
 
-# small DB lock to avoid concurrent writes
-db_lock = asyncio.Lock()
+# db_lock is created on startup (not at import) to avoid loop binding issues. <<< FIX
+db_lock = None
 
 # ---------------- Categories & states -------------
 CATEGORIES = {
@@ -82,6 +84,9 @@ class RecurringState(StatesGroup):
 
 # ---------------- Helpers & DB access ------------
 async def ensure_user(uid: int):
+    global db_lock
+    if db_lock is None:
+        db_lock = asyncio.Lock()
     async with db_lock:
         cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (uid,))
         conn.commit()
@@ -106,6 +111,9 @@ def get_limits_from_income(income: float):
 
 async def add_expense(uid, amount, category, ts=None, rec_id=None):
     ts = ts or datetime.now(TZ)
+    global db_lock
+    if db_lock is None:
+        db_lock = asyncio.Lock()
     async with db_lock:
         cursor.execute("INSERT INTO expenses (user_id, amount, category, timestamp, recurring_id) VALUES (?, ?, ?, ?, ?)",
                        (uid, amount, category, ts.isoformat(), rec_id))
@@ -189,7 +197,6 @@ async def process_recurring():
         except Exception:
             pass
 
-# add scheduling jobs (idempotent)
 def _add_scheduler_jobs_once():
     try:
         if not scheduler.get_job("daily_reminders"):
@@ -202,7 +209,6 @@ def _add_scheduler_jobs_once():
         logger.exception("Failed to add scheduler jobs")
 
 # ---------------- UI helpers ----------------
-
 def get_main_keyboard():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.add("➕ Добавить трату", "📜 История")
@@ -229,7 +235,7 @@ def build_limits_table_html(income: float) -> str:
     pre_block = "<pre>" + "\n".join(lines) + "</pre>"
     return pre_block
 
-# ---------------- Handlers (minimal included) ----------------
+# ---------------- Handlers ----------------
 @dp.message_handler(commands=['start'])
 async def start(msg: types.Message):
     uid = msg.from_user.id
@@ -245,8 +251,6 @@ async def start(msg: types.Message):
     await IncomeState.income.set()
     await msg.reply(welcome, reply_markup=kb)
 
-# (Остальные хендлеры — как в прежней версии; при необходимости можно вставить полный набор)
-
 # ---------------- WEBHOOK queue & worker ----
 _updates_queue = None
 _worker_task = None
@@ -254,21 +258,41 @@ _worker_task = None
 async def webhook_worker():
     logger.info("Webhook worker started")
     try:
-        Bot.set_current(bot)
+        AiogramBot.set_current(bot)
     except Exception:
-        logger.debug("Failed to set current Bot in worker")
+        logger.debug("Failed to set current Bot in worker pre-loop")
     while True:
         try:
             update = await _updates_queue.get()
             try:
+                # <<< FIX: set Dispatcher and Bot current so FSM (IncomeState) works
                 try:
-                    Bot.set_current(bot)
+                    AiogramDispatcher.set_current(dp)
                 except Exception:
-                    pass
+                    try:
+                        dp.set_current(dp)
+                    except Exception:
+                        logger.debug("Failed to set Dispatcher current in worker")
+                try:
+                    AiogramBot.set_current(bot)
+                except Exception:
+                    try:
+                        bot.set_current(bot)
+                    except Exception:
+                        logger.debug("Failed to set Bot current in worker")
                 await dp.process_update(update)
             except Exception:
                 logger.exception("Error while processing update (worker)")
             finally:
+                # cleanup context
+                try:
+                    AiogramDispatcher.set_current(None)
+                except Exception:
+                    pass
+                try:
+                    AiogramBot.set_current(None)
+                except Exception:
+                    pass
                 _updates_queue.task_done()
         except asyncio.CancelledError:
             logger.info("Webhook worker cancelled")
@@ -294,7 +318,6 @@ async def handle_root(request: web.Request):
 
 # ---------------- keep-alive ping ----------------
 async def keep_alive_ping():
-    """Periodically call Telegram API to keep session healthy (only when KEEP_BOT_ALIVE=True)."""
     while True:
         try:
             await bot.get_me()
@@ -306,7 +329,6 @@ async def keep_alive_ping():
 async def polling_runner(app):
     backoff = 1
     max_backoff = 60
-    # Avoid starting multiple polling tasks
     if app.get('polling_task_running'):
         logger.info("Polling already running; exiting runner")
         return
@@ -315,7 +337,7 @@ async def polling_runner(app):
     while True:
         try:
             try:
-                Bot.set_current(bot)
+                AiogramBot.set_current(bot)
             except Exception:
                 pass
             logger.info("Starting dp.start_polling()")
@@ -326,7 +348,6 @@ async def polling_runner(app):
             logger.info("Polling runner cancelled")
             raise
         except TerminatedByOtherGetUpdates as e:
-            # specific handling: backoff and retry (this happens when another instance uses getUpdates)
             logger.warning("Polling terminated by other getUpdates: %s — will backoff and retry", str(e))
             await asyncio.sleep(backoff)
             backoff = min(max_backoff, backoff * 2)
@@ -351,20 +372,21 @@ def _register_signal_handlers(loop):
         logger.debug("Signal handlers not supported on this platform")
 
 async def on_startup_app(app):
-    global _updates_queue, _worker_task
+    global _updates_queue, _worker_task, db_lock
     logger.info("on_startup_app: initializing")
+    # create db_lock on startup so it binds to running loop <<< FIX
+    if db_lock is None:
+        db_lock = asyncio.Lock()
+
     _updates_queue = asyncio.Queue(maxsize=2000)
     _worker_task = asyncio.create_task(webhook_worker())
 
-    # start keep-alive ping only if KEEP_BOT_ALIVE
     if KEEP_BOT_ALIVE:
         app['keep_alive_ping'] = asyncio.create_task(keep_alive_ping())
         logger.info("keep_alive_ping started (KEEP_BOT_ALIVE=True)")
 
-    # short dummy keep_alive task so Render's event loop remains busy
     app['keep_alive'] = asyncio.create_task(asyncio.sleep(3600*24))
 
-    # scheduler & jobs
     _add_scheduler_jobs_once()
     try:
         scheduler.start()
@@ -372,28 +394,24 @@ async def on_startup_app(app):
     except Exception:
         logger.exception("Failed to start scheduler")
 
-    # IMPORTANT CHANGE:
-    # polling is started only if FORCE_POLLING is True or if WEBHOOK_URL is not provided.
-    # KEEP_BOT_ALIVE no longer forces polling (prevents TerminatedByOtherGetUpdates).
+    # polling only when forced or no webhook configured
     if FORCE_POLLING or not WEBHOOK_URL:
         try:
             await bot.delete_webhook(drop_pending_updates=True)
             logger.info("Webhook deleted (pre-polling cleanup)")
         except Exception:
             logger.debug("No webhook to delete or delete failed")
-        # Start polling in background
         if not app.get('polling_task'):
             app['polling_task'] = asyncio.create_task(polling_runner(app))
             logger.info("Polling mode enabled")
     else:
-        # attempt to set webhook (webhook preferred when available)
+        # attempt to set webhook
         webhook = WEBHOOK_URL.rstrip("/") + "/webhook"
         try:
             await bot.set_webhook(webhook)
             logger.info("Webhook set successfully: %s", webhook)
         except Exception:
             logger.exception("set_webhook failed - falling back to polling")
-            # fallback to polling only if forced or webhook not usable
             try:
                 await bot.delete_webhook(drop_pending_updates=True)
             except Exception:
@@ -413,7 +431,6 @@ async def on_cleanup_app(app):
         except Exception:
             pass
 
-    # cancel keep_alive_ping
     if app.get('keep_alive_ping'):
         app['keep_alive_ping'].cancel()
         try:
@@ -460,11 +477,17 @@ async def on_cleanup_app(app):
     else:
         logger.info("KEEP_BOT_ALIVE=True -> skipping webhook deletion")
 
-    # shutdown scheduler
+    # shutdown scheduler safely (check _eventloop) <<< FIX
     try:
-        scheduler.shutdown(wait=False)
+        if hasattr(scheduler, "_eventloop") and getattr(scheduler, "_eventloop") is not None:
+            try:
+                scheduler.shutdown(wait=False)
+            except Exception:
+                logger.debug("Scheduler shutdown failed")
+        else:
+            logger.info("Scheduler exists but _eventloop is None (scheduler wasn't started in this process). Skipping shutdown.")
     except Exception:
-        logger.debug("Scheduler shutdown failed")
+        logger.exception("Scheduler shutdown check failed")
 
     # close storage
     try:
@@ -481,7 +504,6 @@ async def on_cleanup_app(app):
                 sess = await bot.get_session()
             except Exception:
                 sess = getattr(bot, 'session', None)
-
             if sess:
                 try:
                     await sess.close()
@@ -490,7 +512,6 @@ async def on_cleanup_app(app):
                     logger.debug('bot.session.close() failed')
         except Exception:
             logger.exception('Error while closing bot session')
-
         try:
             await bot.close()
             logger.info('Bot closed (client session closed)')
@@ -536,7 +557,6 @@ async def debug_handler(request: web.Request):
     return web.json_response(info)
 
 # ---------------- Create app & run ----------------
-
 def create_app():
     app = web.Application()
     app.router.add_get('/', handle_root)
