@@ -2,14 +2,11 @@
 """
 Entrypoint for Financial_Guide — robust, with auto-restart and heartbeat.
 
-Main additions vs prior version:
-- AUTO_RESTART loop around web.run_app to restart on unexpected exit
-- HEARTBEAT background task to produce periodic logs (helps detect early shutdown)
-- improved logging on exit reason and restart attempts
-- conservative defaults, controlled by env vars:
-    AUTO_RESTART (default "1") - enable auto restart
-    AUTO_RESTART_MAX (default "20") - max restart attempts before giving up
-    AUTO_RESTART_DELAY_S (default 2.0) - seconds to wait between restarts
+Fixes:
+- Do NOT mark shutdown-intent inside on_cleanup (this prevented auto-restart).
+- Use SHUTDOWN_REQUESTED flag set only by signal handler (SIGINT/SIGTERM).
+- Add extra logging so причина shutdown видна.
+- Keep other safeguards (heartbeat, scheduler safe stop, webhook handling).
 """
 import os
 import sys
@@ -18,6 +15,7 @@ import signal
 import logging
 import traceback
 import json
+import datetime as _dt
 from typing import Optional, Tuple, Any
 
 from aiohttp import web, ClientSession, ClientTimeout
@@ -48,25 +46,29 @@ WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # e.g. "https://yourdomain.com"
 WEBHOOK_PREFIX = os.environ.get("WEBHOOK_PREFIX", "/webhook").rstrip("/")
 WEBHOOK_AUTO_DELETE = os.environ.get("WEBHOOK_AUTO_DELETE", "0") in ("1", "true", "yes")
 
-# Auto-restart controls:
 AUTO_RESTART = os.environ.get("AUTO_RESTART", "1") in ("1", "true", "yes")
 AUTO_RESTART_MAX = int(os.environ.get("AUTO_RESTART_MAX", "20"))
 AUTO_RESTART_DELAY_S = float(os.environ.get("AUTO_RESTART_DELAY_S", "2.0"))
-
-# Heartbeat interval
 HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL", "30.0"))
+
+# --------------------
+# Global flags
+# --------------------
+# IMPORTANT: This flag is used to detect whether an external OS signal explicitly requested shutdown.
+# We set this in signal handler only. Previously we set app["shutting_down"] inside on_cleanup which
+# accidentally prevented an auto-restart. Now we keep shutdown request separate.
+SHUTDOWN_REQUESTED = False  # <<< FIX: don't set inside on_cleanup
 
 # --------------------
 # App container
 # --------------------
 app = web.Application()
-import datetime as _dt
 app["boot_time"] = _dt.datetime.utcnow().isoformat()
 app["polling_task"] = None
 app["client_session"] = None
 app["bot"] = None
 app["dp"] = None
-app["shutting_down"] = False
+app["shutting_down"] = False  # still present for internal use but not used as "do not restart" flag
 app["webhook_set_by_main"] = False
 app["webhook_full_url"] = None
 app["heartbeat_task"] = None
@@ -275,7 +277,7 @@ async def _close_db_if_any():
 async def _heartbeat_task():
     logger.info("Heartbeat task started (interval: %ss)", HEARTBEAT_INTERVAL)
     try:
-        while not app.get("shutting_down"):
+        while True:
             logger.debug("heartbeat: app alive (uptime %s s)", ( _dt.datetime.utcnow() - _dt.datetime.fromisoformat(app["boot_time"]) ).total_seconds())
             await asyncio.sleep(HEARTBEAT_INTERVAL)
     except asyncio.CancelledError:
@@ -288,28 +290,27 @@ async def _heartbeat_task():
 # --------------------
 # Startup
 # --------------------
-async def on_startup(app: web.Application):
+async def on_startup(a: web.Application):
     logger.info("on_startup: begin")
-    # create client session
-    if app.get("client_session") is None:
+    a["shutting_down"] = False  # internal state
+    if a.get("client_session") is None:
         try:
             session = create_client_session()
-            app["client_session"] = session
+            a["client_session"] = session
         except Exception as ex:
             _log_exception(ex, "Failed to create shared ClientSession")
-            app["client_session"] = None
+            a["client_session"] = None
     else:
         logger.info("on_startup: app already had client_session")
 
-    session = app.get("client_session")
+    session = a.get("client_session")
     bot, dp = await _init_bot_with_session_or_fallback(session)
-    app["bot"] = bot
-    app["dp"] = dp
+    a["bot"] = bot
+    a["dp"] = dp
 
-    # let bot_app init runtime (scheduler, locks)
     if _has_attr(bot_app, "init_app_for_runtime"):
         try:
-            maybe = bot_app.init_app_for_runtime(app)
+            maybe = bot_app.init_app_for_runtime(a)
             await maybe_await(maybe)
             logger.info("bot_app.init_app_for_runtime finished")
         except Exception as ex:
@@ -317,7 +318,7 @@ async def on_startup(app: web.Application):
     else:
         logger.info("bot_app.init_app_for_runtime not found (skipping)")
 
-    # set webhook if requested and bot present
+    # webhook set attempt (if configured)
     try:
         if WEBHOOK_URL and bot:
             token = getattr(bot, "token", None) or os.environ.get("BOT_TOKEN")
@@ -333,8 +334,8 @@ async def on_startup(app: web.Application):
                         maybe = set_hook_fn(full_url)
                         res = await maybe_await(maybe)
                         logger.info("Webhook set result: %s", res)
-                        app["webhook_set_by_main"] = True
-                        app["webhook_full_url"] = full_url
+                        a["webhook_set_by_main"] = True
+                        a["webhook_full_url"] = full_url
                     else:
                         logger.warning("bot.set_webhook not available on this Bot instance; skipping.")
                 except Exception as ex:
@@ -344,21 +345,19 @@ async def on_startup(app: web.Application):
     except Exception as ex:
         logger.exception("Unexpected error during webhook set attempt: %s", ex)
 
-    # start heartbeat task (helps debug unexpected exits)
     try:
         hb = asyncio.create_task(_heartbeat_task(), name="heartbeat")
-        app["heartbeat_task"] = hb
+        a["heartbeat_task"] = hb
     except Exception as ex:
         logger.debug("Failed to start heartbeat task: %s", ex)
 
-    # polling
     if RUN_POLLING:
         if dp is None:
             logger.error("RUN_POLLING enabled but dispatcher (dp) is None. Polling will NOT start.")
         else:
             logger.info("RUN_POLLING enabled -> starting polling background task")
-            t = asyncio.create_task(_polling_task_runner(dp, app), name="polling-runner")
-            app["polling_task"] = t
+            t = asyncio.create_task(_polling_task_runner(dp, a), name="polling-runner")
+            a["polling_task"] = t
     else:
         logger.info("RUN_POLLING not enabled -> dispatcher polling disabled (webhooks expected).")
 
@@ -367,16 +366,17 @@ async def on_startup(app: web.Application):
 # --------------------
 # Cleanup
 # --------------------
-async def on_cleanup(app: web.Application):
+async def on_cleanup(a: web.Application):
     logger.info("on_cleanup: begin")
-    try:
-        app["shutting_down"] = True
-    except Exception:
-        logger.debug("Could not set app['shutting_down'] (ignored)")
+    # <<< FIX: Do NOT set global "shutdown requested" here. on_cleanup may be called
+    # for transient reasons or internal runner cleanup. We only set SHUTDOWN_REQUESTED
+    # in the signal handler so that the outer auto-restart loop can distinguish true
+    # external shutdown (user/OS requested) from transient cleanups.
+    a["shutting_down"] = True  # internal marker, not used to decide restarts
 
     # stop heartbeat
     try:
-        hb = app.get("heartbeat_task")
+        hb = a.get("heartbeat_task")
         if hb:
             hb.cancel()
             try:
@@ -387,8 +387,8 @@ async def on_cleanup(app: web.Application):
         pass
 
     # stop polling task
-    polling_task = app.get("polling_task")
-    dp = app.get("dp")
+    polling_task = a.get("polling_task")
+    dp = a.get("dp")
     if polling_task is not None:
         if not polling_task.done():
             logger.info("Stopping polling task ...")
@@ -437,8 +437,8 @@ async def on_cleanup(app: web.Application):
 
     # delete webhook only if we set it and only if auto-delete permitted
     try:
-        if app.get("webhook_set_by_main") and WEBHOOK_AUTO_DELETE:
-            bot_obj = app.get("bot")
+        if a.get("webhook_set_by_main") and WEBHOOK_AUTO_DELETE:
+            bot_obj = a.get("bot")
             del_hook = safe_getattr(bot_obj, "delete_webhook", None) or safe_getattr(bot_obj, "remove_webhook", None)
             if callable(del_hook):
                 try:
@@ -447,14 +447,14 @@ async def on_cleanup(app: web.Application):
                 except Exception as ex:
                     logger.debug("Failed to delete webhook on cleanup: %s", ex)
         else:
-            if app.get("webhook_set_by_main"):
+            if a.get("webhook_set_by_main"):
                 logger.info("Webhook was set by main, but WEBHOOK_AUTO_DELETE is false -> keeping webhook.")
     except Exception as ex:
         logger.debug("Error during webhook deletion attempt: %s", ex)
 
     # close bot session
     try:
-        bot_obj = app.get("bot")
+        bot_obj = a.get("bot")
         if bot_obj is not None:
             await _close_bot_session(bot_obj)
         else:
@@ -471,7 +471,7 @@ async def on_cleanup(app: web.Application):
         logger.debug("DB close attempt raised: %s", ex)
 
     # close client session
-    sess = app.get("client_session")
+    sess = a.get("client_session")
     if sess is not None:
         try:
             if not getattr(sess, "closed", True):
@@ -498,7 +498,6 @@ async def _telegram_webhook(request: web.Request):
         logger.warning("Webhook received but dispatcher not ready -> 503")
         return web.Response(status=503, text="dispatcher not initialized")
 
-    # parse JSON defensively
     try:
         data = await request.json()
     except Exception:
@@ -509,7 +508,6 @@ async def _telegram_webhook(request: web.Request):
             logger.exception("Failed to parse webhook JSON")
             return web.Response(status=200, text="bad json")
 
-    # build Update defensively
     try:
         upd = aiogram_types.Update(**data)
     except Exception:
@@ -519,8 +517,8 @@ async def _telegram_webhook(request: web.Request):
             logger.exception("Failed to construct Update from payload")
             return web.Response(status=200, text="bad update")
 
-    # Ensure current context for FSM
     try:
+        # restore current context for FSM (helps aiogram v2 FSM usage with webhooks)
         try:
             from aiogram.dispatcher.dispatcher import Dispatcher
             Dispatcher.set_current(dp)
@@ -590,16 +588,28 @@ def _loop_exception_handler(loop, context):
         logger.exception("Error in loop exception handler")
 
 def _install_signal_handlers(loop: asyncio.AbstractEventLoop):
+    # Install handlers that set SHUTDOWN_REQUESTED = True and trigger aiohttp graceful shutdown
+    def _on_signal(signame):
+        global SHUTDOWN_REQUESTED
+        SHUTDOWN_REQUESTED = True  # <<< CHANGED: set only here
+        logger.info("Signal handler fired: %s (SHUTDOWN_REQUESTED set True).", signame)
+        # Try to cancel tasks gently by asking aiohttp runner to shutdown via stopping loop tasks.
+        # We create a tiny coroutine to allow aiohttp to run its cleanup hooks.
+        try:
+            asyncio.create_task(_signal_trigger_shutdown(signame))
+        except Exception:
+            logger.debug("Could not create shutdown task from signal handler (ignored).")
+
     try:
         for signame in ("SIGINT", "SIGTERM"):
             sig = getattr(signal, signame)
-            loop.add_signal_handler(sig, lambda s=signame: asyncio.create_task(_signal_trigger_shutdown(s)))
+            loop.add_signal_handler(sig, lambda s=signame: _on_signal(s))
         logger.info("Signal handlers installed for SIGINT/SIGTERM.")
     except NotImplementedError:
         logger.warning("add_signal_handler not supported on this platform; OS signals will not be handled specially.")
 
 async def _signal_trigger_shutdown(signame: str):
-    logger.info("Received signal %s - initiating graceful shutdown via aiohttp runner.", signame)
+    logger.info("Received signal %s - aiohttp runner should begin graceful shutdown.", signame)
     await asyncio.sleep(0.01)
 
 # --------------------
@@ -617,7 +627,6 @@ app.on_cleanup.append(on_cleanup)
 # Entrypoint with AUTO_RESTART wrapper
 # --------------------
 def _run_once():
-    """Run web.run_app once (blocking). Return exit reason as tuple(success:boolean, error:Exception|None)."""
     try:
         web.run_app(app, host="0.0.0.0", port=PORT)
         return True, None
@@ -649,14 +658,13 @@ if __name__ == "__main__":
             break
 
         restart_count += 1
-        # If user explicitly disabled auto-restart, break
         if not AUTO_RESTART:
             logger.warning("AUTO_RESTART disabled. Exiting after web.run_app exit.")
             break
 
-        # If shutdown flagged by app (clean shutdown requested), do not restart
-        if app.get("shutting_down"):
-            logger.info("app['shutting_down'] is True — graceful shutdown requested. Not restarting.")
+        # <<< FIX: use SHUTDOWN_REQUESTED to avoid restart only when OS signal was received.
+        if SHUTDOWN_REQUESTED:
+            logger.info("SHUTDOWN_REQUESTED is True (signal received). Not restarting.")
             break
 
         if restart_count > AUTO_RESTART_MAX:
