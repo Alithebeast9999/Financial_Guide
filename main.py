@@ -290,11 +290,9 @@ async def on_startup(app: web.Application):
 async def _stop_scheduler_if_any():
     """
     Attempt to stop APScheduler / scheduler stored in bot_app.scheduler or similar.
-    It's common to have an AsyncIOScheduler instance as bot_app.scheduler.
-
-    IMPORTANT: AsyncIOScheduler.shutdown() may call self._eventloop.call_soon_threadsafe().
-    If scheduler was created but not started in this process, scheduler._eventloop can be None
-    and calling shutdown will raise AttributeError. We guard against that.
+    Guard against the case when scheduler._eventloop is None (scheduler created in a different process
+    or never started here), because AsyncIOScheduler.shutdown() will call
+    self._eventloop.call_soon_threadsafe(...) immediately and raise AttributeError if it's None.
     """
     try:
         scheduler = safe_getattr(bot_app, "scheduler", None)
@@ -302,27 +300,41 @@ async def _stop_scheduler_if_any():
             logger.info("No scheduler found in bot_app (skipping scheduler shutdown).")
             return
 
-        # Protect: do not call shutdown if scheduler has no associated event loop.
-        # AsyncIOScheduler stores _eventloop when started in current process.
-        eventloop = getattr(scheduler, "_eventloop", None)
-        if eventloop is None:
-            logger.info("Scheduler exists but _eventloop is None (scheduler wasn't started in this process). Skipping shutdown.")
+        # Try several common attribute names that might hold the event loop reference
+        loop_attr_names = ("_eventloop", "_event_loop", "_asyncio_loop", "_loop", "event_loop")
+        found_loop = None
+        found_attr = None
+        for name in loop_attr_names:
+            if hasattr(scheduler, name):
+                found_loop = getattr(scheduler, name)
+                found_attr = name
+                break
+
+        if found_loop is None:
+            logger.info(
+                "Scheduler exists but no associated event loop found on attributes %s; "
+                "skipping shutdown to avoid AttributeError.",
+                loop_attr_names,
+            )
             return
 
+        # If we got here and found_loop is not None, it's safe to call shutdown.
         try:
-            logger.info("Stopping scheduler (bot_app.scheduler) ...")
+            logger.info("Stopping scheduler (bot_app.scheduler) ... (loop attr: %s)", found_attr)
             maybe_shutdown = scheduler.shutdown(wait=False)
-            # scheduler.shutdown may be coroutine or sync
+            # scheduler.shutdown may be a coroutine or a regular function
             if asyncio.iscoroutine(maybe_shutdown):
                 await maybe_shutdown
             logger.info("Scheduler stopped.")
         except AttributeError as ex:
-            # Defensive: if scheduler internals changed and call_soon_threadsafe missing, log and continue.
+            # Extremely defensive: if scheduler internals still try to access call_soon_threadsafe, catch it.
             logger.exception("AttributeError while shutting down scheduler (likely _eventloop issue): %s", ex)
         except Exception as ex:
             logger.exception("Failed to shutdown scheduler cleanly: %s", ex)
+
     except Exception as ex:
         logger.exception("Unexpected error while checking/stopping scheduler: %s", ex)
+
 
 
 async def _close_bot_session(bot_obj):
