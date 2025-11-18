@@ -2,7 +2,7 @@
 """
 Entrypoint for Financial_Guide — robust, with auto-restart and heartbeat.
 (Исправлённая версия: гарантированно выставляет Dispatcher/ Bot current в webhook-пути,
-безопасно останавливает scheduler, и не полагается на on_cleanup как «флаг» для авто-рестарта.)
+ безопасно останавливает scheduler, и не полагается на on_cleanup как «флаг» для авто-рестарта.)
 """
 import os
 import sys
@@ -326,8 +326,21 @@ async def on_startup(a: web.Application):
 
 # --------------------
 async def on_cleanup(a: web.Application):
-    logger.info("on_cleanup: begin")
+    logger.info("on_cleanup: begin (SHUTDOWN_REQUESTED=%s)", SHUTDOWN_REQUESTED)
     a["shutting_down"] = True  # internal marker only
+
+    # Diagnostic: list a few asyncio tasks to help understand why cleanup triggered
+    try:
+        tasks = asyncio.all_tasks()
+        logger.debug("Currently %s asyncio tasks (showing up to 20):", len(tasks))
+        for t in list(tasks)[:20]:
+            try:
+                name = t.get_name() if hasattr(t, "get_name") else repr(t)
+                logger.debug("Task name=%s done=%s cancelled=%s repr=%s", name, t.done(), t.cancelled(), t)
+            except Exception:
+                logger.debug("Task repr failed: %s", t)
+    except Exception:
+        logger.exception("Failed to enumerate asyncio tasks during cleanup")
 
     # Stop heartbeat
     try:
@@ -444,6 +457,12 @@ async def _telegram_webhook(request: web.Request):
             logger.exception("Failed to parse webhook JSON")
             return web.Response(status=200, text="bad json")
 
+    # Optional lightweight logging of payload size (avoid full dump in prod)
+    try:
+        logger.debug("Incoming webhook token=%s payload_keys=%s", token_in_path, list(data.keys()) if isinstance(data, dict) else None)
+    except Exception:
+        pass
+
     try:
         upd = aiogram_types.Update(**data)
     except Exception:
@@ -528,7 +547,7 @@ def _install_signal_handlers(loop: asyncio.AbstractEventLoop):
         try:
             asyncio.create_task(_signal_trigger_shutdown(signame))
         except Exception:
-            logger.debug("Could not create shutdown task from signal handler (ignored).")
+            logger.exception("Failed to create _signal_trigger_shutdown task")
 
     try:
         for signame in ("SIGINT", "SIGTERM"):
@@ -555,7 +574,13 @@ app.on_cleanup.append(on_cleanup)
 def _run_once():
     try:
         web.run_app(app, host="0.0.0.0", port=PORT)
-        return True, None
+        # web.run_app returned normally. Decide whether this was a deliberate shutdown (signal)
+        if SHUTDOWN_REQUESTED:
+            logger.info("web.run_app finished and SHUTDOWN_REQUESTED is True => normal deliberate shutdown.")
+            return True, None
+        else:
+            logger.warning("web.run_app exited normally but no shutdown signal was recorded (unexpected).")
+            return False, "web.run_app exited without shutdown signal"
     except SystemExit as ex:
         logger.warning("web.run_app exited via SystemExit: %s", ex)
         return False, ex
