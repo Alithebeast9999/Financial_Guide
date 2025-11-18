@@ -25,6 +25,7 @@ from typing import Optional, Tuple, Any, Callable
 
 from aiohttp import web, ClientSession, ClientTimeout
 from aiogram.utils.exceptions import TerminatedByOtherGetUpdates
+from aiogram import types  # used for constructing Update from webhook JSON
 
 # Import the user's bot_app module (contains handlers, scheduler, db, etc.)
 import bot_app
@@ -50,6 +51,8 @@ RUN_POLLING = os.environ.get("RUN_POLLING", "0").lower() in ("1", "true", "yes")
 POLLING_SHUTDOWN_TIMEOUT = float(os.environ.get("POLLING_SHUTDOWN_TIMEOUT", "6.0"))
 # Shared client session timeout
 CLIENT_SESSION_TIMEOUT_S = float(os.environ.get("CLIENT_SESSION_TIMEOUT_S", "60"))
+# WEBHOOK_URL (optional). If set and RUN_POLLING is False, app will attempt to register webhook
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # e.g. "https://financial-guide.onrender.com"
 
 # ----------------------
 # Application container
@@ -69,6 +72,9 @@ app["client_session"] = None
 app["bot"] = None
 app["dp"] = None
 app["shutting_down"] = False
+# webhook bookkeeping
+app["webhook_registered"] = False
+app["webhook_path"] = None
 
 # ----------------------
 # Helper utilities
@@ -241,6 +247,7 @@ async def on_startup(app: web.Application):
     - initialize bot via bot_app.init_bot(session) or fallback
     - call bot_app.init_app_for_runtime(app)
     - optionally start polling (based on RUN_POLLING)
+    - if RUN_POLLING is False and WEBHOOK_URL is set, configure webhook endpoint and set webhook
     """
     logger.info("on_startup: begin")
 
@@ -282,7 +289,59 @@ async def on_startup(app: web.Application):
             t = asyncio.create_task(_polling_task_runner(dp, app), name="polling-runner")
             app["polling_task"] = t
     else:
-        logger.info("RUN_POLLING not enabled -> dispatcher polling disabled. Use RUN_POLLING=1 for local single-instance polling.")
+        # Attempt webhook fallback if WEBHOOK_URL is provided
+        if WEBHOOK_URL and bot and dp:
+            try:
+                token = safe_getattr(bot, "token", None)
+                if not token:
+                    # Some bot implementations may not expose token attribute; try to get from bot_app or environment
+                    token = os.environ.get("BOT_TOKEN")
+                if not token:
+                    logger.warning("Webhook requested but bot token not found. WEBHOOK will not be set.")
+                else:
+                    # Use token in path so telegram can route to unique endpoint; keep it simple
+                    webhook_path = f"/webhook/{token}"
+                    # Avoid duplicate route registration
+                    if app.get("webhook_registered"):
+                        logger.info("Webhook already registered in app (skipping route registration).")
+                    else:
+                        # Handler for incoming webhook updates
+                        async def _telegram_webhook(request: web.Request):
+                            try:
+                                data = await request.json()
+                            except Exception:
+                                logger.debug("Webhook received non-json request; returning 400.")
+                                return web.Response(status=400, text="invalid json")
+                            try:
+                                update = types.Update(**data)
+                            except Exception as ex:
+                                logger.exception("Invalid update payload: %s", ex)
+                                return web.Response(status=400, text="invalid update")
+                            # process update with dispatcher
+                            try:
+                                await dp.process_update(update)
+                            except Exception as ex:
+                                # log and return 200 to avoid Telegram retry storms in many cases;
+                                # you may choose 500 to let Telegram retry if you prefer.
+                                logger.exception("dp.process_update failed: %s", ex)
+                            return web.Response(status=200, text="ok")
+
+                        # register route
+                        app.router.add_post(webhook_path, _telegram_webhook)
+                        app["webhook_path"] = webhook_path
+                        app["webhook_registered"] = True
+                        # set webhook on Telegram side
+                        try:
+                            await bot.set_webhook(WEBHOOK_URL.rstrip("/") + webhook_path)
+                            logger.info("Webhook configured: %s -> %s", WEBHOOK_URL.rstrip("/"), webhook_path)
+                        except Exception as ex:
+                            logger.exception("Failed to call bot.set_webhook: %s", ex)
+            except Exception as ex:
+                logger.exception("Webhook setup failed: %s", ex)
+        else:
+            logger.info("RUN_POLLING not enabled -> dispatcher polling disabled. Use RUN_POLLING=1 for local single-instance polling.")
+            if not WEBHOOK_URL:
+                logger.info("WEBHOOK_URL not provided; no updates will be delivered to the bot (set WEBHOOK_URL or enable RUN_POLLING).")
 
     logger.info("on_startup: done")
 
@@ -312,9 +371,7 @@ async def _stop_scheduler_if_any():
 
         if found_loop is None:
             logger.info(
-                "Scheduler exists but no associated event loop found on attributes %s; "
-                "skipping shutdown to avoid AttributeError.",
-                loop_attr_names,
+                "Scheduler exists but _eventloop is None (scheduler wasn't started in this process). Skipping shutdown."
             )
             return
 
@@ -334,7 +391,6 @@ async def _stop_scheduler_if_any():
 
     except Exception as ex:
         logger.exception("Unexpected error while checking/stopping scheduler: %s", ex)
-
 
 
 async def _close_bot_session(bot_obj):
@@ -477,6 +533,24 @@ async def on_cleanup(app: web.Application):
     except Exception as ex:
         logger.debug("Scheduler shutdown attempt raised: %s", ex)
 
+    # If we registered a webhook on startup, try to delete it before closing bot/session
+    try:
+        webhook_path = app.get("webhook_path")
+        webhook_registered = app.get("webhook_registered", False)
+        if webhook_registered:
+            bot_obj = app.get("bot") or safe_getattr(bot_app, "bot", None)
+            if bot_obj:
+                try:
+                    # drop pending updates to avoid surprises on restart
+                    await bot_obj.delete_webhook(drop_pending_updates=True)
+                    logger.info("Webhook deleted on cleanup.")
+                except Exception as ex:
+                    logger.debug("Failed to delete webhook on cleanup: %s", ex)
+            else:
+                logger.debug("Webhook was registered but bot object not found during cleanup.")
+    except Exception as ex:
+        logger.debug("Exception while removing webhook on cleanup: %s", ex)
+
     # Close bot's aiohttp session / bot object
     try:
         bot_obj = app.get("bot")
@@ -538,6 +612,8 @@ async def info(request):
         "has_polling_task": bool(app.get("polling_task")),
         "bot_present": bool(app.get("bot")),
         "dp_present": bool(app.get("dp")),
+        "webhook_registered": bool(app.get("webhook_registered")),
+        "webhook_path": app.get("webhook_path"),
     }
     return web.json_response(data)
 
