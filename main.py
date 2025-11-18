@@ -291,49 +291,86 @@ async def _stop_scheduler_if_any():
     """
     Attempt to stop APScheduler / scheduler stored in bot_app.scheduler or similar.
     It's common to have an AsyncIOScheduler instance as bot_app.scheduler.
+
+    IMPORTANT: AsyncIOScheduler.shutdown() may call self._eventloop.call_soon_threadsafe().
+    If scheduler was created but not started in this process, scheduler._eventloop can be None
+    and calling shutdown will raise AttributeError. We guard against that.
     """
     try:
         scheduler = safe_getattr(bot_app, "scheduler", None)
-        if scheduler:
-            try:
-                logger.info("Stopping scheduler (bot_app.scheduler) ...")
-                # apscheduler's AsyncIOScheduler.shutdown() is blocking sync method; call it in thread if necessary
-                maybe_shutdown = scheduler.shutdown(wait=False)
-                # scheduler.shutdown may be synchronous or coroutine — handle both
-                if asyncio.iscoroutine(maybe_shutdown):
-                    await maybe_shutdown
-                logger.info("Scheduler stopped.")
-            except Exception as ex:
-                logger.exception("Failed to shutdown scheduler cleanly: %s", ex)
-        else:
+        if not scheduler:
             logger.info("No scheduler found in bot_app (skipping scheduler shutdown).")
+            return
+
+        # Protect: do not call shutdown if scheduler has no associated event loop.
+        # AsyncIOScheduler stores _eventloop when started in current process.
+        eventloop = getattr(scheduler, "_eventloop", None)
+        if eventloop is None:
+            logger.info("Scheduler exists but _eventloop is None (scheduler wasn't started in this process). Skipping shutdown.")
+            return
+
+        try:
+            logger.info("Stopping scheduler (bot_app.scheduler) ...")
+            maybe_shutdown = scheduler.shutdown(wait=False)
+            # scheduler.shutdown may be coroutine or sync
+            if asyncio.iscoroutine(maybe_shutdown):
+                await maybe_shutdown
+            logger.info("Scheduler stopped.")
+        except AttributeError as ex:
+            # Defensive: if scheduler internals changed and call_soon_threadsafe missing, log and continue.
+            logger.exception("AttributeError while shutting down scheduler (likely _eventloop issue): %s", ex)
+        except Exception as ex:
+            logger.exception("Failed to shutdown scheduler cleanly: %s", ex)
     except Exception as ex:
-        logger.exception("Unexpected error while checking scheduler: %s", ex)
+        logger.exception("Unexpected error while checking/stopping scheduler: %s", ex)
 
 
 async def _close_bot_session(bot_obj):
     """
     Attempt to close aiogram Bot resources cleanly.
-    aiogram.Bot provides close() coroutine and session attribute referencing aiohttp.ClientSession.
-    We attempt multiple ways to close it safely.
+    Prefer using `await bot.get_session()` (if available) to obtain session; fall back to bot.session.
+    Also call bot.close() if present.
     """
     if bot_obj is None:
         return
     try:
-        # Preferred: if bot has close coroutine
+        # 1) Try to call close() on bot (preferred)
         close_fn = safe_getattr(bot_obj, "close", None)
         if callable(close_fn):
-            maybe = close_fn()
-            await maybe_await(maybe)
-            logger.info("Called bot.close()")
-        # Additionally, if Bot exposes 'session' and it's an aiohttp.ClientSession, close it
-        ses = safe_getattr(bot_obj, "session", None)
-        if ses and not getattr(ses, "closed", True):
             try:
-                await ses.close()
-                logger.info("Closed bot.session (aiohttp.ClientSession).")
+                maybe = close_fn()
+                await maybe_await(maybe)
+                logger.info("Called bot.close()")
             except Exception as ex:
-                logger.debug("Closing bot.session failed: %s", ex)
+                logger.debug("bot.close() call failed: %s", ex)
+
+        # 2) Prefer to retrieve session via async getter if available (aiogram recommended pattern)
+        ses = None
+        get_sess = safe_getattr(bot_obj, "get_session", None)
+        if callable(get_sess):
+            try:
+                maybe_s = get_sess()
+                ses = await maybe_await(maybe_s)
+            except Exception as ex:
+                # Not fatal; fallback to attribute below
+                logger.debug("bot.get_session() failed or not supported: %s", ex)
+                ses = None
+
+        # 3) Fallback to session attribute if above didn't produce session
+        if ses is None:
+            ses = safe_getattr(bot_obj, "session", None)
+
+        # 4) Close session if present and open
+        if ses is not None:
+            try:
+                closed_attr = getattr(ses, "closed", None)
+                if closed_attr is False:
+                    await ses.close()
+                    logger.info("Closed bot session.")
+                else:
+                    logger.debug("Bot session is already closed or 'closed' attribute truthy.")
+            except Exception as ex:
+                logger.debug("Error while closing bot's session: %s", ex)
     except Exception as ex:
         logger.exception("Failed to close bot object cleanly: %s", ex)
 
@@ -348,7 +385,11 @@ async def _close_db_if_any():
         if conn:
             try:
                 logger.info("Closing DB connection (bot_app.conn) ...")
-                conn.commit()
+                try:
+                    conn.commit()
+                except Exception:
+                    # ignore commit problems during shutdown
+                    pass
                 conn.close()
                 logger.info("DB connection closed.")
             except Exception as ex:
@@ -383,9 +424,12 @@ async def on_cleanup(app: web.Application):
                 if dp:
                     stop_fn = safe_getattr(dp, "stop_polling", None)
                     if callable(stop_fn):
-                        maybe = stop_fn()
-                        await maybe_await(maybe)
-                        logger.debug("dp.stop_polling() called successfully.")
+                        try:
+                            maybe = stop_fn()
+                            await maybe_await(maybe)
+                            logger.debug("dp.stop_polling() called successfully.")
+                        except Exception as ex:
+                            logger.debug("dp.stop_polling() raised: %s", ex)
             except Exception as ex:
                 logger.debug("dp.stop_polling() raised during cleanup: %s", ex)
 
@@ -444,7 +488,7 @@ async def on_cleanup(app: web.Application):
     sess = app.get("client_session")
     if sess is not None:
         try:
-            if not sess.closed:
+            if not getattr(sess, "closed", True):
                 logger.info("Closing shared ClientSession ...")
                 await sess.close()
                 logger.info("Shared ClientSession closed.")
