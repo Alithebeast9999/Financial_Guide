@@ -1,12 +1,16 @@
 # main.py
 """
-Entrypoint for Financial_Guide — webhook-safe version.
+Entrypoint for Financial_Guide — robust webhook-friendly version.
 
-Изменения:
-- Авто-установка webhook при наличии WEBHOOK_URL.
-- Установка Dispatcher/Bot current перед dp.process_update (решает FSM error).
-- Удаление webhook при cleanup только если установили его мы.
-- Защитный shutdown scheduler, безопасное закрытие сессий/DB.
+Key points:
+- create single shared aiohttp.ClientSession
+- attempt bot_app.init_bot(session) else fallback to module-level bot/dp
+- set webhook automatically if WEBHOOK_URL provided
+- do NOT delete webhook on cleanup unless WEBHOOK_AUTO_DELETE=1
+- protect webhook handler: catch all exceptions, always return 200 to Telegram
+- set loop exception handler to avoid accidental shutdown on unhandled exceptions
+- graceful cleanup: stop polling (if running), stop scheduler if started here,
+  close bot session, close shared ClientSession, close DB if present
 """
 
 import os
@@ -26,7 +30,9 @@ from aiogram import types as aiogram_types
 
 import bot_app
 
+# --------------------
 # Logging
+# --------------------
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -35,15 +41,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main")
 
+# --------------------
 # Config
+# --------------------
 PORT = int(os.environ.get("PORT", "10000"))
 RUN_POLLING = os.environ.get("RUN_POLLING", "0").lower() in ("1", "true", "yes")
 CLIENT_SESSION_TIMEOUT_S = float(os.environ.get("CLIENT_SESSION_TIMEOUT_S", "60"))
 POLLING_SHUTDOWN_TIMEOUT = float(os.environ.get("POLLING_SHUTDOWN_TIMEOUT", "6.0"))
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # e.g. "https://financial-guide.onrender.com"
 WEBHOOK_PREFIX = os.environ.get("WEBHOOK_PREFIX", "/webhook").rstrip("/")
+WEBHOOK_AUTO_DELETE = os.environ.get("WEBHOOK_AUTO_DELETE", "0") in ("1", "true", "yes")
 
+# --------------------
 # App container
+# --------------------
 app = web.Application()
 import datetime as _dt
 app["boot_time"] = _dt.datetime.utcnow().isoformat()
@@ -55,7 +66,9 @@ app["shutting_down"] = False
 app["webhook_set_by_main"] = False
 app["webhook_full_url"] = None
 
+# --------------------
 # Helpers
+# --------------------
 def safe_getattr(obj: Any, name: str, default: Any = None):
     try:
         return getattr(obj, name, default)
@@ -74,14 +87,18 @@ def _log_exception(exc: Optional[BaseException] = None, msg: str = "Exception"):
         logger.error("%s: %s", msg, exc)
         logger.debug("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
 
+# --------------------
 # ClientSession creator
+# --------------------
 def create_client_session() -> ClientSession:
     timeout = ClientTimeout(total=CLIENT_SESSION_TIMEOUT_S)
     session = ClientSession(timeout=timeout)
     logger.info("Created shared aiohttp ClientSession (timeout=%ss)", CLIENT_SESSION_TIMEOUT_S)
     return session
 
+# --------------------
 # Bot init / fallback
+# --------------------
 def _has_attr(module, name: str) -> bool:
     try:
         return hasattr(module, name)
@@ -129,7 +146,9 @@ async def _init_bot_with_session_or_fallback(session: Optional[ClientSession]):
             logger.info("Discovered bot via dp.bot")
     return bot, dp
 
+# --------------------
 # Polling runner
+# --------------------
 async def _polling_task_runner(dp, app: web.Application):
     logger.info("Polling runner: starting aiogram dp.start_polling()")
     try:
@@ -153,7 +172,9 @@ async def _polling_task_runner(dp, app: web.Application):
         logger.info("Polling runner: finished (cleaning up)")
         app["polling_task"] = None
 
+# --------------------
 # Scheduler safe stop
+# --------------------
 async def _stop_scheduler_if_any():
     try:
         scheduler = safe_getattr(bot_app, "scheduler", None)
@@ -169,7 +190,7 @@ async def _stop_scheduler_if_any():
                 found_attr = name
                 break
         if found_loop is None:
-            logger.info("Scheduler exists but _eventloop is None (not started here). Skipping shutdown to avoid AttributeError.")
+            logger.info("Scheduler exists but no associated event loop found on attributes %s; skipping shutdown.", loop_attr_names)
             return
         try:
             logger.info("Stopping scheduler (bot_app.scheduler) ... (loop attr: %s)", found_attr)
@@ -182,7 +203,9 @@ async def _stop_scheduler_if_any():
     except Exception as ex:
         logger.exception("Unexpected error while checking/stopping scheduler: %s", ex)
 
+# --------------------
 # Close bot session
+# --------------------
 async def _close_bot_session(bot_obj):
     if bot_obj is None:
         return
@@ -219,7 +242,9 @@ async def _close_bot_session(bot_obj):
     except Exception as ex:
         logger.exception("Failed to close bot object cleanly: %s", ex)
 
+# --------------------
 # DB close
+# --------------------
 async def _close_db_if_any():
     try:
         conn = safe_getattr(bot_app, "conn", None)
@@ -239,9 +264,12 @@ async def _close_db_if_any():
     except Exception as ex:
         logger.exception("Unexpected error while closing DB: %s", ex)
 
+# --------------------
 # Startup
+# --------------------
 async def on_startup(app: web.Application):
     logger.info("on_startup: begin")
+    # create client session
     if app.get("client_session") is None:
         try:
             session = create_client_session()
@@ -257,6 +285,7 @@ async def on_startup(app: web.Application):
     app["bot"] = bot
     app["dp"] = dp
 
+    # let bot_app init runtime (scheduler, locks)
     if _has_attr(bot_app, "init_app_for_runtime"):
         try:
             maybe = bot_app.init_app_for_runtime(app)
@@ -267,15 +296,13 @@ async def on_startup(app: web.Application):
     else:
         logger.info("bot_app.init_app_for_runtime not found (skipping)")
 
-    # If WEBHOOK_URL provided, set webhook automatically (and register flag)
+    # set webhook if requested and bot present
     try:
         if WEBHOOK_URL and bot:
-            # derive token
             token = getattr(bot, "token", None) or os.environ.get("BOT_TOKEN")
             if not token:
                 logger.warning("WEBHOOK_URL set but bot token not found; skipping automatic set_webhook.")
             else:
-                # ensure full path ends with /webhook/{token}
                 path = f"{WEBHOOK_PREFIX}/{token}"
                 full_url = WEBHOOK_URL.rstrip("/") + path
                 try:
@@ -296,7 +323,7 @@ async def on_startup(app: web.Application):
     except Exception as ex:
         logger.exception("Unexpected error during webhook set attempt: %s", ex)
 
-    # Polling (only if explicitly enabled)
+    # polling
     if RUN_POLLING:
         if dp is None:
             logger.error("RUN_POLLING enabled but dispatcher (dp) is None. Polling will NOT start.")
@@ -309,7 +336,9 @@ async def on_startup(app: web.Application):
 
     logger.info("on_startup: done")
 
+# --------------------
 # Cleanup
+# --------------------
 async def on_cleanup(app: web.Application):
     logger.info("on_cleanup: begin")
     try:
@@ -317,6 +346,7 @@ async def on_cleanup(app: web.Application):
     except Exception:
         logger.debug("Could not set app['shutting_down'] (ignored)")
 
+    # stop polling task
     polling_task = app.get("polling_task")
     dp = app.get("dp")
     if polling_task is not None:
@@ -347,7 +377,7 @@ async def on_cleanup(app: web.Application):
     else:
         logger.debug("No polling task set on app (nothing to stop).")
 
-    # Let bot_app shutdown
+    # call bot_app.shutdown_bot if exists
     if _has_attr(bot_app, "shutdown_bot"):
         try:
             logger.info("Calling bot_app.shutdown_bot() ...")
@@ -359,14 +389,15 @@ async def on_cleanup(app: web.Application):
     else:
         logger.info("bot_app.shutdown_bot not found (skipping).")
 
+    # attempt scheduler stop
     try:
         await _stop_scheduler_if_any()
     except Exception as ex:
         logger.debug("Scheduler shutdown attempt raised: %s", ex)
 
-    # If we set webhook on startup — delete it
+    # delete webhook only if we set it and only if auto-delete permitted
     try:
-        if app.get("webhook_set_by_main") and app.get("bot"):
+        if app.get("webhook_set_by_main") and WEBHOOK_AUTO_DELETE:
             bot_obj = app.get("bot")
             del_hook = safe_getattr(bot_obj, "delete_webhook", None) or safe_getattr(bot_obj, "remove_webhook", None)
             if callable(del_hook):
@@ -375,10 +406,13 @@ async def on_cleanup(app: web.Application):
                     logger.info("Webhook deleted on cleanup.")
                 except Exception as ex:
                     logger.debug("Failed to delete webhook on cleanup: %s", ex)
+        else:
+            if app.get("webhook_set_by_main"):
+                logger.info("Webhook was set by main, but WEBHOOK_AUTO_DELETE is false -> keeping webhook.")
     except Exception as ex:
         logger.debug("Error during webhook deletion attempt: %s", ex)
 
-    # Close bot session
+    # close bot session
     try:
         bot_obj = app.get("bot")
         if bot_obj is not None:
@@ -390,13 +424,13 @@ async def on_cleanup(app: web.Application):
     except Exception as ex:
         logger.debug("Error closing aiogram Bot: %s", ex)
 
-    # Close DB
+    # close DB
     try:
         await _close_db_if_any()
     except Exception as ex:
         logger.debug("DB close attempt raised: %s", ex)
 
-    # Close shared client session
+    # close client session
     sess = app.get("client_session")
     if sess is not None:
         try:
@@ -413,7 +447,9 @@ async def on_cleanup(app: web.Application):
 
     logger.info("on_cleanup: done")
 
-# Webhook handler
+# --------------------
+# Webhook handler (very defensive)
+# --------------------
 async def _telegram_webhook(request: web.Request):
     token_in_path = request.match_info.get("token")
     dp = app.get("dp")
@@ -421,6 +457,8 @@ async def _telegram_webhook(request: web.Request):
     if dp is None:
         logger.warning("Webhook received but dispatcher not ready -> 503")
         return web.Response(status=503, text="dispatcher not initialized")
+
+    # parse JSON defensively
     try:
         data = await request.json()
     except Exception:
@@ -429,17 +467,21 @@ async def _telegram_webhook(request: web.Request):
             data = json.loads(data_text or "{}")
         except Exception:
             logger.exception("Failed to parse webhook JSON")
-            return web.Response(status=400, text="bad request")
+            # return 200 so Telegram won't spam retries; but indicate bad payload
+            return web.Response(status=200, text="bad json")
+
+    # build Update defensively
     try:
         upd = aiogram_types.Update(**data)
     except Exception:
         try:
+            # fallback: try to construct via to_object or leave raw
             upd = aiogram_types.Update.to_object(data)
         except Exception:
             logger.exception("Failed to construct Update from payload")
-            return web.Response(status=400, text="bad update")
+            return web.Response(status=200, text="bad update")
 
-    # set current context for Dispatcher / Bot (fix FSM issues)
+    # Ensure dispatcher/bot current context is set for FSM and handlers
     try:
         try:
             Dispatcher.set_current(dp)
@@ -456,14 +498,18 @@ async def _telegram_webhook(request: web.Request):
                     bot_obj.set_current(bot_obj)
                 except Exception:
                     logger.debug("Could not set Bot current (ignored).")
-        # process update
+
+        # Process update inside try/except so exceptions won't crash the process
         try:
             await dp.process_update(upd)
         except Exception as ex:
-            logger.exception("dp.process_update failed: %s", ex)
+            # Log error but DON'T re-raise — return 200 to Telegram
+            logger.exception("dp.process_update failed (caught): %s", ex)
+            # Optionally, you could persist the update or notify admin here
+            return web.Response(text="OK")
         return web.Response(text="OK")
     finally:
-        # unset contexts
+        # unset contexts quietly
         try:
             Dispatcher.set_current(None)
         except Exception:
@@ -473,7 +519,9 @@ async def _telegram_webhook(request: web.Request):
         except Exception:
             pass
 
-# Health routes
+# --------------------
+# Health endpoints
+# --------------------
 async def index(request):
     return web.Response(text="OK", content_type="text/plain")
 async def ping(request):
@@ -491,7 +539,9 @@ async def info(request):
     }
     return web.json_response(data)
 
-# Signal handlers
+# --------------------
+# Signal handlers & loop exception handler
+# --------------------
 def _install_signal_handlers(loop: asyncio.AbstractEventLoop):
     try:
         for signame in ("SIGINT", "SIGTERM"):
@@ -500,11 +550,28 @@ def _install_signal_handlers(loop: asyncio.AbstractEventLoop):
         logger.info("Signal handlers installed for SIGINT/SIGTERM.")
     except NotImplementedError:
         logger.warning("add_signal_handler not supported on this platform; OS signals will not be handled specially.")
+
 async def _signal_trigger_shutdown(signame: str):
     logger.info("Received signal %s - initiating graceful shutdown via aiohttp runner.", signame)
     await asyncio.sleep(0.01)
 
-# Register routes & hooks
+def _loop_exception_handler(loop, context):
+    """
+    log unhandled exceptions and DO NOT let them crash the loop
+    (prevents web.run_app from unwinding on a single unexpected error).
+    """
+    try:
+        msg = context.get("exception") or context.get("message")
+        logger.error("Unhandled loop exception: %s", msg)
+        # print traceback if available
+        if "exception" in context and context["exception"] is not None:
+            logger.debug("".join(traceback.format_exception(type(context["exception"]), context["exception"], context["exception"].__traceback__)))
+    except Exception:
+        logger.exception("Error in loop exception handler")
+
+# --------------------
+# Routes and hooks registration
+# --------------------
 app.router.add_get("/", index)
 app.router.add_get("/ping", ping)
 app.router.add_head("/", index)
@@ -513,9 +580,17 @@ app.router.add_post(f"{WEBHOOK_PREFIX}/{{token:.*}}", _telegram_webhook)
 app.on_startup.append(on_startup)
 app.on_cleanup.append(on_cleanup)
 
+# --------------------
 # Entrypoint
+# --------------------
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
+    # install custom loop exception handler to avoid accidental shutdowns
+    try:
+        loop.set_exception_handler(_loop_exception_handler)
+    except Exception:
+        logger.debug("Could not set custom loop exception handler (ignored).")
+
     _install_signal_handlers(loop)
     logger.info("Starting web app on 0.0.0.0:%s", PORT)
     try:
@@ -523,6 +598,7 @@ if __name__ == "__main__":
     except Exception as ex:
         logger.exception("web.run_app raised exception (app exiting): %s", ex)
     finally:
+        # final cleanup attempts (best-effort)
         try:
             sess = app.get("client_session")
             if sess is not None and not getattr(sess, "closed", True):
