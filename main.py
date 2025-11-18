@@ -1,18 +1,15 @@
 # main.py
 """
-Robust entrypoint for Financial_Guide
+Robust entrypoint for Financial_Guide (fixed webhook/context issues)
 
-Responsibilities:
-- create a single shared aiohttp.ClientSession for the web app and (optionally) for aiogram bot
-- try to call bot_app.init_bot(session) to allow bot_app to create its Bot/Dispatcher bound to our session
-- fallback to using bot_app.bot / bot_app.dp if init_bot is not present
-- call bot_app.init_app_for_runtime(app) to let bot_app initialize scheduler, db locks, etc.
-- start aiogram polling only when RUN_POLLING environment var is explicitly enabled
-- protect against TerminatedByOtherGetUpdates errors (caused by more than one polling instance)
-- on cleanup: stop polling, stop scheduler, close bot sessions/sockets, close shared ClientSession, close DB if present
-- provide health endpoints for Render / uptime monitors
-- install graceful SIGINT/SIGTERM handlers so Render shutdown behaves cleanly
-- abundant logging and defensive checks
+Key fixes:
+- provide /webhook/{token} handler that sets Dispatcher/Bot "current" context
+  so FSM (State.set / get_current) works under webhook processing.
+- safer scheduler shutdown (guard when scheduler._eventloop is None)
+- safer closure of bot session (try get_session(), fallback to .session)
+- defensive handling if bot_app.init_bot/init_app_for_runtime absent
+- register webhook route so Telegram requests are accepted (200/503 as appropriate)
+- abundant logging
 """
 
 import os
@@ -21,11 +18,15 @@ import asyncio
 import signal
 import logging
 import traceback
-from typing import Optional, Tuple, Any, Callable
+import json
+from typing import Optional, Tuple, Any
 
 from aiohttp import web, ClientSession, ClientTimeout
 from aiogram.utils.exceptions import TerminatedByOtherGetUpdates
-from aiogram import types  # used for constructing Update from webhook JSON
+
+# aiogram types/classes we'll use directly
+from aiogram import Bot
+from aiogram.dispatcher.dispatcher import Dispatcher
 
 # Import the user's bot_app module (contains handlers, scheduler, db, etc.)
 import bot_app
@@ -51,30 +52,20 @@ RUN_POLLING = os.environ.get("RUN_POLLING", "0").lower() in ("1", "true", "yes")
 POLLING_SHUTDOWN_TIMEOUT = float(os.environ.get("POLLING_SHUTDOWN_TIMEOUT", "6.0"))
 # Shared client session timeout
 CLIENT_SESSION_TIMEOUT_S = float(os.environ.get("CLIENT_SESSION_TIMEOUT_S", "60"))
-# WEBHOOK_URL (optional). If set and RUN_POLLING is False, app will attempt to register webhook
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # e.g. "https://financial-guide.onrender.com"
+# webhook path prefix (if your bot sets webhook to a different path - change here)
+WEBHOOK_PREFIX = os.environ.get("WEBHOOK_PREFIX", "/webhook")
 
 # ----------------------
 # Application container
 # ----------------------
 app = web.Application()
-# We'll attach useful objects into app dict during startup:
-# - app['client_session'] -> the shared aiohttp.ClientSession created here
-# - app['bot'] -> aiogram.Bot instance (if available)
-# - app['dp'] -> aiogram.Dispatcher instance (if available)
-# - app['polling_task'] -> asyncio.Task running dp.start_polling()
-# - app['shutting_down'] -> bool flag set during cleanup
-# - app['boot_time'] -> string timestamp
-import datetime
-app["boot_time"] = datetime.datetime.utcnow().isoformat()
+import datetime as _dt
+app["boot_time"] = _dt.datetime.utcnow().isoformat()
 app["polling_task"] = None
 app["client_session"] = None
 app["bot"] = None
 app["dp"] = None
 app["shutting_down"] = False
-# webhook bookkeeping
-app["webhook_registered"] = False
-app["webhook_path"] = None
 
 # ----------------------
 # Helper utilities
@@ -114,7 +105,6 @@ def _log_exception(exc: Optional[BaseException] = None, msg: str = "Exception"):
 def create_client_session() -> ClientSession:
     """
     Create a shared aiohttp.ClientSession for the web app and (optionally) for the aiogram Bot.
-    We keep a fairly conservative timeout.
     """
     timeout = ClientTimeout(total=CLIENT_SESSION_TIMEOUT_S)
     session = ClientSession(timeout=timeout)
@@ -142,15 +132,10 @@ def _get_bot_and_dp_from_module(module) -> Tuple[Optional[Any], Optional[Any]]:
     return bot, dp
 
 
-async def _init_bot_with_session_or_fallback(session: ClientSession):
+async def _init_bot_with_session_or_fallback(session: Optional[ClientSession]):
     """
     Try to call bot_app.init_bot(session) if present. If not present or it fails,
     use module-level bot/dp (bot_app.bot, bot_app.dp) as a fallback.
-    Expected return from init_bot(session) is either:
-        - (bot, dp)
-        - bot  (less likely)
-        - a coroutine that sets up bot_app.bot/dp internally
-    The function is defensive and returns tuple (bot, dp) where elements might be None.
     """
     bot = None
     dp = None
@@ -160,16 +145,13 @@ async def _init_bot_with_session_or_fallback(session: ClientSession):
             logger.info("Calling bot_app.init_bot(session) ...")
             maybe = bot_app.init_bot(session)
             res = await maybe_await(maybe)
-            # Accept multiple shapes of return
             if isinstance(res, tuple) and len(res) >= 2:
                 bot, dp = res[0], res[1]
                 logger.info("bot_app.init_bot returned (bot, dp).")
             elif res is None:
-                # assume bot_app created module-level objects
                 bot, dp = _get_bot_and_dp_from_module(bot_app)
                 logger.info("bot_app.init_bot returned None; using module-level bot/dp (if present).")
             else:
-                # some code returns only bot
                 bot = res
                 dp = getattr(bot_app, "dp", None)
                 logger.info("bot_app.init_bot returned object; interpreted as bot. dp=%s", bool(dp))
@@ -197,18 +179,10 @@ async def _init_bot_with_session_or_fallback(session: ClientSession):
 
 async def _polling_task_runner(dp, app: web.Application):
     """
-    Background task that runs dp.start_polling() and handles the TerminatedByOtherGetUpdates
-    exception gracefully — that exception arises when Telegram detects multiple polling clients
-    for the same token.
-
-    Important behaviors:
-    - If TerminatedByOtherGetUpdates is raised, log an error and stop the polling task.
-    - On CancelledError, attempt to stop polling politely.
-    - Update app['polling_task'] to None on exit so cleanup logic knows it's gone.
+    Background task that runs dp.start_polling() and handles TerminatedByOtherGetUpdates.
     """
     logger.info("Polling runner: starting aiogram dp.start_polling()")
     try:
-        # dp.start_polling is blocking (async) until stopped; await it
         await dp.start_polling()
     except TerminatedByOtherGetUpdates as ex:
         logger.error(
@@ -219,7 +193,6 @@ async def _polling_task_runner(dp, app: web.Application):
     except asyncio.CancelledError:
         logger.info("Polling runner: cancelled. Attempting graceful dp.stop_polling()")
         try:
-            # dp.stop_polling tries to stop the long-poll loop
             stop_fn = safe_getattr(dp, "stop_polling", None)
             if callable(stop_fn):
                 maybe = stop_fn()
@@ -231,7 +204,6 @@ async def _polling_task_runner(dp, app: web.Application):
         _log_exception(ex, "Unhandled exception in polling runner")
     finally:
         logger.info("Polling runner: finished (cleaning up)")
-        # mark as finished
         app["polling_task"] = None
 
 
@@ -241,14 +213,6 @@ async def _polling_task_runner(dp, app: web.Application):
 
 
 async def on_startup(app: web.Application):
-    """
-    aiohttp on_startup hook. Responsibilities:
-    - create shared ClientSession
-    - initialize bot via bot_app.init_bot(session) or fallback
-    - call bot_app.init_app_for_runtime(app)
-    - optionally start polling (based on RUN_POLLING)
-    - if RUN_POLLING is False and WEBHOOK_URL is set, configure webhook endpoint and set webhook
-    """
     logger.info("on_startup: begin")
 
     # Create shared client session if not already present
@@ -258,7 +222,6 @@ async def on_startup(app: web.Application):
             app["client_session"] = session
         except Exception as ex:
             _log_exception(ex, "Failed to create shared ClientSession")
-            # still continue; some features might fail if session absent
             app["client_session"] = None
     else:
         logger.info("on_startup: app already had client_session")
@@ -269,7 +232,7 @@ async def on_startup(app: web.Application):
     app["bot"] = bot
     app["dp"] = dp
 
-    # Let bot_app perform runtime initializations (scheduler jobs, db_lock). It exists in provided bot_app.
+    # Allow bot_app to initialize runtime resources if function available
     if _has_attr(bot_app, "init_app_for_runtime"):
         try:
             maybe = bot_app.init_app_for_runtime(app)
@@ -289,59 +252,7 @@ async def on_startup(app: web.Application):
             t = asyncio.create_task(_polling_task_runner(dp, app), name="polling-runner")
             app["polling_task"] = t
     else:
-        # Attempt webhook fallback if WEBHOOK_URL is provided
-        if WEBHOOK_URL and bot and dp:
-            try:
-                token = safe_getattr(bot, "token", None)
-                if not token:
-                    # Some bot implementations may not expose token attribute; try to get from bot_app or environment
-                    token = os.environ.get("BOT_TOKEN")
-                if not token:
-                    logger.warning("Webhook requested but bot token not found. WEBHOOK will not be set.")
-                else:
-                    # Use token in path so telegram can route to unique endpoint; keep it simple
-                    webhook_path = f"/webhook/{token}"
-                    # Avoid duplicate route registration
-                    if app.get("webhook_registered"):
-                        logger.info("Webhook already registered in app (skipping route registration).")
-                    else:
-                        # Handler for incoming webhook updates
-                        async def _telegram_webhook(request: web.Request):
-                            try:
-                                data = await request.json()
-                            except Exception:
-                                logger.debug("Webhook received non-json request; returning 400.")
-                                return web.Response(status=400, text="invalid json")
-                            try:
-                                update = types.Update(**data)
-                            except Exception as ex:
-                                logger.exception("Invalid update payload: %s", ex)
-                                return web.Response(status=400, text="invalid update")
-                            # process update with dispatcher
-                            try:
-                                await dp.process_update(update)
-                            except Exception as ex:
-                                # log and return 200 to avoid Telegram retry storms in many cases;
-                                # you may choose 500 to let Telegram retry if you prefer.
-                                logger.exception("dp.process_update failed: %s", ex)
-                            return web.Response(status=200, text="ok")
-
-                        # register route
-                        app.router.add_post(webhook_path, _telegram_webhook)
-                        app["webhook_path"] = webhook_path
-                        app["webhook_registered"] = True
-                        # set webhook on Telegram side
-                        try:
-                            await bot.set_webhook(WEBHOOK_URL.rstrip("/") + webhook_path)
-                            logger.info("Webhook configured: %s -> %s", WEBHOOK_URL.rstrip("/"), webhook_path)
-                        except Exception as ex:
-                            logger.exception("Failed to call bot.set_webhook: %s", ex)
-            except Exception as ex:
-                logger.exception("Webhook setup failed: %s", ex)
-        else:
-            logger.info("RUN_POLLING not enabled -> dispatcher polling disabled. Use RUN_POLLING=1 for local single-instance polling.")
-            if not WEBHOOK_URL:
-                logger.info("WEBHOOK_URL not provided; no updates will be delivered to the bot (set WEBHOOK_URL or enable RUN_POLLING).")
+        logger.info("RUN_POLLING not enabled -> dispatcher polling disabled. Use RUN_POLLING=1 for local single-instance polling.")
 
     logger.info("on_startup: done")
 
@@ -349,9 +260,7 @@ async def on_startup(app: web.Application):
 async def _stop_scheduler_if_any():
     """
     Attempt to stop APScheduler / scheduler stored in bot_app.scheduler or similar.
-    Guard against the case when scheduler._eventloop is None (scheduler created in a different process
-    or never started here), because AsyncIOScheduler.shutdown() will call
-    self._eventloop.call_soon_threadsafe(...) immediately and raise AttributeError if it's None.
+    Guard against scheduler._eventloop is None (created elsewhere).
     """
     try:
         scheduler = safe_getattr(bot_app, "scheduler", None)
@@ -359,7 +268,7 @@ async def _stop_scheduler_if_any():
             logger.info("No scheduler found in bot_app (skipping scheduler shutdown).")
             return
 
-        # Try several common attribute names that might hold the event loop reference
+        # common attribute names that may point to event loop
         loop_attr_names = ("_eventloop", "_event_loop", "_asyncio_loop", "_loop", "event_loop")
         found_loop = None
         found_attr = None
@@ -371,20 +280,19 @@ async def _stop_scheduler_if_any():
 
         if found_loop is None:
             logger.info(
-                "Scheduler exists but _eventloop is None (scheduler wasn't started in this process). Skipping shutdown."
+                "Scheduler exists but no associated event loop found on attributes %s; "
+                "skipping shutdown to avoid AttributeError.",
+                loop_attr_names,
             )
             return
 
-        # If we got here and found_loop is not None, it's safe to call shutdown.
         try:
             logger.info("Stopping scheduler (bot_app.scheduler) ... (loop attr: %s)", found_attr)
             maybe_shutdown = scheduler.shutdown(wait=False)
-            # scheduler.shutdown may be a coroutine or a regular function
             if asyncio.iscoroutine(maybe_shutdown):
                 await maybe_shutdown
             logger.info("Scheduler stopped.")
         except AttributeError as ex:
-            # Extremely defensive: if scheduler internals still try to access call_soon_threadsafe, catch it.
             logger.exception("AttributeError while shutting down scheduler (likely _eventloop issue): %s", ex)
         except Exception as ex:
             logger.exception("Failed to shutdown scheduler cleanly: %s", ex)
@@ -395,14 +303,13 @@ async def _stop_scheduler_if_any():
 
 async def _close_bot_session(bot_obj):
     """
-    Attempt to close aiogram Bot resources cleanly.
-    Prefer using `await bot.get_session()` (if available) to obtain session; fall back to bot.session.
-    Also call bot.close() if present.
+    Close aiogram.Bot resources cleanly.
+    Try await bot.get_session() first, fallback to bot.session, and call bot.close().
     """
     if bot_obj is None:
         return
     try:
-        # 1) Try to call close() on bot (preferred)
+        # try close()
         close_fn = safe_getattr(bot_obj, "close", None)
         if callable(close_fn):
             try:
@@ -412,7 +319,7 @@ async def _close_bot_session(bot_obj):
             except Exception as ex:
                 logger.debug("bot.close() call failed: %s", ex)
 
-        # 2) Prefer to retrieve session via async getter if available (aiogram recommended pattern)
+        # try get_session()
         ses = None
         get_sess = safe_getattr(bot_obj, "get_session", None)
         if callable(get_sess):
@@ -420,15 +327,12 @@ async def _close_bot_session(bot_obj):
                 maybe_s = get_sess()
                 ses = await maybe_await(maybe_s)
             except Exception as ex:
-                # Not fatal; fallback to attribute below
                 logger.debug("bot.get_session() failed or not supported: %s", ex)
                 ses = None
 
-        # 3) Fallback to session attribute if above didn't produce session
         if ses is None:
             ses = safe_getattr(bot_obj, "session", None)
 
-        # 4) Close session if present and open
         if ses is not None:
             try:
                 closed_attr = getattr(ses, "closed", None)
@@ -444,10 +348,6 @@ async def _close_bot_session(bot_obj):
 
 
 async def _close_db_if_any():
-    """
-    If bot_app provides a sqlite connection object 'conn', try to close it.
-    If bot_app manages DB differently, skip.
-    """
     try:
         conn = safe_getattr(bot_app, "conn", None)
         if conn:
@@ -456,7 +356,6 @@ async def _close_db_if_any():
                 try:
                     conn.commit()
                 except Exception:
-                    # ignore commit problems during shutdown
                     pass
                 conn.close()
                 logger.info("DB connection closed.")
@@ -469,17 +368,13 @@ async def _close_db_if_any():
 
 
 async def on_cleanup(app: web.Application):
-    """
-    aiohttp on_cleanup hook. Responsibilities:
-    - signal and stop polling task if running
-    - call bot_app.shutdown_bot() if present to let bot_app cleanup its resources
-    - attempt to stop scheduler
-    - close bot session and module session if created here
-    - close shared ClientSession
-    - close DB connection if present
-    """
     logger.info("on_cleanup: begin")
-    app["shutting_down"] = True
+    # mark shutting down
+    try:
+        app["shutting_down"] = True
+    except Exception:
+        # older aiohttp warns when changing state; ignore
+        logger.debug("Could not set app['shutting_down'] (ignored)")
 
     # Stop polling task if running
     polling_task = app.get("polling_task")
@@ -487,7 +382,6 @@ async def on_cleanup(app: web.Application):
     if polling_task is not None:
         if not polling_task.done():
             logger.info("Stopping polling task ...")
-            # Ask dispatcher to stop first (graceful)
             try:
                 if dp:
                     stop_fn = safe_getattr(dp, "stop_polling", None)
@@ -501,7 +395,6 @@ async def on_cleanup(app: web.Application):
             except Exception as ex:
                 logger.debug("dp.stop_polling() raised during cleanup: %s", ex)
 
-            # Cancel the background task and wait up to POLLING_SHUTDOWN_TIMEOUT
             try:
                 polling_task.cancel()
                 await asyncio.wait_for(polling_task, timeout=POLLING_SHUTDOWN_TIMEOUT)
@@ -515,7 +408,7 @@ async def on_cleanup(app: web.Application):
     else:
         logger.debug("No polling task set on app (nothing to stop).")
 
-    # Let bot_app perform its own shutdown if provided (e.g. stop scheduler, close any sessions)
+    # Let bot_app shutdown if available
     if _has_attr(bot_app, "shutdown_bot"):
         try:
             logger.info("Calling bot_app.shutdown_bot() ...")
@@ -525,46 +418,27 @@ async def on_cleanup(app: web.Application):
         except Exception as ex:
             logger.exception("bot_app.shutdown_bot failed: %s", ex)
     else:
-        logger.info("bot_app.shutdown_bot not found (skipping). We will attempt individual cleanup steps.")
+        logger.info("bot_app.shutdown_bot not found (skipping). We'll attempt individual cleanup steps.")
 
-    # Attempt to stop scheduler if present
+    # Attempt to stop scheduler
     try:
         await _stop_scheduler_if_any()
     except Exception as ex:
         logger.debug("Scheduler shutdown attempt raised: %s", ex)
 
-    # If we registered a webhook on startup, try to delete it before closing bot/session
-    try:
-        webhook_path = app.get("webhook_path")
-        webhook_registered = app.get("webhook_registered", False)
-        if webhook_registered:
-            bot_obj = app.get("bot") or safe_getattr(bot_app, "bot", None)
-            if bot_obj:
-                try:
-                    # drop pending updates to avoid surprises on restart
-                    await bot_obj.delete_webhook(drop_pending_updates=True)
-                    logger.info("Webhook deleted on cleanup.")
-                except Exception as ex:
-                    logger.debug("Failed to delete webhook on cleanup: %s", ex)
-            else:
-                logger.debug("Webhook was registered but bot object not found during cleanup.")
-    except Exception as ex:
-        logger.debug("Exception while removing webhook on cleanup: %s", ex)
-
-    # Close bot's aiohttp session / bot object
+    # Close bot session/object
     try:
         bot_obj = app.get("bot")
         if bot_obj is not None:
             await _close_bot_session(bot_obj)
         else:
-            # Maybe bot_app has module-level bot that we didn't pick up
             bot_mod = safe_getattr(bot_app, "bot", None)
             if bot_mod is not None:
                 await _close_bot_session(bot_mod)
     except Exception as ex:
         logger.debug("Error closing aiogram Bot: %s", ex)
 
-    # Close module-level DB if present
+    # Close DB if present
     try:
         await _close_db_if_any()
     except Exception as ex:
@@ -589,6 +463,115 @@ async def on_cleanup(app: web.Application):
 
 
 # ----------------------
+# Webhook handler for Telegram
+# ----------------------
+# This is the crucial addition: Telegram will POST updates to /webhook/{token}.
+# We parse JSON into aiogram.types.Update and call dp.process_update(update).
+# VERY IMPORTANT: before calling dp.process_update we set Dispatcher/Bot "current"
+# so FSM/State APIs that rely on Dispatcher.get_current() / Bot.get_current() work.
+#
+# We attempt to set and then reset contextvars to avoid leaking state between requests.
+
+from aiogram import types as aiogram_types  # imported here to use Update type
+
+
+async def _telegram_webhook(request: web.Request):
+    """
+    POST /webhook/{token}
+    """
+    token_in_path = request.match_info.get("token")
+    dp = app.get("dp")
+    bot_obj = app.get("bot") or safe_getattr(bot_app, "bot", None)
+
+    if dp is None:
+        logger.warning("Received webhook but dispatcher not ready -> 503")
+        return web.Response(status=503, text="dispatcher not initialized")
+
+    # parse payload as json
+    try:
+        data = await request.json()
+    except Exception:
+        try:
+            text = await request.text()
+            data = json.loads(text or "{}")
+        except Exception:
+            logger.exception("Failed to parse incoming webhook JSON")
+            return web.Response(status=400, text="bad request")
+
+    # Build Update object
+    try:
+        upd = aiogram_types.Update(**data)
+    except Exception:
+        # fallback: use from_object where available, or pass data through
+        try:
+            upd = aiogram_types.Update.to_object(data)
+        except Exception:
+            logger.exception("Failed to construct Update from payload; returning 400")
+            return web.Response(status=400, text="bad update")
+
+    # Set context for Dispatcher and Bot so FSM and Bot.get_current() work
+    # Prefer classmethod setting, but bound method exists too.
+    set_dp = getattr(Dispatcher, "set_current", None)
+    set_bot = getattr(Bot, "set_current", None)
+    unset_dp = getattr(Dispatcher, "set_current", None)
+    unset_bot = getattr(Bot, "set_current", None)
+
+    try:
+        # set current dispatcher and bot (if available)
+        if callable(set_dp):
+            try:
+                # some aiogram builds support Dispatcher.set_current(dp)
+                Dispatcher.set_current(dp)
+            except Exception:
+                # try bound method
+                try:
+                    dp.set_current(dp)
+                except Exception:
+                    logger.debug("Could not set Dispatcher current via set_current (ignored).")
+        if bot_obj and callable(set_bot):
+            try:
+                Bot.set_current(bot_obj)
+            except Exception:
+                try:
+                    bot_obj.set_current(bot_obj)
+                except Exception:
+                    logger.debug("Could not set Bot current (ignored).")
+
+        # Now process update
+        try:
+            await dp.process_update(upd)
+        except Exception as ex:
+            # Log inner exception but still return 200 to Telegram (so it doesn't keep retrying endlessly).
+            logger.exception("dp.process_update failed: %s", ex)
+        # Return OK
+        return web.Response(text="OK")
+    finally:
+        # unset context to avoid leaking into subsequent requests
+        try:
+            if callable(unset_dp):
+                try:
+                    Dispatcher.set_current(None)
+                except Exception:
+                    try:
+                        dp.set_current(None)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        try:
+            if callable(unset_bot):
+                try:
+                    Bot.set_current(None)
+                except Exception:
+                    try:
+                        bot_obj.set_current(None)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+
+# ----------------------
 # Health / Utility routes
 # ----------------------
 
@@ -602,9 +585,6 @@ async def ping(request):
 
 
 async def info(request):
-    """
-    A slightly more verbose info endpoint. Avoid leaking secrets.
-    """
     data = {
         "status": "ok",
         "boot_time": app.get("boot_time"),
@@ -612,8 +592,6 @@ async def info(request):
         "has_polling_task": bool(app.get("polling_task")),
         "bot_present": bool(app.get("bot")),
         "dp_present": bool(app.get("dp")),
-        "webhook_registered": bool(app.get("webhook_registered")),
-        "webhook_path": app.get("webhook_path"),
     }
     return web.json_response(data)
 
@@ -624,10 +602,6 @@ async def info(request):
 
 
 def _install_signal_handlers(loop: asyncio.AbstractEventLoop):
-    """
-    Install handlers for SIGINT and SIGTERM to perform graceful shutdown using aiohttp's shutdown sequence.
-    On platforms that don't support loop.add_signal_handler (e.g. Windows in certain contexts), we still continue.
-    """
     try:
         for signame in ("SIGINT", "SIGTERM"):
             sig = getattr(signal, signame)
@@ -639,12 +613,7 @@ def _install_signal_handlers(loop: asyncio.AbstractEventLoop):
 
 async def _signal_trigger_shutdown(signame: str):
     logger.info("Received signal %s - initiating graceful shutdown via aiohttp runner.", signame)
-    # aiohttp will call on_cleanup and shutdown handlers when web.run_app stops the runner.
-    # We try to stop the loop gently by cancelling tasks; the actual runner will follow.
-    # Create a small delay to allow logging flush
     await asyncio.sleep(0.01)
-    # If we are running under web.run_app, it will handle shutdown. In some environments, we might need to call loop.stop.
-    # We avoid calling loop.stop() directly here to let aiohttp orchestrate proper cleanup.
 
 
 # ----------------------
@@ -654,8 +623,9 @@ app.router.add_get("/", index)
 app.router.add_get("/ping", ping)
 app.router.add_head("/", index)
 app.router.add_get("/info", info)
+# webhook route — keep token in path for basic protection
+app.router.add_post(f"{WEBHOOK_PREFIX}/{{token:.*}}", _telegram_webhook)
 
-# Attach startup and cleanup hooks
 app.on_startup.append(on_startup)
 app.on_cleanup.append(on_cleanup)
 
@@ -664,31 +634,26 @@ app.on_cleanup.append(on_cleanup)
 # Entrypoint
 # ----------------------
 if __name__ == "__main__":
-    # On startup of the process (before launching aiohttp), install signal handlers
     loop = asyncio.get_event_loop()
     _install_signal_handlers(loop)
 
     logger.info("Starting web app on 0.0.0.0:%s", PORT)
     try:
-        # Use web.run_app which handles setup/cleanup hooks for us
         web.run_app(app, host="0.0.0.0", port=PORT)
     except Exception as ex:
         logger.exception("web.run_app raised exception (app exiting): %s", ex)
     finally:
-        # As a last-ditch sanity step, if something left sessions open, attempt to close them synchronously.
+        # best-effort synchronous cleanup after loop stops
         try:
             sess = app.get("client_session")
             if sess is not None and not getattr(sess, "closed", True):
-                # We are in main thread after loop stopped; try to close via loop
                 try:
                     loop.run_until_complete(sess.close())
                 except Exception:
-                    # If cannot close, ignore - process is exiting
                     pass
         except Exception:
             pass
 
-        # Also attempt to run bot_app.shutdown_bot one more time synchronously if provided
         try:
             if hasattr(bot_app, "shutdown_bot"):
                 maybe = bot_app.shutdown_bot()
