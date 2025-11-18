@@ -44,6 +44,7 @@ AUTO_RESTART_DELAY_S = float(os.environ.get("AUTO_RESTART_DELAY_S", "2.0"))
 HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL", "30.0"))
 
 # --------------------
+# Set to True only when a real external OS signal requested shutdown (SIGINT/SIGTERM).
 SHUTDOWN_REQUESTED = False
 
 # --------------------
@@ -57,6 +58,7 @@ app["shutting_down"] = False
 app["webhook_set_by_main"] = False
 app["webhook_full_url"] = None
 app["heartbeat_task"] = None
+app["cleanup_skipped_due_no_signal"] = False
 
 # --------------------
 def safe_getattr(obj: Any, name: str, default: Any = None):
@@ -314,7 +316,7 @@ async def on_startup(a: web.Application):
 
     if RUN_POLLING:
         if dp is None:
-            logger.error("RUN_POLLING is enabled but dispatcher (dp) is None. Polling will NOT start.")
+            logger.error("RUN_POLLING enabled but dispatcher (dp) is None. Polling will NOT start.")
         else:
             logger.info("RUN_POLLING enabled -> starting polling background task")
             t = asyncio.create_task(_polling_task_runner(dp, a), name="polling-runner")
@@ -329,6 +331,28 @@ async def on_cleanup(a: web.Application):
     logger.info("on_cleanup: begin (SHUTDOWN_REQUESTED=%s)", SHUTDOWN_REQUESTED)
     a["shutting_down"] = True  # internal marker only
 
+    # If cleanup was triggered but no external signal requested shutdown, skip destructive cleanup.
+    # This prevents the bot/session/DB from being closed on transient runner cleanups (which cause "bot goes silent").
+    if not SHUTDOWN_REQUESTED:
+        logger.warning("on_cleanup invoked but no external shutdown signal detected -> skipping destructive cleanup to keep bot alive.")
+        a["cleanup_skipped_due_no_signal"] = True
+        # Still stop heartbeat (non-destructive) so we don't leave that task dangling between restarts
+        try:
+            hb = a.get("heartbeat_task")
+            if hb:
+                hb.cancel()
+                try:
+                    await hb
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # don't close bot/session/db/scheduler here — return promptly
+        logger.info("on_cleanup: minimal cleanup done (heartbeat stopped). Full cleanup deferred until real shutdown.")
+        return
+
+    # ---------- If we get here, SHUTDOWN_REQUESTED == True -> perform full cleanup ----------
     # Diagnostic: list a few asyncio tasks to help understand why cleanup triggered
     try:
         tasks = asyncio.all_tasks()
@@ -436,7 +460,7 @@ async def on_cleanup(a: web.Application):
     else:
         logger.debug("No shared ClientSession to close.")
 
-    logger.info("on_cleanup: done")
+    logger.info("on_cleanup: done (full cleanup)")
 
 # --------------------
 async def _telegram_webhook(request: web.Request):
@@ -526,6 +550,7 @@ async def info(request):
         "dp_present": bool(app.get("dp")),
         "webhook_set_by_main": bool(app.get("webhook_set_by_main")),
         "webhook_full_url": app.get("webhook_full_url"),
+        "cleanup_skipped_due_no_signal": app.get("cleanup_skipped_due_no_signal", False),
     }
     return web.json_response(data)
 
@@ -574,12 +599,12 @@ app.on_cleanup.append(on_cleanup)
 def _run_once():
     try:
         web.run_app(app, host="0.0.0.0", port=PORT)
-        # web.run_app returned normally. Decide whether this was a deliberate shutdown (signal)
         if SHUTDOWN_REQUESTED:
             logger.info("web.run_app finished and SHUTDOWN_REQUESTED is True => normal deliberate shutdown.")
             return True, None
         else:
             logger.warning("web.run_app exited normally but no shutdown signal was recorded (unexpected).")
+            # Return False so the outer loop may restart the app (auto-restart behavior)
             return False, "web.run_app exited without shutdown signal"
     except SystemExit as ex:
         logger.warning("web.run_app exited via SystemExit: %s", ex)
