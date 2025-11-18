@@ -1,18 +1,16 @@
 # main.py
 """
-Entrypoint for Financial_Guide — robust webhook-friendly version.
+Entrypoint for Financial_Guide — robust, with auto-restart and heartbeat.
 
-Key points:
-- create single shared aiohttp.ClientSession
-- attempt bot_app.init_bot(session) else fallback to module-level bot/dp
-- set webhook automatically if WEBHOOK_URL provided
-- do NOT delete webhook on cleanup unless WEBHOOK_AUTO_DELETE=1
-- protect webhook handler: catch all exceptions, always return 200 to Telegram
-- set loop exception handler to avoid accidental shutdown on unhandled exceptions
-- graceful cleanup: stop polling (if running), stop scheduler if started here,
-  close bot session, close shared ClientSession, close DB if present
+Main additions vs prior version:
+- AUTO_RESTART loop around web.run_app to restart on unexpected exit
+- HEARTBEAT background task to produce periodic logs (helps detect early shutdown)
+- improved logging on exit reason and restart attempts
+- conservative defaults, controlled by env vars:
+    AUTO_RESTART (default "1") - enable auto restart
+    AUTO_RESTART_MAX (default "20") - max restart attempts before giving up
+    AUTO_RESTART_DELAY_S (default 2.0) - seconds to wait between restarts
 """
-
 import os
 import sys
 import asyncio
@@ -24,8 +22,6 @@ from typing import Optional, Tuple, Any
 
 from aiohttp import web, ClientSession, ClientTimeout
 from aiogram.utils.exceptions import TerminatedByOtherGetUpdates
-from aiogram import Bot
-from aiogram.dispatcher.dispatcher import Dispatcher
 from aiogram import types as aiogram_types
 
 import bot_app
@@ -42,15 +38,23 @@ logging.basicConfig(
 logger = logging.getLogger("main")
 
 # --------------------
-# Config
+# Config (exposed via env)
 # --------------------
 PORT = int(os.environ.get("PORT", "10000"))
 RUN_POLLING = os.environ.get("RUN_POLLING", "0").lower() in ("1", "true", "yes")
 CLIENT_SESSION_TIMEOUT_S = float(os.environ.get("CLIENT_SESSION_TIMEOUT_S", "60"))
 POLLING_SHUTDOWN_TIMEOUT = float(os.environ.get("POLLING_SHUTDOWN_TIMEOUT", "6.0"))
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # e.g. "https://financial-guide.onrender.com"
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # e.g. "https://yourdomain.com"
 WEBHOOK_PREFIX = os.environ.get("WEBHOOK_PREFIX", "/webhook").rstrip("/")
 WEBHOOK_AUTO_DELETE = os.environ.get("WEBHOOK_AUTO_DELETE", "0") in ("1", "true", "yes")
+
+# Auto-restart controls:
+AUTO_RESTART = os.environ.get("AUTO_RESTART", "1") in ("1", "true", "yes")
+AUTO_RESTART_MAX = int(os.environ.get("AUTO_RESTART_MAX", "20"))
+AUTO_RESTART_DELAY_S = float(os.environ.get("AUTO_RESTART_DELAY_S", "2.0"))
+
+# Heartbeat interval
+HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL", "30.0"))
 
 # --------------------
 # App container
@@ -65,9 +69,10 @@ app["dp"] = None
 app["shutting_down"] = False
 app["webhook_set_by_main"] = False
 app["webhook_full_url"] = None
+app["heartbeat_task"] = None
 
 # --------------------
-# Helpers
+# Utilities
 # --------------------
 def safe_getattr(obj: Any, name: str, default: Any = None):
     try:
@@ -265,6 +270,22 @@ async def _close_db_if_any():
         logger.exception("Unexpected error while closing DB: %s", ex)
 
 # --------------------
+# Heartbeat (background)
+# --------------------
+async def _heartbeat_task():
+    logger.info("Heartbeat task started (interval: %ss)", HEARTBEAT_INTERVAL)
+    try:
+        while not app.get("shutting_down"):
+            logger.debug("heartbeat: app alive (uptime %s s)", ( _dt.datetime.utcnow() - _dt.datetime.fromisoformat(app["boot_time"]) ).total_seconds())
+            await asyncio.sleep(HEARTBEAT_INTERVAL)
+    except asyncio.CancelledError:
+        logger.info("Heartbeat task cancelled")
+    except Exception as ex:
+        logger.exception("Heartbeat encountered exception: %s", ex)
+    finally:
+        logger.info("Heartbeat task finished")
+
+# --------------------
 # Startup
 # --------------------
 async def on_startup(app: web.Application):
@@ -323,6 +344,13 @@ async def on_startup(app: web.Application):
     except Exception as ex:
         logger.exception("Unexpected error during webhook set attempt: %s", ex)
 
+    # start heartbeat task (helps debug unexpected exits)
+    try:
+        hb = asyncio.create_task(_heartbeat_task(), name="heartbeat")
+        app["heartbeat_task"] = hb
+    except Exception as ex:
+        logger.debug("Failed to start heartbeat task: %s", ex)
+
     # polling
     if RUN_POLLING:
         if dp is None:
@@ -345,6 +373,18 @@ async def on_cleanup(app: web.Application):
         app["shutting_down"] = True
     except Exception:
         logger.debug("Could not set app['shutting_down'] (ignored)")
+
+    # stop heartbeat
+    try:
+        hb = app.get("heartbeat_task")
+        if hb:
+            hb.cancel()
+            try:
+                await hb
+            except Exception:
+                pass
+    except Exception:
+        pass
 
     # stop polling task
     polling_task = app.get("polling_task")
@@ -448,7 +488,7 @@ async def on_cleanup(app: web.Application):
     logger.info("on_cleanup: done")
 
 # --------------------
-# Webhook handler (very defensive)
+# Webhook handler
 # --------------------
 async def _telegram_webhook(request: web.Request):
     token_in_path = request.match_info.get("token")
@@ -467,7 +507,6 @@ async def _telegram_webhook(request: web.Request):
             data = json.loads(data_text or "{}")
         except Exception:
             logger.exception("Failed to parse webhook JSON")
-            # return 200 so Telegram won't spam retries; but indicate bad payload
             return web.Response(status=200, text="bad json")
 
     # build Update defensively
@@ -475,15 +514,15 @@ async def _telegram_webhook(request: web.Request):
         upd = aiogram_types.Update(**data)
     except Exception:
         try:
-            # fallback: try to construct via to_object or leave raw
             upd = aiogram_types.Update.to_object(data)
         except Exception:
             logger.exception("Failed to construct Update from payload")
             return web.Response(status=200, text="bad update")
 
-    # Ensure dispatcher/bot current context is set for FSM and handlers
+    # Ensure current context for FSM
     try:
         try:
+            from aiogram.dispatcher.dispatcher import Dispatcher
             Dispatcher.set_current(dp)
         except Exception:
             try:
@@ -492,6 +531,7 @@ async def _telegram_webhook(request: web.Request):
                 logger.debug("Could not set Dispatcher current (ignored).")
         if bot_obj:
             try:
+                from aiogram import Bot
                 Bot.set_current(bot_obj)
             except Exception:
                 try:
@@ -499,22 +539,20 @@ async def _telegram_webhook(request: web.Request):
                 except Exception:
                     logger.debug("Could not set Bot current (ignored).")
 
-        # Process update inside try/except so exceptions won't crash the process
         try:
             await dp.process_update(upd)
         except Exception as ex:
-            # Log error but DON'T re-raise — return 200 to Telegram
             logger.exception("dp.process_update failed (caught): %s", ex)
-            # Optionally, you could persist the update or notify admin here
             return web.Response(text="OK")
         return web.Response(text="OK")
     finally:
-        # unset contexts quietly
         try:
+            from aiogram.dispatcher.dispatcher import Dispatcher
             Dispatcher.set_current(None)
         except Exception:
             pass
         try:
+            from aiogram import Bot
             Bot.set_current(None)
         except Exception:
             pass
@@ -540,8 +578,17 @@ async def info(request):
     return web.json_response(data)
 
 # --------------------
-# Signal handlers & loop exception handler
+# Loop exception handler and signal handlers
 # --------------------
+def _loop_exception_handler(loop, context):
+    try:
+        msg = context.get("exception") or context.get("message")
+        logger.error("Unhandled loop exception: %s", msg)
+        if "exception" in context and context["exception"] is not None:
+            logger.debug("".join(traceback.format_exception(type(context["exception"]), context["exception"], context["exception"].__traceback__)))
+    except Exception:
+        logger.exception("Error in loop exception handler")
+
 def _install_signal_handlers(loop: asyncio.AbstractEventLoop):
     try:
         for signame in ("SIGINT", "SIGTERM"):
@@ -555,22 +602,8 @@ async def _signal_trigger_shutdown(signame: str):
     logger.info("Received signal %s - initiating graceful shutdown via aiohttp runner.", signame)
     await asyncio.sleep(0.01)
 
-def _loop_exception_handler(loop, context):
-    """
-    log unhandled exceptions and DO NOT let them crash the loop
-    (prevents web.run_app from unwinding on a single unexpected error).
-    """
-    try:
-        msg = context.get("exception") or context.get("message")
-        logger.error("Unhandled loop exception: %s", msg)
-        # print traceback if available
-        if "exception" in context and context["exception"] is not None:
-            logger.debug("".join(traceback.format_exception(type(context["exception"]), context["exception"], context["exception"].__traceback__)))
-    except Exception:
-        logger.exception("Error in loop exception handler")
-
 # --------------------
-# Routes and hooks registration
+# Register routes & hooks
 # --------------------
 app.router.add_get("/", index)
 app.router.add_get("/ping", ping)
@@ -581,38 +614,80 @@ app.on_startup.append(on_startup)
 app.on_cleanup.append(on_cleanup)
 
 # --------------------
-# Entrypoint
+# Entrypoint with AUTO_RESTART wrapper
 # --------------------
+def _run_once():
+    """Run web.run_app once (blocking). Return exit reason as tuple(success:boolean, error:Exception|None)."""
+    try:
+        web.run_app(app, host="0.0.0.0", port=PORT)
+        return True, None
+    except SystemExit as ex:
+        logger.warning("web.run_app exited via SystemExit: %s", ex)
+        return False, ex
+    except KeyboardInterrupt as ex:
+        logger.warning("web.run_app interrupted by KeyboardInterrupt: %s", ex)
+        return False, ex
+    except Exception as ex:
+        logger.exception("web.run_app raised exception (will consider restart): %s", ex)
+        return False, ex
+
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
-    # install custom loop exception handler to avoid accidental shutdowns
     try:
         loop.set_exception_handler(_loop_exception_handler)
     except Exception:
         logger.debug("Could not set custom loop exception handler (ignored).")
-
     _install_signal_handlers(loop)
-    logger.info("Starting web app on 0.0.0.0:%s", PORT)
+
+    logger.info("Starting main process (auto_restart=%s, max=%s, delay=%ss)", AUTO_RESTART, AUTO_RESTART_MAX, AUTO_RESTART_DELAY_S)
+
+    restart_count = 0
+    while True:
+        success, err = _run_once()
+        if success:
+            logger.info("web.run_app exited normally. Will not restart.")
+            break
+
+        restart_count += 1
+        # If user explicitly disabled auto-restart, break
+        if not AUTO_RESTART:
+            logger.warning("AUTO_RESTART disabled. Exiting after web.run_app exit.")
+            break
+
+        # If shutdown flagged by app (clean shutdown requested), do not restart
+        if app.get("shutting_down"):
+            logger.info("app['shutting_down'] is True — graceful shutdown requested. Not restarting.")
+            break
+
+        if restart_count > AUTO_RESTART_MAX:
+            logger.error("Exceeded AUTO_RESTART_MAX (%s). Giving up and exiting.", AUTO_RESTART_MAX)
+            break
+
+        logger.warning("web.run_app exited unexpectedly (attempt %s/%s). Waiting %ss before restart. Error: %s", restart_count, AUTO_RESTART_MAX, AUTO_RESTART_DELAY_S, repr(err))
+        try:
+            import time
+            time.sleep(AUTO_RESTART_DELAY_S)
+        except Exception:
+            pass
+        logger.info("Restarting web.run_app now (attempt %s)", restart_count + 1)
+
+    # final best-effort cleanup
     try:
-        web.run_app(app, host="0.0.0.0", port=PORT)
-    except Exception as ex:
-        logger.exception("web.run_app raised exception (app exiting): %s", ex)
-    finally:
-        # final cleanup attempts (best-effort)
-        try:
-            sess = app.get("client_session")
-            if sess is not None and not getattr(sess, "closed", True):
-                try:
-                    loop.run_until_complete(sess.close())
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        try:
-            if hasattr(bot_app, "shutdown_bot"):
-                maybe = bot_app.shutdown_bot()
-                if asyncio.iscoroutine(maybe):
-                    loop.run_until_complete(maybe)
-        except Exception:
-            pass
-        logger.info("Main process exiting.")
+        sess = app.get("client_session")
+        if sess is not None and not getattr(sess, "closed", True):
+            try:
+                loop.run_until_complete(sess.close())
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    try:
+        if hasattr(bot_app, "shutdown_bot"):
+            maybe = bot_app.shutdown_bot()
+            if asyncio.iscoroutine(maybe):
+                loop.run_until_complete(maybe)
+    except Exception:
+        pass
+
+    logger.info("Main process exiting.")
