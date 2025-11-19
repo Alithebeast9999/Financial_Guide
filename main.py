@@ -1,12 +1,12 @@
 # main.py
 """
-Robust launcher for Financial_Guide.
+Robust launcher for Financial_Guide with improved cleanup to avoid
+'Unclosed client session' warnings.
 
-Fixes applied:
- - ensure webhook is deleted before starting polling (avoid CantGetUpdates / TerminatedByOtherGetUpdates)
- - retries + wait-for-confirmation when deleting webhook
- - close all discovered aiohttp sessions on cleanup to avoid 'Unclosed client session' warnings
- - defensive logging
+Key change: on_cleanup_app now enumerates and closes all discovered
+aiohttp ClientSession objects (bot.get_session(), bot.session, app['bot_session'],
+bot_app.client_session, etc.) and then closes bot. This avoids the unclosed
+client session/connector errors seen in logs.
 """
 import os
 import logging
@@ -69,17 +69,12 @@ async def set_webhook_with_retries(bot_obj, webhook_url: str, attempts: int = 3,
     return False
 
 async def ensure_webhook_deleted(bot_obj, timeout: float = 10.0) -> bool:
-    """
-    Ensure Telegram webhook is removed. Returns True if webhook is absent (or was removed).
-    Attempts delete_webhook then polls get_webhook_info until .url is empty or timeout.
-    """
     try:
         info = None
         try:
             info = await bot_obj.get_webhook_info()
         except Exception as e:
             logger.debug("get_webhook_info initial failed: %s", e)
-            # continue to attempt delete anyway
         if info and getattr(info, "url", None):
             logger.info("Webhook currently set to %s. Will attempt to delete.", info.url)
             try:
@@ -87,7 +82,6 @@ async def ensure_webhook_deleted(bot_obj, timeout: float = 10.0) -> bool:
                 logger.info("Called delete_webhook()")
             except Exception as ex:
                 logger.warning("delete_webhook call failed: %s", ex)
-            # poll until webhook gone
             start = asyncio.get_event_loop().time()
             while True:
                 try:
@@ -203,7 +197,6 @@ async def polling_runner(app):
     max_backoff = 60
     logger.info("Polling runner started")
 
-    # ensure webhook removed before polling
     ok = await ensure_webhook_deleted(bot, timeout=8.0)
     if not ok:
         logger.warning("Could not ensure webhook removed before polling. Proceeding may raise CantGetUpdates.")
@@ -263,7 +256,6 @@ async def on_startup_app(app: web.Application):
     app['updates_queue'] = _updates_queue
     _worker_task = asyncio.create_task(webhook_worker())
 
-    # obtain bot session
     try:
         sess = await bot.get_session()
         app['bot_session'] = sess
@@ -276,9 +268,7 @@ async def on_startup_app(app: web.Application):
         logger.info("keep_alive_ping started (KEEP_BOT_ALIVE=True)")
     app['keep_alive'] = asyncio.create_task(asyncio.sleep(3600*24))
 
-    # Decide mode: prefer webhook if WEBHOOK_URL provided.
     if FORCE_POLLING or not WEBHOOK_URL:
-        # ensure webhook removed before polling
         try:
             ok = await ensure_webhook_deleted(bot, timeout=8.0)
             if not ok:
@@ -346,7 +336,6 @@ async def on_cleanup_app(app: web.Application):
         except Exception:
             pass
 
-    # delete webhook only if set by main and AUTO_DELETE configured
     if app.get('webhook_set_by_main') and WEBHOOK_AUTO_DELETE:
         try:
             await bot.delete_webhook()
@@ -357,7 +346,6 @@ async def on_cleanup_app(app: web.Application):
         if app.get('webhook_set_by_main'):
             logger.info("Webhook set by main but WEBHOOK_AUTO_DELETE=False -> left intact")
 
-    # attempt to stop scheduler (prefer bot_app helper)
     try:
         stop_sched_fn = getattr(bot_app, "_stop_scheduler_if_any", None)
         if callable(stop_sched_fn):
@@ -376,7 +364,6 @@ async def on_cleanup_app(app: web.Application):
     except Exception:
         logger.debug("Scheduler shutdown encountered issues", exc_info=True)
 
-    # close storage
     try:
         await dp.storage.close()
         await dp.storage.wait_closed()
@@ -384,47 +371,82 @@ async def on_cleanup_app(app: web.Application):
     except Exception:
         logger.debug("Storage close failed", exc_info=True)
 
-    # CLOSE all discovered aiohttp sessions to avoid 'Unclosed client session'
+    # === Robust session cleanup: enumerate likely sessions and close them ===
+    sessions_to_close = []
     try:
-        # 1) session via bot.get_session()
+        # 1) session returned by bot.get_session() (awaitable)
         try:
             sess = await bot.get_session()
+            if sess:
+                sessions_to_close.append(("bot.get_session()", sess))
         except Exception:
-            sess = getattr(bot, "session", None)
-        if sess:
-            try:
-                await sess.close()
-                logger.info("Closed bot.get_session() session")
-            except Exception:
-                logger.debug("Failed to close session from bot.get_session()", exc_info=True)
-
-        # 2) session stored on app during startup
-        try:
-            app_sess = app.get("bot_session")
-            if app_sess and getattr(app_sess, "closed", False) is False:
-                try:
-                    await app_sess.close()
-                    logger.info("Closed app['bot_session']")
-                except Exception:
-                    logger.debug("Failed to close app['bot_session']", exc_info=True)
-        except Exception:
-            logger.debug("Error handling app['bot_session']", exc_info=True)
-
-        # 3) any session exported by bot_app (e.g. bot_app.client_session)
-        try:
-            ca = getattr(bot_app, "client_session", None)
-            if ca and getattr(ca, "closed", False) is False:
-                try:
-                    await ca.close()
-                    logger.info("Closed bot_app.client_session")
-                except Exception:
-                    logger.debug("Failed to close bot_app.client_session", exc_info=True)
-        except Exception:
-            logger.debug("Error handling bot_app.client_session", exc_info=True)
+            # fallback to attributes on bot
+            sess = getattr(bot, "session", None) or getattr(bot, "_session", None)
+            if sess:
+                sessions_to_close.append(("bot.session or bot._session", sess))
     except Exception:
-        logger.exception("Error while attempting to close aiohttp sessions")
+        logger.debug("Error while obtaining bot session", exc_info=True)
 
-    # close bot object itself (best-effort)
+    # 2) session stored on app during startup
+    try:
+        app_sess = app.get("bot_session")
+        if app_sess:
+            sessions_to_close.append(("app['bot_session']", app_sess))
+    except Exception:
+        logger.debug("Error while reading app['bot_session']", exc_info=True)
+
+    # 3) session possibly exported by bot_app (client_session or similar)
+    try:
+        ca = getattr(bot_app, "client_session", None)
+        if ca:
+            sessions_to_close.append(("bot_app.client_session", ca))
+    except Exception:
+        logger.debug("Error while reading bot_app.client_session", exc_info=True)
+
+    # 4) any other common names
+    try:
+        maybe = getattr(bot_app, "session", None) or getattr(bot_app, "sess", None)
+        if maybe:
+            sessions_to_close.append(("bot_app.session", maybe))
+    except Exception:
+        pass
+
+    # Unique by id to avoid double-close attempts
+    seen_ids = set()
+    for name, s in sessions_to_close:
+        try:
+            sid = id(s)
+            if sid in seen_ids:
+                continue
+            seen_ids.add(sid)
+            closed_attr = getattr(s, "closed", None)
+            # If closed attribute exists and is False -> close it
+            if closed_attr is False:
+                try:
+                    await s.close()
+                    logger.info("Closed session %s", name)
+                except Exception:
+                    logger.exception("Failed to close session %s", name)
+            else:
+                # if 'closed' attribute missing, still try to close if callable
+                close_fn = getattr(s, "close", None)
+                if callable(close_fn):
+                    try:
+                        maybe = close_fn()
+                        if asyncio.iscoroutine(maybe):
+                            await maybe
+                        logger.info("Called close() on session-like object %s", name)
+                    except Exception:
+                        logger.debug("close() on session-like object %s raised", name, exc_info=True)
+                else:
+                    logger.debug("Session %s already closed or not closeable", name)
+        except Exception:
+            logger.debug("Exception while attempting to close session %s", name, exc_info=True)
+
+    # Best-effort: also try to close connector objects found on sessions (rare)
+    # (usually closing session suffices)
+
+    # Finally, close bot object itself (best-effort)
     try:
         await bot.close()
         logger.info("Bot closed")
