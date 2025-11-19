@@ -11,6 +11,7 @@ import os
 import logging
 import sqlite3
 import asyncio
+from typing import Optional
 from datetime import datetime, timedelta
 import pytz
 
@@ -242,9 +243,7 @@ async def start(msg: types.Message):
     await IncomeState.income.set()
     await msg.reply(welcome, reply_markup=kb)
 
-# ... (rest of handlers as in working version, omitted here for brevity in this snippet)
-# In actual file include the complete handlers set you previously used (as in your working version).
-# For clarity I assume you keep the previously provided full handler implementations.
+# (остальные хендлеры — тот же рабочий набор, который у вас был; вставьте полностью как в рабочей версии)
 
 # ------------- init helper -------------
 async def init_app_for_runtime(app):
@@ -271,7 +270,6 @@ async def init_app_for_runtime(app):
 
     # ensure DB tables exist already (they are created at import but double-check)
     try:
-        # Use a simple sync check inside executor if needed; here keep sync but guarded
         cursor.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, income REAL DEFAULT 0, notifications BOOLEAN DEFAULT 1)")
         cursor.execute("CREATE TABLE IF NOT EXISTS expenses (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount REAL, category TEXT, timestamp DATETIME, recurring_id INTEGER DEFAULT NULL)")
         cursor.execute("CREATE TABLE IF NOT EXISTS recurring (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount REAL, category TEXT, day INTEGER)")
