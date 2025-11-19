@@ -18,6 +18,7 @@ import random
 from typing import Optional
 
 from aiohttp import web
+from aiogram.utils.exceptions import TerminatedByOtherGetUpdates
 
 import bot_app  # imports bot, dp, scheduler, registers handlers on import
 
@@ -34,9 +35,9 @@ KEEP_BOT_ALIVE = os.environ.get("KEEP_BOT_ALIVE", "1") != "0"
 HOOK_SECRET = os.environ.get("HOOK_SECRET")  # optional secret token to validate incoming webhooks
 
 # Short aliases to objects exported by bot_app
-bot = bot_app.bot
-dp = bot_app.dp
-scheduler = bot_app.scheduler
+bot = getattr(bot_app, "bot", None)
+dp = getattr(bot_app, "dp", None)
+scheduler = getattr(bot_app, "scheduler", None)
 
 # runtime artifacts
 _updates_queue: Optional[asyncio.Queue] = None
@@ -82,7 +83,6 @@ async def _db_ping(loop=None) -> bool:
     Returns True if DB exists and responds to a simple query.
     """
     try:
-        # run in executor
         def ping():
             try:
                 conn = getattr(bot_app, "conn", None)
@@ -95,7 +95,7 @@ async def _db_ping(loop=None) -> bool:
             except Exception:
                 return False
         if loop is None:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, ping)
     except Exception:
         return False
@@ -150,6 +150,7 @@ async def handle_webhook(request: web.Request):
         data = await request.json()
     except Exception:
         logger.exception("Failed to parse JSON from webhook request")
+        # return 200 to tell Telegram we accepted the request (to avoid retries flooding)
         return web.Response(status=200, text="ok")
 
     try:
@@ -230,7 +231,11 @@ async def on_startup_app(app: web.Application):
 
     # Let bot_app initialize its runtime (db_lock, scheduler jobs, etc.)
     try:
-        await bot_app.init_app_for_runtime(app)
+        init_fn = getattr(bot_app, "init_app_for_runtime", None)
+        if callable(init_fn):
+            await init_fn(app)
+        else:
+            logger.debug("bot_app.init_app_for_runtime not present (skipping)")
     except Exception:
         logger.exception("bot_app.init_app_for_runtime failed (continuing)")
 
@@ -264,11 +269,13 @@ async def on_startup_app(app: web.Application):
         app['polling_task'] = asyncio.create_task(polling_runner(app))
         logger.info("Polling mode enabled")
     else:
-        webhook = WEBHOOK_URL.rstrip("/") + f"{WEBHOOK_PREFIX}"
-        # Accept both forms: with and without trailing token; main will route /webhook and /webhook/{token}.
+        webhook = WEBHOOK_URL.rstrip("/") + WEBHOOK_PREFIX
         # Attempt resilient set_webhook (with retries)
         success = await set_webhook_with_retries(bot, webhook, attempts=3, base_sleep=1.0)
-        if not success:
+        if success:
+            app['webhook_set_by_main'] = True
+            app['webhook_full_url'] = webhook
+        else:
             logger.warning("set_webhook failed, falling back to polling")
             try:
                 await bot.delete_webhook(drop_pending_updates=True)
@@ -336,15 +343,15 @@ async def on_cleanup_app(app: web.Application):
         if app.get('webhook_set_by_main'):
             logger.info("Webhook set by main but WEBHOOK_AUTO_DELETE=False -> left intact")
 
-    # shutdown scheduler safely
+    # shutdown scheduler safely (try bot_app helper first, else fallback)
     try:
-        # bot_app.scheduler may be AsyncIOScheduler; _stop_scheduler_if_any in bot_app handles loop issues.
-        try:
-            if hasattr(bot_app, "scheduler"):
-                # attempt a graceful stop via bot_app helper if available
-                await bot_app._stop_scheduler_if_any()  # If present as helper; else ignore
-        except Exception:
-            # fallback: try direct shutdown if scheduler object present
+        stop_sched_fn = getattr(bot_app, "_stop_scheduler_if_any", None)
+        if callable(stop_sched_fn):
+            try:
+                await stop_sched_fn()
+            except Exception:
+                logger.debug("bot_app._stop_scheduler_if_any raised", exc_info=True)
+        else:
             sched = getattr(bot_app, "scheduler", None)
             if sched:
                 try:
@@ -402,8 +409,13 @@ async def on_cleanup_app(app: web.Application):
 async def set_webhook_handler(request: web.Request):
     if not WEBHOOK_URL:
         return web.json_response({"ok": False, "error": "WEBHOOK_URL not configured"}, status=400)
-    webhook = WEBHOOK_URL.rstrip("/") + f"{WEBHOOK_PREFIX}"
+    webhook = WEBHOOK_URL.rstrip("/") + WEBHOOK_PREFIX
     success = await set_webhook_with_retries(bot, webhook, attempts=3)
+    if success:
+        # mark for cleanup logic
+        app = request.app
+        app['webhook_set_by_main'] = True
+        app['webhook_full_url'] = webhook
     return web.json_response({"ok": success, "webhook": webhook})
 
 async def debug_handler(request: web.Request):
@@ -435,7 +447,7 @@ async def ready_handler(request: web.Request):
     except Exception:
         ready["bot"] = False
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         ready["db"] = await _db_ping(loop)
     except Exception:
         ready["db"] = False
@@ -448,6 +460,7 @@ def create_app():
     a = web.Application()
     a.router.add_get("/", handle_root)
     a.router.add_get("/ready", ready_handler)
+    # both forms for compatibility
     a.router.add_post(f"{WEBHOOK_PREFIX}", handle_webhook)
     a.router.add_post(f"{WEBHOOK_PREFIX}/{{token:.*}}", handle_webhook)
     a.router.add_post("/set_webhook", set_webhook_handler)
