@@ -1,41 +1,43 @@
 # main.py
 """
-Main entrypoint — fixes for:
- - avoid starting polling when webhook was successfully set (KEEP_BOT_ALIVE no longer forces polling)
- - always close bot aiohttp session on cleanup to prevent 'Unclosed client session'
- - small defensive tweaks around webhook startup/shutdown
+Robust launcher for Financial_Guide.
+
+Fixes applied:
+ - ensure webhook is deleted before starting polling (avoid CantGetUpdates / TerminatedByOtherGetUpdates)
+ - retries + wait-for-confirmation when deleting webhook
+ - close all discovered aiohttp sessions on cleanup to avoid 'Unclosed client session' warnings
+ - defensive logging
 """
 import os
 import logging
 import asyncio
 import signal
-import json
 import random
 from typing import Optional
 
 from aiohttp import web
-from aiogram.utils.exceptions import TerminatedByOtherGetUpdates
+from aiogram.utils.exceptions import TerminatedByOtherGetUpdates, CantGetUpdates
 
-import bot_app  # imports bot, dp, scheduler, registers handlers on import
+import bot_app  # imports bot, dp, scheduler, handlers registered on import
 
 logger = logging.getLogger("main")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# Config from env
+# Config
 PORT = int(os.environ.get("PORT", "10000"))
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # e.g. https://domain.com
 WEBHOOK_PREFIX = os.environ.get("WEBHOOK_PREFIX", "/webhook").rstrip("/")
 WEBHOOK_AUTO_DELETE = os.environ.get("WEBHOOK_AUTO_DELETE", "0") in ("1", "true", "yes")
 FORCE_POLLING = os.environ.get("FORCE_POLLING", "0") == "1"
 KEEP_BOT_ALIVE = os.environ.get("KEEP_BOT_ALIVE", "1") != "0"
-HOOK_SECRET = os.environ.get("HOOK_SECRET")  # optional secret token to validate incoming webhooks
+HOOK_SECRET = os.environ.get("HOOK_SECRET")  # optional
 
-# Short aliases to objects exported by bot_app
+# exported from bot_app
 bot = getattr(bot_app, "bot", None)
 dp = getattr(bot_app, "dp", None)
 scheduler = getattr(bot_app, "scheduler", None)
 
-# runtime artifacts
+# runtime
 _updates_queue: Optional[asyncio.Queue] = None
 _worker_task: Optional[asyncio.Task] = None
 
@@ -65,6 +67,47 @@ async def set_webhook_with_retries(bot_obj, webhook_url: str, attempts: int = 3,
             await asyncio.sleep(base_sleep * attempt + random.random() * 0.3)
     logger.error("set_webhook failed after %s attempts", attempts)
     return False
+
+async def ensure_webhook_deleted(bot_obj, timeout: float = 10.0) -> bool:
+    """
+    Ensure Telegram webhook is removed. Returns True if webhook is absent (or was removed).
+    Attempts delete_webhook then polls get_webhook_info until .url is empty or timeout.
+    """
+    try:
+        info = None
+        try:
+            info = await bot_obj.get_webhook_info()
+        except Exception as e:
+            logger.debug("get_webhook_info initial failed: %s", e)
+            # continue to attempt delete anyway
+        if info and getattr(info, "url", None):
+            logger.info("Webhook currently set to %s. Will attempt to delete.", info.url)
+            try:
+                await bot_obj.delete_webhook(drop_pending_updates=True)
+                logger.info("Called delete_webhook()")
+            except Exception as ex:
+                logger.warning("delete_webhook call failed: %s", ex)
+            # poll until webhook gone
+            start = asyncio.get_event_loop().time()
+            while True:
+                try:
+                    info = await bot_obj.get_webhook_info()
+                    url = getattr(info, "url", None)
+                    if not url:
+                        logger.info("Webhook confirmed removed.")
+                        return True
+                except Exception as ex:
+                    logger.debug("get_webhook_info during delete wait: %s", ex)
+                if asyncio.get_event_loop().time() - start > timeout:
+                    logger.warning("Timeout waiting for webhook to be removed")
+                    return False
+                await asyncio.sleep(0.5)
+        else:
+            logger.debug("No webhook set (get_webhook_info empty).")
+            return True
+    except Exception as ex:
+        logger.exception("ensure_webhook_deleted failed: %s", ex)
+        return False
 
 async def _db_ping(loop=None) -> bool:
     try:
@@ -159,6 +202,12 @@ async def polling_runner(app):
     backoff = 1
     max_backoff = 60
     logger.info("Polling runner started")
+
+    # ensure webhook removed before polling
+    ok = await ensure_webhook_deleted(bot, timeout=8.0)
+    if not ok:
+        logger.warning("Could not ensure webhook removed before polling. Proceeding may raise CantGetUpdates.")
+
     while True:
         try:
             try:
@@ -172,11 +221,14 @@ async def polling_runner(app):
         except asyncio.CancelledError:
             logger.info("Polling runner cancelled")
             raise
-        except TerminatedByOtherGetUpdates:
-            logger.warning("TerminatedByOtherGetUpdates — another getUpdates exists. Sleeping 60s then retry.")
+        except (TerminatedByOtherGetUpdates, CantGetUpdates) as e:
+            logger.warning("Polling refused: %s. Attempting to delete webhook and retry.", e)
+            try:
+                await ensure_webhook_deleted(bot, timeout=8.0)
+            except Exception:
+                logger.debug("ensure_webhook_deleted raised during polling handler", exc_info=True)
             await asyncio.sleep(60)
             backoff = 1
-            continue
         except Exception:
             logger.exception("Polling crashed, will retry")
             await asyncio.sleep(backoff)
@@ -211,6 +263,7 @@ async def on_startup_app(app: web.Application):
     app['updates_queue'] = _updates_queue
     _worker_task = asyncio.create_task(webhook_worker())
 
+    # obtain bot session
     try:
         sess = await bot.get_session()
         app['bot_session'] = sess
@@ -223,29 +276,30 @@ async def on_startup_app(app: web.Application):
         logger.info("keep_alive_ping started (KEEP_BOT_ALIVE=True)")
     app['keep_alive'] = asyncio.create_task(asyncio.sleep(3600*24))
 
-    # IMPORTANT CHANGE: KEEP_BOT_ALIVE no longer forces polling.
+    # Decide mode: prefer webhook if WEBHOOK_URL provided.
     if FORCE_POLLING or not WEBHOOK_URL:
+        # ensure webhook removed before polling
         try:
-            await bot.delete_webhook(drop_pending_updates=True)
-            logger.info("Webhook deleted (pre-polling cleanup)")
+            ok = await ensure_webhook_deleted(bot, timeout=8.0)
+            if not ok:
+                logger.warning("ensure_webhook_deleted returned False before polling; still starting polling (may fail).")
         except Exception:
-            logger.debug("delete_webhook pre-polling failed (ignored)")
+            logger.debug("ensure_webhook_deleted failed pre-polling (ignored)", exc_info=True)
         app['polling_task'] = asyncio.create_task(polling_runner(app))
         logger.info("Polling mode enabled")
     else:
-        # attempt to set webhook (preferred)
         webhook = WEBHOOK_URL.rstrip("/") + WEBHOOK_PREFIX
         success = await set_webhook_with_retries(bot, webhook, attempts=3, base_sleep=1.0)
         if success:
             app['webhook_set_by_main'] = True
             app['webhook_full_url'] = webhook
-            logger.info("Using webhook mode; polling not started.")
+            logger.info("Webhook mode enabled; polling not started.")
         else:
             logger.warning("set_webhook failed, falling back to polling")
             try:
-                await bot.delete_webhook(drop_pending_updates=True)
+                await ensure_webhook_deleted(bot, timeout=8.0)
             except Exception:
-                logger.debug("delete_webhook during fallback failed")
+                logger.debug("ensure_webhook_deleted failed during fallback (ignored)")
             app['polling_task'] = asyncio.create_task(polling_runner(app))
 
 async def on_cleanup_app(app: web.Application):
@@ -292,6 +346,7 @@ async def on_cleanup_app(app: web.Application):
         except Exception:
             pass
 
+    # delete webhook only if set by main and AUTO_DELETE configured
     if app.get('webhook_set_by_main') and WEBHOOK_AUTO_DELETE:
         try:
             await bot.delete_webhook()
@@ -302,7 +357,7 @@ async def on_cleanup_app(app: web.Application):
         if app.get('webhook_set_by_main'):
             logger.info("Webhook set by main but WEBHOOK_AUTO_DELETE=False -> left intact")
 
-    # shutdown scheduler safely (try bot_app helper first, else fallback)
+    # attempt to stop scheduler (prefer bot_app helper)
     try:
         stop_sched_fn = getattr(bot_app, "_stop_scheduler_if_any", None)
         if callable(stop_sched_fn):
@@ -329,40 +384,64 @@ async def on_cleanup_app(app: web.Application):
     except Exception:
         logger.debug("Storage close failed", exc_info=True)
 
-    # ALWAYS try to close bot's aiohttp session to avoid Unclosed client session warnings.
+    # CLOSE all discovered aiohttp sessions to avoid 'Unclosed client session'
     try:
-        sess = None
+        # 1) session via bot.get_session()
         try:
             sess = await bot.get_session()
         except Exception:
-            sess = getattr(bot, 'session', None)
+            sess = getattr(bot, "session", None)
         if sess:
             try:
                 await sess.close()
-                logger.info('bot.session closed explicitly')
+                logger.info("Closed bot.get_session() session")
             except Exception:
-                logger.debug('bot.session.close() failed', exc_info=True)
-    except Exception:
-        logger.exception('Failed while closing bot session (final)')
+                logger.debug("Failed to close session from bot.get_session()", exc_info=True)
 
-    # close bot object itself
+        # 2) session stored on app during startup
+        try:
+            app_sess = app.get("bot_session")
+            if app_sess and getattr(app_sess, "closed", False) is False:
+                try:
+                    await app_sess.close()
+                    logger.info("Closed app['bot_session']")
+                except Exception:
+                    logger.debug("Failed to close app['bot_session']", exc_info=True)
+        except Exception:
+            logger.debug("Error handling app['bot_session']", exc_info=True)
+
+        # 3) any session exported by bot_app (e.g. bot_app.client_session)
+        try:
+            ca = getattr(bot_app, "client_session", None)
+            if ca and getattr(ca, "closed", False) is False:
+                try:
+                    await ca.close()
+                    logger.info("Closed bot_app.client_session")
+                except Exception:
+                    logger.debug("Failed to close bot_app.client_session", exc_info=True)
+        except Exception:
+            logger.debug("Error handling bot_app.client_session", exc_info=True)
+    except Exception:
+        logger.exception("Error while attempting to close aiohttp sessions")
+
+    # close bot object itself (best-effort)
     try:
         await bot.close()
-        logger.info('Bot closed')
+        logger.info("Bot closed")
     except Exception:
-        logger.debug('bot.close() failed', exc_info=True)
+        logger.debug("bot.close() failed", exc_info=True)
 
     # close sqlite connection if present
     try:
         if getattr(bot_app, "conn", None):
             bot_app.conn.close()
-            logger.info('DB connection closed')
+            logger.info("DB connection closed")
     except Exception:
-        logger.debug('DB close failed', exc_info=True)
+        logger.debug("DB close failed", exc_info=True)
 
     logger.info("Cleanup complete")
 
-# ---------- admin / health endpoints ----------
+# ---------- admin / health ----------
 async def set_webhook_handler(request: web.Request):
     if not WEBHOOK_URL:
         return web.json_response({"ok": False, "error": "WEBHOOK_URL not configured"}, status=400)
