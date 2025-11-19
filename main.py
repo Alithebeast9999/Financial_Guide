@@ -9,6 +9,7 @@ Safe improvements added:
  - registers both /webhook and /webhook/{token} endpoints (compatibility)
  - better logging and defensive shutdown handling
  - ensures Dispatcher.set_current(dp) is set in webhook worker to support FSM
+ - always close any aiohttp client session stored on app['bot_session'] (fixes "Unclosed client session")
 """
 import os
 import logging
@@ -112,17 +113,13 @@ async def webhook_worker():
     logger.info("Webhook worker started")
     # prefer to set current Bot/Dispatcher object for aiogram internals (FSM etc.)
     try:
-        # ensure dispatcher current for the worker context too
-        try:
-            Dispatcher.set_current(dp)
-        except Exception:
-            logger.debug("Dispatcher.set_current(dp) failed at worker start (ignored)")
-        try:
-            bot_app.Bot.set_current(bot)
-        except Exception:
-            logger.debug("Bot.set_current failed in worker (ignored)")
+        Dispatcher.set_current(dp)
     except Exception:
-        logger.debug("Setting initial current Bot/Dispatcher failed (ignored)")
+        logger.debug("Dispatcher.set_current(dp) failed at worker start (ignored)")
+    try:
+        bot_app.Bot.set_current(bot)
+    except Exception:
+        logger.debug("Bot.set_current failed in worker (ignored)")
 
     while True:
         try:
@@ -302,6 +299,8 @@ async def on_startup_app(app: web.Application):
             try:
                 await bot.set_webhook(webhook)
                 logger.info("Webhook set successfully: %s", webhook)
+                app['webhook_set_by_main'] = True
+                app['webhook_full_url'] = webhook
                 success = True
                 break
             except Exception:
@@ -364,7 +363,29 @@ async def on_cleanup_app(app: web.Application):
         except Exception:
             pass
 
-    # delete webhook only if NOT KEEP_BOT_ALIVE
+    # --- NEW: always close the aiohttp session we stored on startup (if any).
+    # This fixes "Unclosed client session" warnings even if KEEP_BOT_ALIVE=True.
+    try:
+        sess = app.get('bot_session')
+        if not sess:
+            try:
+                sess = await bot.get_session()
+            except Exception:
+                sess = getattr(bot, 'session', None)
+        if sess:
+            try:
+                closed_attr = getattr(sess, "closed", None)
+                if closed_attr is False:
+                    await sess.close()
+                    logger.info("Closed bot_session (app['bot_session']).")
+                else:
+                    logger.debug("bot_session already closed.")
+            except Exception:
+                logger.exception("Error while closing bot session stored on app")
+    except Exception:
+        logger.debug("Failed to close stored bot session (ignored)", exc_info=True)
+
+    # delete webhook only if WEBHOOK_AUTO_DELETE is true
     if app.get('webhook_set_by_main') and WEBHOOK_AUTO_DELETE:
         try:
             await bot.delete_webhook()
@@ -390,38 +411,25 @@ async def on_cleanup_app(app: web.Application):
     except Exception:
         logger.debug("Storage close failed", exc_info=True)
 
-    # close bot session & bot only if NOT KEEP_BOT_ALIVE
+    # close bot object only if NOT KEEP_BOT_ALIVE
     if not KEEP_BOT_ALIVE:
-        try:
-            sess = None
-            try:
-                sess = await bot.get_session()
-            except Exception:
-                sess = getattr(bot, 'session', None)
-            if sess:
-                try:
-                    await sess.close()
-                    logger.info('bot.session closed explicitly')
-                except Exception:
-                    logger.exception('Error while closing bot session')
-        except Exception:
-            logger.exception('Failed while closing bot session')
         try:
             await bot.close()
             logger.info('Bot closed (client session closed)')
         except Exception:
             logger.exception('Error while closing bot')
     else:
-        logger.info('KEEP_BOT_ALIVE=True -> skipping bot.close()')
+        logger.info('KEEP_BOT_ALIVE=True -> skipping bot.close() (session already closed above)')
 
     # close sqlite connection
     try:
-        bot_app.conn.close()
-        logger.info('DB connection closed')
+        if getattr(bot_app, "conn", None):
+            bot_app.conn.close()
+            logger.info('DB connection closed')
     except Exception:
         logger.debug('DB close failed', exc_info=True)
 
-    logger.info('Cleanup complete')
+    logger.info("Cleanup complete")
 
 # Admin endpoints
 async def set_webhook_handler(request: web.Request):
