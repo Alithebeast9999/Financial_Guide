@@ -1,21 +1,21 @@
 # main.py
 """
-Robust launcher for Financial_Guide with improved cleanup to avoid
-'Unclosed client session' warnings.
+Robust launcher for Financial_Guide with aggressive aiohttp cleanup.
 
-Key change: on_cleanup_app now enumerates and closes all discovered
-aiohttp ClientSession objects (bot.get_session(), bot.session, app['bot_session'],
-bot_app.client_session, etc.) and then closes bot. This avoids the unclosed
-client session/connector errors seen in logs.
+On cleanup we enumerate all alive aiohttp.ClientSession objects via gc.get_objects()
+and close any that are still open — this prevents "Unclosed client session" errors
+that were observed in the logs.
 """
 import os
 import logging
 import asyncio
 import signal
 import random
+import gc
 from typing import Optional
 
-from aiohttp import web
+from aiohttp import web, ClientSession
+
 from aiogram.utils.exceptions import TerminatedByOtherGetUpdates, CantGetUpdates
 
 import bot_app  # imports bot, dp, scheduler, handlers registered on import
@@ -292,6 +292,57 @@ async def on_startup_app(app: web.Application):
                 logger.debug("ensure_webhook_deleted failed during fallback (ignored)")
             app['polling_task'] = asyncio.create_task(polling_runner(app))
 
+async def _close_all_aiohttp_sessions():
+    """
+    Aggressively find all aiohttp.ClientSession objects via gc and close them.
+    This is a last-resort cleanup to avoid 'Unclosed client session' warnings.
+    """
+    closed_count = 0
+    found = []
+    try:
+        for obj in gc.get_objects():
+            try:
+                if isinstance(obj, ClientSession):
+                    found.append(obj)
+            except Exception:
+                # some gc objects may raise on isinstance check
+                continue
+    except Exception:
+        logger.debug("gc.get_objects() scan failed", exc_info=True)
+
+    # unique by id
+    unique = {}
+    for s in found:
+        unique[id(s)] = s
+    for sid, s in unique.items():
+        try:
+            closed_attr = getattr(s, "closed", None)
+            if closed_attr is False:
+                logger.info("Closing lingering aiohttp ClientSession (id=%s)", sid)
+                try:
+                    maybe = s.close()
+                    if asyncio.iscoroutine(maybe):
+                        await maybe
+                    closed_count += 1
+                except Exception:
+                    logger.exception("Failed to close session id=%s", sid)
+            else:
+                # still attempt a close if close() callable but closed flag missing
+                close_fn = getattr(s, "close", None)
+                if callable(close_fn):
+                    try:
+                        maybe = close_fn()
+                        if asyncio.iscoroutine(maybe):
+                            await maybe
+                        closed_count += 1
+                    except Exception:
+                        logger.debug("close() on session-like object id=%s raised", sid, exc_info=True)
+        except Exception:
+            logger.debug("Error while closing session id=%s", sid, exc_info=True)
+
+    logger.info("Aggressive aiohttp cleanup: closed %s sessions", closed_count)
+    return closed_count
+
 async def on_cleanup_app(app: web.Application):
     global _updates_queue, _worker_task
     logger.info("on_cleanup: starting cleanup (initiator=%s)", _shutdown_initiator.get("signal"))
@@ -371,23 +422,20 @@ async def on_cleanup_app(app: web.Application):
     except Exception:
         logger.debug("Storage close failed", exc_info=True)
 
-    # === Robust session cleanup: enumerate likely sessions and close them ===
+    # Try to close sessions we know about (bot.get_session/app['bot_session']/bot_app.client_session, etc.)
     sessions_to_close = []
     try:
-        # 1) session returned by bot.get_session() (awaitable)
         try:
             sess = await bot.get_session()
             if sess:
                 sessions_to_close.append(("bot.get_session()", sess))
         except Exception:
-            # fallback to attributes on bot
             sess = getattr(bot, "session", None) or getattr(bot, "_session", None)
             if sess:
                 sessions_to_close.append(("bot.session or bot._session", sess))
     except Exception:
         logger.debug("Error while obtaining bot session", exc_info=True)
 
-    # 2) session stored on app during startup
     try:
         app_sess = app.get("bot_session")
         if app_sess:
@@ -395,7 +443,6 @@ async def on_cleanup_app(app: web.Application):
     except Exception:
         logger.debug("Error while reading app['bot_session']", exc_info=True)
 
-    # 3) session possibly exported by bot_app (client_session or similar)
     try:
         ca = getattr(bot_app, "client_session", None)
         if ca:
@@ -403,15 +450,7 @@ async def on_cleanup_app(app: web.Application):
     except Exception:
         logger.debug("Error while reading bot_app.client_session", exc_info=True)
 
-    # 4) any other common names
-    try:
-        maybe = getattr(bot_app, "session", None) or getattr(bot_app, "sess", None)
-        if maybe:
-            sessions_to_close.append(("bot_app.session", maybe))
-    except Exception:
-        pass
-
-    # Unique by id to avoid double-close attempts
+    # Close gathered sessions
     seen_ids = set()
     for name, s in sessions_to_close:
         try:
@@ -420,15 +459,15 @@ async def on_cleanup_app(app: web.Application):
                 continue
             seen_ids.add(sid)
             closed_attr = getattr(s, "closed", None)
-            # If closed attribute exists and is False -> close it
             if closed_attr is False:
                 try:
-                    await s.close()
+                    maybe = s.close()
+                    if asyncio.iscoroutine(maybe):
+                        await maybe
                     logger.info("Closed session %s", name)
                 except Exception:
                     logger.exception("Failed to close session %s", name)
             else:
-                # if 'closed' attribute missing, still try to close if callable
                 close_fn = getattr(s, "close", None)
                 if callable(close_fn):
                     try:
@@ -438,15 +477,16 @@ async def on_cleanup_app(app: web.Application):
                         logger.info("Called close() on session-like object %s", name)
                     except Exception:
                         logger.debug("close() on session-like object %s raised", name, exc_info=True)
-                else:
-                    logger.debug("Session %s already closed or not closeable", name)
         except Exception:
             logger.debug("Exception while attempting to close session %s", name, exc_info=True)
 
-    # Best-effort: also try to close connector objects found on sessions (rare)
-    # (usually closing session suffices)
+    # Aggressive GC-based cleanup (last resort)
+    try:
+        await _close_all_aiohttp_sessions()
+    except Exception:
+        logger.debug("Aggressive GC-based session cleanup failed", exc_info=True)
 
-    # Finally, close bot object itself (best-effort)
+    # Finally, try to close bot itself
     try:
         await bot.close()
         logger.info("Bot closed")
