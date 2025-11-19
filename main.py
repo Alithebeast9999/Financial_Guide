@@ -2,27 +2,23 @@
 """
 Main entrypoint — robust webhook/polling launcher for Financial_Guide.
 
-Safe improvements added:
- - optional secret-token check for webhook requests (HOOK_SECRET / X-Telegram-Bot-Api-Secret-Token)
- - resilient set_webhook with retries and jitter
- - /ready endpoint which checks bot.get_me() and a light DB ping (via executor)
- - registers both /webhook and /webhook/{token} endpoints (compatibility)
- - better logging and defensive shutdown handling
- - ensures Dispatcher.set_current(dp) is set in webhook worker to support FSM
- - always close any aiohttp client session stored on app['bot_session'] (fixes "Unclosed client session")
+Key fixes in this version:
+ - DO NOT start polling just because KEEP_BOT_ALIVE=True (avoids webhook vs getUpdates conflicts)
+ - Start polling only when FORCE_POLLING=True or when webhook is not configured/failed to set
+ - Ensure Dispatcher/ Bot current are set in webhook worker for FSM support
+ - Robustly close bot aiohttp session stored on app or returned by bot.get_session()
+ - Better handling of TerminatedByOtherGetUpdates / CantGetUpdates in polling loop
 """
 import os
 import logging
 import asyncio
 import signal
-import json
 import random
 from typing import Optional
 
 from aiohttp import web
-
-from aiogram.dispatcher.dispatcher import Dispatcher
 from aiogram.utils.exceptions import TerminatedByOtherGetUpdates, CantGetUpdates
+from aiogram.dispatcher.dispatcher import Dispatcher
 
 import bot_app  # imports bot, dp, scheduler, registers handlers on import
 
@@ -50,10 +46,6 @@ _worker_task: Optional[asyncio.Task] = None
 # ---------- Helpers ----------
 
 def _check_secret_header(request: web.Request) -> bool:
-    """
-    If HOOK_SECRET is configured, require header 'X-Telegram-Bot-Api-Secret-Token'
-    to match. Otherwise allow.
-    """
     if not HOOK_SECRET:
         return True
     header = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
@@ -82,28 +74,20 @@ async def set_webhook_with_retries(bot_obj, webhook_url: str, attempts: int = 3,
     return False
 
 async def _db_ping(loop=None) -> bool:
-    """
-    Light DB ping executed in executor to avoid blocking event loop.
-    Returns True if DB exists and responds to a simple query.
-    """
-    try:
-        # run in executor
-        def ping():
-            try:
-                conn = getattr(bot_app, "conn", None)
-                if not conn:
-                    return False
-                cur = conn.cursor()
-                cur.execute("SELECT 1")
-                _ = cur.fetchone()
-                return True
-            except Exception:
+    def ping():
+        try:
+            conn = getattr(bot_app, "conn", None)
+            if not conn:
                 return False
-        if loop is None:
-            loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, ping)
-    except Exception:
-        return False
+            cur = conn.cursor()
+            cur.execute("SELECT 1")
+            _ = cur.fetchone()
+            return True
+        except Exception:
+            return False
+    if loop is None:
+        loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, ping)
 
 # ---------- Worker & webhook queue ----------
 
@@ -111,7 +95,7 @@ async def webhook_worker():
     """Background worker that takes Updates from queue and calls dp.process_update"""
     global _updates_queue
     logger.info("Webhook worker started")
-    # prefer to set current Bot/Dispatcher object for aiogram internals (FSM etc.)
+    # set a default current so FSM/Dispatcher can access it
     try:
         Dispatcher.set_current(dp)
     except Exception:
@@ -125,7 +109,7 @@ async def webhook_worker():
         try:
             update = await _updates_queue.get()
             try:
-                # set current for this task (ensures FSM: Dispatcher.get_current() is not None)
+                # For each task set current to allow FSM state ops
                 try:
                     Dispatcher.set_current(dp)
                 except Exception:
@@ -156,13 +140,6 @@ async def webhook_worker():
             logger.exception("Unexpected exception in webhook worker; continuing")
 
 async def handle_webhook(request: web.Request):
-    """
-    Accepts Telegram webhook POSTs. Two route variants are supported:
-      - /webhook
-      - /webhook/{token}
-    Payload is converted to aiogram Update and queued for processing.
-    Secret header is checked if HOOK_SECRET configured.
-    """
     if not _check_secret_header(request):
         return web.Response(status=403, text="forbidden")
 
@@ -195,7 +172,6 @@ async def handle_root(request: web.Request):
 # ---------- keep alive / polling runner ----------
 
 async def keep_alive_ping():
-    """Periodically call Telegram API to keep session healthy (only if KEEP_BOT_ALIVE)."""
     try:
         while True:
             try:
@@ -208,7 +184,6 @@ async def keep_alive_ping():
         raise
 
 async def polling_runner(app):
-    """Resilient polling loop (if polling used)."""
     backoff = 1
     max_backoff = 60
     logger.info("Polling runner started")
@@ -230,7 +205,7 @@ async def polling_runner(app):
             await asyncio.sleep(60)
             backoff = 1
         except CantGetUpdates:
-            logger.warning("CantGetUpdates — webhook is active. Ensure webhook deleted before polling.")
+            logger.warning("CantGetUpdates — webhook is active. Sleeping 60s then retry.")
             await asyncio.sleep(60)
         except Exception:
             logger.exception("Polling crashed, will retry")
@@ -267,7 +242,7 @@ async def on_startup_app(app: web.Application):
     app['updates_queue'] = _updates_queue
     _worker_task = asyncio.create_task(webhook_worker())
 
-    # obtain bot session inside async context to avoid DeprecationWarning
+    # obtain bot session inside async context
     try:
         sess = await bot.get_session()
         app['bot_session'] = sess
@@ -284,7 +259,9 @@ async def on_startup_app(app: web.Application):
     app['keep_alive'] = asyncio.create_task(asyncio.sleep(3600*24))
 
     # choose mode
-    if FORCE_POLLING or KEEP_BOT_ALIVE or not WEBHOOK_URL:
+    # IMPORTANT: do not force polling just because KEEP_BOT_ALIVE==True.
+    # Polling is started only if FORCE_POLLING is True or WEBHOOK_URL is not provided/fails to set.
+    if FORCE_POLLING or not WEBHOOK_URL:
         try:
             await bot.delete_webhook(drop_pending_updates=True)
             logger.info("Webhook deleted (pre-polling cleanup)")
@@ -294,25 +271,19 @@ async def on_startup_app(app: web.Application):
         logger.info("Polling mode enabled")
     else:
         webhook = WEBHOOK_URL.rstrip("/") + f"{WEBHOOK_PREFIX}"
-        success = False
-        for attempt in range(3):
-            try:
-                await bot.set_webhook(webhook)
-                logger.info("Webhook set successfully: %s", webhook)
-                app['webhook_set_by_main'] = True
-                app['webhook_full_url'] = webhook
-                success = True
-                break
-            except Exception:
-                logger.exception("set_webhook failed (attempt %s)", attempt + 1)
-                await asyncio.sleep(1 + attempt * 2)
-        if not success:
-            logger.warning("set_webhook failed after retries - falling back to polling")
+        success = await set_webhook_with_retries(bot, webhook, attempts=3, base_sleep=1.0)
+        if success:
+            app['webhook_set_by_main'] = True
+            app['webhook_full_url'] = webhook
+            logger.info("Webhook mode enabled; polling not started.")
+        else:
+            logger.warning("set_webhook failed, falling back to polling")
             try:
                 await bot.delete_webhook(drop_pending_updates=True)
             except Exception:
                 logger.debug("delete_webhook during fallback failed")
             app['polling_task'] = asyncio.create_task(polling_runner(app))
+            logger.info("Polling mode enabled (fallback)")
 
 async def on_cleanup_app(app: web.Application):
     global _updates_queue, _worker_task
@@ -363,8 +334,7 @@ async def on_cleanup_app(app: web.Application):
         except Exception:
             pass
 
-    # --- NEW: always close the aiohttp session we stored on startup (if any).
-    # This fixes "Unclosed client session" warnings even if KEEP_BOT_ALIVE=True.
+    # --- Always attempt to close bot's aiohttp session we stored on startup (if any).
     try:
         sess = app.get('bot_session')
         if not sess:
@@ -396,10 +366,11 @@ async def on_cleanup_app(app: web.Application):
         if app.get('webhook_set_by_main'):
             logger.info("Webhook set by main but WEBHOOK_AUTO_DELETE=False -> left intact")
 
-    # shutdown scheduler
+    # shutdown scheduler safely
     try:
-        scheduler.shutdown(wait=False)
-        logger.info("Scheduler shutdown")
+        if scheduler:
+            scheduler.shutdown(wait=False)
+            logger.info("Scheduler shutdown")
     except Exception:
         logger.debug("Scheduler shutdown failed", exc_info=True)
 
@@ -419,7 +390,7 @@ async def on_cleanup_app(app: web.Application):
         except Exception:
             logger.exception('Error while closing bot')
     else:
-        logger.info('KEEP_BOT_ALIVE=True -> skipping bot.close() (session already closed above)')
+        logger.info('KEEP_BOT_ALIVE=True -> skipping bot.close() (session already closed above if present)')
 
     # close sqlite connection
     try:
@@ -456,11 +427,6 @@ async def debug_handler(request: web.Request):
     return web.json_response(info)
 
 async def ready_handler(request: web.Request):
-    """
-    /ready endpoint:
-     - checks bot.get_me()
-     - performs a light DB ping (via executor) to ensure DB is open
-    """
     ready = {"bot": False, "db": False}
     try:
         me = await bot.get_me()
