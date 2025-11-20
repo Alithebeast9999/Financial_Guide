@@ -1,137 +1,49 @@
 # main.py
-"""
-Main entrypoint — robust webhook/polling launcher for Financial_Guide.
-
-Key fixes in this version:
- - DO NOT start polling just because KEEP_BOT_ALIVE=True (avoids webhook vs getUpdates conflicts)
- - Start polling only when FORCE_POLLING=True or when webhook is not configured/failed to set
- - Ensure Dispatcher/ Bot current are set in webhook worker for FSM support
- - Robustly close bot aiohttp session stored on app or returned by bot.get_session()
- - Better handling of TerminatedByOtherGetUpdates / CantGetUpdates in polling loop
-"""
 import os
 import logging
 import asyncio
 import signal
-import random
-from typing import Optional
-
 from aiohttp import web
-from aiogram.utils.exceptions import TerminatedByOtherGetUpdates, CantGetUpdates
-from aiogram.dispatcher.dispatcher import Dispatcher
 
-import bot_app  # imports bot, dp, scheduler, registers handlers on import
+from aiogram.utils.exceptions import TerminatedByOtherGetUpdates
 
-logger = logging.getLogger("main")
+import bot_app  # <-- imports bot, dp, scheduler, handlers are registered on import
+
+logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# Config from env
-PORT = int(os.environ.get("PORT", "10000"))
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # e.g. https://domain.com
-WEBHOOK_PREFIX = os.environ.get("WEBHOOK_PREFIX", "/webhook").rstrip("/")
-WEBHOOK_AUTO_DELETE = os.environ.get("WEBHOOK_AUTO_DELETE", "0") in ("1", "true", "yes")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # e.g. https://financial-guide.onrender.com
+PORT = int(os.environ.get("PORT", 10000))
 FORCE_POLLING = os.environ.get("FORCE_POLLING", "0") == "1"
 KEEP_BOT_ALIVE = os.environ.get("KEEP_BOT_ALIVE", "1") != "0"
-HOOK_SECRET = os.environ.get("HOOK_SECRET")  # optional secret token to validate incoming webhooks
 
-# Short aliases to objects exported by bot_app
-bot = getattr(bot_app, "bot", None)
-dp = getattr(bot_app, "dp", None)
-scheduler = getattr(bot_app, "scheduler", None)
+# Shared references
+bot = bot_app.bot
+dp = bot_app.dp
+scheduler = bot_app.scheduler
 
-# runtime artifacts
-_updates_queue: Optional[asyncio.Queue] = None
-_worker_task: Optional[asyncio.Task] = None
-
-# ---------- Helpers ----------
-
-def _check_secret_header(request: web.Request) -> bool:
-    if not HOOK_SECRET:
-        return True
-    header = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
-    if not header:
-        logger.warning("Webhook request missing secret header")
-        return False
-    if header != HOOK_SECRET:
-        logger.warning("Webhook request provided wrong secret token")
-        return False
-    return True
-
-async def set_webhook_with_retries(bot_obj, webhook_url: str, attempts: int = 3, base_sleep: float = 1.0) -> bool:
-    """Try to call bot.set_webhook(webhook_url) with retries and jitter."""
-    for attempt in range(1, attempts + 1):
-        try:
-            await bot_obj.set_webhook(webhook_url)
-            logger.info("Webhook set successfully: %s", webhook_url)
-            return True
-        except Exception as ex:
-            logger.warning("set_webhook attempt %s failed: %s", attempt, ex)
-            if attempt == attempts:
-                break
-            jitter = random.random() * 0.3
-            await asyncio.sleep(base_sleep * attempt + jitter)
-    logger.error("set_webhook failed after %s attempts", attempts)
-    return False
-
-async def _db_ping(loop=None) -> bool:
-    def ping():
-        try:
-            conn = getattr(bot_app, "conn", None)
-            if not conn:
-                return False
-            cur = conn.cursor()
-            cur.execute("SELECT 1")
-            _ = cur.fetchone()
-            return True
-        except Exception:
-            return False
-    if loop is None:
-        loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, ping)
-
-# ---------- Worker & webhook queue ----------
+# Runtime artifacts
+_updates_queue = None
+_worker_task = None
 
 async def webhook_worker():
-    """Background worker that takes Updates from queue and calls dp.process_update"""
-    global _updates_queue
     logger.info("Webhook worker started")
-    # set a default current so FSM/Dispatcher can access it
     try:
-        Dispatcher.set_current(dp)
+        bot_app.Bot.set_current(bot)  # Bot class available via bot_app import
     except Exception:
-        logger.debug("Dispatcher.set_current(dp) failed at worker start (ignored)")
-    try:
-        bot_app.Bot.set_current(bot)
-    except Exception:
-        logger.debug("Bot.set_current failed in worker (ignored)")
-
+        logger.debug("Bot.set_current failed in worker")
     while True:
         try:
             update = await _updates_queue.get()
             try:
-                # For each task set current to allow FSM state ops
-                try:
-                    Dispatcher.set_current(dp)
-                except Exception:
-                    logger.debug("Dispatcher.set_current(dp) failed for update (ignored)")
                 try:
                     bot_app.Bot.set_current(bot)
                 except Exception:
-                    logger.debug("Bot.set_current(bot) failed for update (ignored)")
-
+                    pass
                 await dp.process_update(update)
             except Exception:
                 logger.exception("Error while processing update (worker)")
             finally:
-                # clear current to avoid leaking context into other tasks
-                try:
-                    Dispatcher.set_current(None)
-                except Exception:
-                    pass
-                try:
-                    bot_app.Bot.set_current(None)
-                except Exception:
-                    pass
                 _updates_queue.task_done()
         except asyncio.CancelledError:
             logger.info("Webhook worker cancelled")
@@ -140,36 +52,20 @@ async def webhook_worker():
             logger.exception("Unexpected exception in webhook worker; continuing")
 
 async def handle_webhook(request: web.Request):
-    if not _check_secret_header(request):
-        return web.Response(status=403, text="forbidden")
-
-    global _updates_queue
-    if _updates_queue is None:
-        logger.warning("Webhook received but updates queue not ready -> 503")
-        return web.Response(status=503, text="service not ready")
-
     try:
         data = await request.json()
+        update = bot_app.TgUpdate.to_object(data)
     except Exception:
-        logger.exception("Failed to parse JSON from webhook request")
-        return web.Response(status=200, text="ok")
-
+        logger.exception("handle_webhook: invalid payload")
+        return web.Response(status=400, text="invalid")
     try:
-        upd = bot_app.TgUpdate.to_object(data)
-    except Exception:
-        logger.exception("Failed to construct Update from payload")
-        return web.Response(status=200, text="ok")
-
-    try:
-        _updates_queue.put_nowait(upd)
+        _updates_queue.put_nowait(update)
     except asyncio.QueueFull:
-        logger.warning("Updates queue full: dropping incoming update")
+        logger.warning("queue full - drop update")
     return web.Response(text="OK")
 
 async def handle_root(request: web.Request):
     return web.Response(text="OK")
-
-# ---------- keep alive / polling runner ----------
 
 async def keep_alive_ping():
     try:
@@ -178,7 +74,7 @@ async def keep_alive_ping():
                 await bot.get_me()
             except Exception:
                 logger.debug("keep_alive_ping: bot.get_me() failed", exc_info=True)
-            await asyncio.sleep(300)
+            await asyncio.sleep(60)
     except asyncio.CancelledError:
         logger.info("keep_alive_ping cancelled")
         raise
@@ -194,32 +90,27 @@ async def polling_runner(app):
             except Exception:
                 pass
             logger.info("Starting dp.start_polling()")
-            await dp.start_polling()
+            await dp.start_polling(timeout=20)
             logger.info("dp.start_polling() ended normally")
             break
         except asyncio.CancelledError:
             logger.info("Polling runner cancelled")
             raise
         except TerminatedByOtherGetUpdates:
-            logger.warning("TerminatedByOtherGetUpdates — another getUpdates exists. Sleeping 60s then retry.")
+            logger.warning("TerminatedByOtherGetUpdates — another getUpdates exists. Sleeping 60s.")
             await asyncio.sleep(60)
             backoff = 1
-        except CantGetUpdates:
-            logger.warning("CantGetUpdates — webhook is active. Sleeping 60s then retry.")
-            await asyncio.sleep(60)
         except Exception:
             logger.exception("Polling crashed, will retry")
             await asyncio.sleep(backoff)
             backoff = min(max_backoff, backoff * 2)
-
-# ---------- startup / cleanup ----------
 
 _shutdown_initiator = {"signal": None}
 
 def _register_signal_handlers(loop):
     def _on_signal(sig):
         _shutdown_initiator["signal"] = str(sig)
-        logger.info("Process received signal: %s. Marking shutdown initiator.", sig)
+        logger.info(f"Process received signal: {sig}. Marking shutdown_initiator.")
     try:
         loop.add_signal_handler(signal.SIGINT, _on_signal, signal.SIGINT)
         loop.add_signal_handler(signal.SIGTERM, _on_signal, signal.SIGTERM)
@@ -227,22 +118,19 @@ def _register_signal_handlers(loop):
     except NotImplementedError:
         logger.debug("Signal handlers not supported on this platform")
 
-async def on_startup_app(app: web.Application):
+async def on_startup_app(app):
     global _updates_queue, _worker_task
     logger.info("on_startup_app: initializing")
 
-    # Let bot_app initialize its runtime (db_lock, scheduler jobs, etc.)
-    try:
-        await bot_app.init_app_for_runtime(app)
-    except Exception:
-        logger.exception("bot_app.init_app_for_runtime failed (continuing)")
+    # Initialize bot_app internals (db_lock, scheduler jobs, etc.)
+    await bot_app.init_app_for_runtime(app)
 
     # Queue + worker for webhook handling
     _updates_queue = asyncio.Queue(maxsize=2000)
     app['updates_queue'] = _updates_queue
     _worker_task = asyncio.create_task(webhook_worker())
 
-    # obtain bot session inside async context
+    # obtain bot session inside async context to avoid DeprecationWarning
     try:
         sess = await bot.get_session()
         app['bot_session'] = sess
@@ -259,9 +147,7 @@ async def on_startup_app(app: web.Application):
     app['keep_alive'] = asyncio.create_task(asyncio.sleep(3600*24))
 
     # choose mode
-    # IMPORTANT: do not force polling just because KEEP_BOT_ALIVE==True.
-    # Polling is started only if FORCE_POLLING is True or WEBHOOK_URL is not provided/fails to set.
-    if FORCE_POLLING or not WEBHOOK_URL:
+    if FORCE_POLLING or KEEP_BOT_ALIVE or not WEBHOOK_URL:
         try:
             await bot.delete_webhook(drop_pending_updates=True)
             logger.info("Webhook deleted (pre-polling cleanup)")
@@ -270,22 +156,26 @@ async def on_startup_app(app: web.Application):
         app['polling_task'] = asyncio.create_task(polling_runner(app))
         logger.info("Polling mode enabled")
     else:
-        webhook = WEBHOOK_URL.rstrip("/") + f"{WEBHOOK_PREFIX}"
-        success = await set_webhook_with_retries(bot, webhook, attempts=3, base_sleep=1.0)
-        if success:
-            app['webhook_set_by_main'] = True
-            app['webhook_full_url'] = webhook
-            logger.info("Webhook mode enabled; polling not started.")
-        else:
-            logger.warning("set_webhook failed, falling back to polling")
+        webhook = WEBHOOK_URL.rstrip("/") + "/webhook"
+        success = False
+        for attempt in range(3):
+            try:
+                await bot.set_webhook(webhook)
+                logger.info("Webhook set successfully: %s", webhook)
+                success = True
+                break
+            except Exception:
+                logger.exception("set_webhook failed (attempt %s)", attempt + 1)
+                await asyncio.sleep(1 + attempt * 2)
+        if not success:
+            logger.warning("set_webhook failed after retries - falling back to polling")
             try:
                 await bot.delete_webhook(drop_pending_updates=True)
             except Exception:
                 logger.debug("delete_webhook during fallback failed")
             app['polling_task'] = asyncio.create_task(polling_runner(app))
-            logger.info("Polling mode enabled (fallback)")
 
-async def on_cleanup_app(app: web.Application):
+async def on_cleanup_app(app):
     global _updates_queue, _worker_task
     logger.info("on_cleanup: starting cleanup (initiator=%s)", _shutdown_initiator.get("signal"))
 
@@ -334,43 +224,20 @@ async def on_cleanup_app(app: web.Application):
         except Exception:
             pass
 
-    # --- Always attempt to close bot's aiohttp session we stored on startup (if any).
-    try:
-        sess = app.get('bot_session')
-        if not sess:
-            try:
-                sess = await bot.get_session()
-            except Exception:
-                sess = getattr(bot, 'session', None)
-        if sess:
-            try:
-                closed_attr = getattr(sess, "closed", None)
-                if closed_attr is False:
-                    await sess.close()
-                    logger.info("Closed bot_session (app['bot_session']).")
-                else:
-                    logger.debug("bot_session already closed.")
-            except Exception:
-                logger.exception("Error while closing bot session stored on app")
-    except Exception:
-        logger.debug("Failed to close stored bot session (ignored)", exc_info=True)
-
-    # delete webhook only if WEBHOOK_AUTO_DELETE is true
-    if app.get('webhook_set_by_main') and WEBHOOK_AUTO_DELETE:
+    # delete webhook only if NOT KEEP_BOT_ALIVE
+    if not KEEP_BOT_ALIVE:
         try:
             await bot.delete_webhook()
             logger.info("Webhook deleted on cleanup")
         except Exception:
             logger.debug("Failed to delete webhook on cleanup", exc_info=True)
     else:
-        if app.get('webhook_set_by_main'):
-            logger.info("Webhook set by main but WEBHOOK_AUTO_DELETE=False -> left intact")
+        logger.info("KEEP_BOT_ALIVE=True -> skipping webhook deletion")
 
-    # shutdown scheduler safely
+    # shutdown scheduler
     try:
-        if scheduler:
-            scheduler.shutdown(wait=False)
-            logger.info("Scheduler shutdown")
+        scheduler.shutdown(wait=False)
+        logger.info("Scheduler shutdown")
     except Exception:
         logger.debug("Scheduler shutdown failed", exc_info=True)
 
@@ -382,82 +249,80 @@ async def on_cleanup_app(app: web.Application):
     except Exception:
         logger.debug("Storage close failed", exc_info=True)
 
-    # close bot object only if NOT KEEP_BOT_ALIVE
+    # close bot session & bot only if NOT KEEP_BOT_ALIVE
     if not KEEP_BOT_ALIVE:
+        try:
+            sess = None
+            try:
+                sess = await bot.get_session()
+            except Exception:
+                sess = getattr(bot, 'session', None)
+            if sess:
+                try:
+                    await sess.close()
+                    logger.info('bot.session closed explicitly')
+                except Exception:
+                    logger.exception('Error while closing bot session')
+        except Exception:
+            logger.exception('Failed while closing bot session')
         try:
             await bot.close()
             logger.info('Bot closed (client session closed)')
         except Exception:
             logger.exception('Error while closing bot')
     else:
-        logger.info('KEEP_BOT_ALIVE=True -> skipping bot.close() (session already closed above if present)')
+        logger.info('KEEP_BOT_ALIVE=True -> skipping bot.close()')
 
     # close sqlite connection
     try:
-        if getattr(bot_app, "conn", None):
-            bot_app.conn.close()
-            logger.info('DB connection closed')
+        bot_app.conn.close()
+        logger.info('DB connection closed')
     except Exception:
         logger.debug('DB close failed', exc_info=True)
 
-    logger.info("Cleanup complete")
+    logger.info('Cleanup complete')
 
 # Admin endpoints
 async def set_webhook_handler(request: web.Request):
     if not WEBHOOK_URL:
         return web.json_response({"ok": False, "error": "WEBHOOK_URL not configured"}, status=400)
-    webhook = WEBHOOK_URL.rstrip("/") + f"{WEBHOOK_PREFIX}"
-    success = await set_webhook_with_retries(bot, webhook, attempts=3)
-    return web.json_response({"ok": success, "webhook": webhook})
+    webhook = WEBHOOK_URL.rstrip("/") + "/webhook"
+    try:
+        await bot.set_webhook(webhook)
+        return web.json_response({"ok": True, "webhook": webhook})
+    except Exception as e:
+        logger.exception('set_webhook_handler failed')
+        return web.json_response({"ok": False, "error": str(e)})
 
 async def debug_handler(request: web.Request):
     info = {
-        "queue_size": _updates_queue.qsize() if _updates_queue else None,
-        "worker_running": _worker_task is not None and not _worker_task.done(),
-        "scheduler_running": getattr(scheduler, "running", None),
-        "force_polling": FORCE_POLLING,
-        "keep_bot_alive": KEEP_BOT_ALIVE,
-        "webhook_url_env": WEBHOOK_URL,
+        'queue_size': _updates_queue.qsize() if _updates_queue else None,
+        'worker_running': _worker_task is not None and not _worker_task.done(),
+        'scheduler_running': scheduler.running,
+        'force_polling': FORCE_POLLING,
+        'keep_bot_alive': KEEP_BOT_ALIVE,
+        'webhook_url_env': WEBHOOK_URL,
     }
     try:
         wh = await bot.get_webhook_info()
-        info["telegram_webhook"] = wh.to_python() if wh else None
+        info['telegram_webhook'] = wh.to_python() if wh else None
     except Exception as e:
-        info["telegram_webhook_error"] = str(e)
+        info['telegram_webhook_error'] = str(e)
     return web.json_response(info)
 
-async def ready_handler(request: web.Request):
-    ready = {"bot": False, "db": False}
-    try:
-        me = await bot.get_me()
-        ready["bot"] = bool(me)
-    except Exception:
-        ready["bot"] = False
-    try:
-        loop = asyncio.get_event_loop()
-        ready["db"] = await _db_ping(loop)
-    except Exception:
-        ready["db"] = False
-    status = 200 if ready["bot"] or ready["db"] else 503
-    return web.json_response(ready, status=status)
-
-# ---------- create app & run ----------
-
 def create_app():
-    a = web.Application()
-    a.router.add_get("/", handle_root)
-    a.router.add_get("/ready", ready_handler)
-    a.router.add_post(f"{WEBHOOK_PREFIX}", handle_webhook)
-    a.router.add_post(f"{WEBHOOK_PREFIX}/{{token:.*}}", handle_webhook)
-    a.router.add_post("/set_webhook", set_webhook_handler)
-    a.router.add_get("/debug", debug_handler)
-    a.on_startup.append(on_startup_app)
-    a.on_cleanup.append(on_cleanup_app)
-    return a
+    app = web.Application()
+    app.router.add_get('/', handle_root)
+    app.router.add_post('/webhook', handle_webhook)
+    app.router.add_post('/set_webhook', set_webhook_handler)
+    app.router.add_get('/debug', debug_handler)
+    app.on_startup.append(on_startup_app)
+    app.on_cleanup.append(on_cleanup_app)
+    return app
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     loop = asyncio.get_event_loop()
     _register_signal_handlers(loop)
     app = create_app()
-    logger.info("Starting web app on 0.0.0.0:%s (FORCE_POLLING=%s, KEEP_BOT_ALIVE=%s)", PORT, FORCE_POLLING, KEEP_BOT_ALIVE)
-    web.run_app(app, host="0.0.0.0", port=PORT)
+    logger.info(f"Starting web app on 0.0.0.0:{PORT} (FORCE_POLLING={FORCE_POLLING}, KEEP_BOT_ALIVE={KEEP_BOT_ALIVE})")
+    web.run_app(app, host='0.0.0.0', port=PORT)
