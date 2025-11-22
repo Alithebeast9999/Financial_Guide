@@ -23,7 +23,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN not set")
 
-TZ = pytz.timezone("Europe/Moscow")  # used for display; DB stores utc timestamps
+TZ = pytz.timezone("Europe/Moscow")  # used for display; DB stores UTC timestamps
 
 # ---------------- Bot / Dispatcher ---------------
 bot = Bot(token=BOT_TOKEN, timeout=30, parse_mode=types.ParseMode.HTML)
@@ -34,7 +34,7 @@ dp = Dispatcher(bot, storage=storage)
 DB_FILE = "bot.db"
 db: aiosqlite.Connection | None = None
 
-# db_lock for async coordination (not strictly required with aiosqlite single conn, but useful)
+# db_lock for async coordination
 db_lock: asyncio.Lock | None = None
 
 # ---------------- Categories & states -------------
@@ -66,7 +66,7 @@ async def init_db():
     """
     global db
     db = await aiosqlite.connect(DB_FILE)
-    # rows as mapping
+    # Use sqlite3.Row-compatible mapping
     db.row_factory = aiosqlite.Row  # type: ignore[attr-defined]
     # PRAGMA for better concurrency
     await db.execute("PRAGMA journal_mode=WAL;")
@@ -186,9 +186,9 @@ async def check_limits(uid, category, amount):
     income = await get_income(uid)
     # compute month window using UTC times for DB
     now_utc = datetime.utcnow()
-    month_start_local = now_utc.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    month_start = month_start_local.isoformat()
-    month_end_dt = (datetime.fromisoformat(month_start) + timedelta(days=35)).replace(day=1) - timedelta(seconds=1)
+    month_start_dt = now_utc.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    month_start = month_start_dt.isoformat()
+    month_end_dt = (month_start_dt + timedelta(days=35)).replace(day=1) - timedelta(seconds=1)
     month_end = month_end_dt.isoformat()
     r_total = await db_fetchone(
         "SELECT SUM(amount) as total FROM expenses WHERE user_id = ? AND timestamp BETWEEN ? AND ?",
@@ -213,9 +213,10 @@ async def format_stats(uid: int) -> str:
     income = await get_income(uid)
     limits = get_limits_from_income(income)
     now_utc = datetime.utcnow()
-    month_start = now_utc.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
-    month_end = (datetime.fromisoformat(month_start) + timedelta(days=35)).replace(day=1) - timedelta(seconds=1)
-    month_end = month_end.isoformat()
+    month_start_dt = now_utc.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    month_start = month_start_dt.isoformat()
+    month_end_dt = (month_start_dt + timedelta(days=35)).replace(day=1) - timedelta(seconds=1)
+    month_end = month_end_dt.isoformat()
     rows = await db_fetchall(
         "SELECT category, SUM(amount) as total FROM expenses WHERE user_id = ? AND timestamp BETWEEN ? AND ? GROUP BY category",
         (uid, month_start, month_end)
@@ -319,6 +320,7 @@ def build_limits_table_html(income: float) -> str:
     return pre_block
 
 # ---------------- Handlers (registered to dp) ----------------
+
 @dp.message_handler(commands=['start'])
 async def start(msg: types.Message):
     uid = msg.from_user.id
@@ -331,7 +333,9 @@ async def start(msg: types.Message):
         "После ввода дохода я рассчитую рекомендованные лимиты по категориям и покажу подсказки по кнопкам внизу."
     )
     kb = get_main_keyboard()
-    await IncomeState.income.set()
+    # set FSM state explicitly via dp.current_state to avoid relying on Dispatcher.get_current()
+    state = dp.current_state(chat=msg.chat.id, user=uid)
+    await state.set_state(IncomeState.income.state)
     await msg.reply(welcome, reply_markup=kb)
 
 @dp.message_handler(commands=['cancel'], state="*")
@@ -385,8 +389,10 @@ async def set_income_handler(msg: types.Message, state: FSMContext):
 
 @dp.message_handler(lambda m: m.text == "➕ Добавить трату")
 async def add_expense_cmd(msg: types.Message):
+    # set FSM explicitly
+    state = dp.current_state(chat=msg.chat.id, user=msg.from_user.id)
+    await state.set_state(ExpenseState.amount.state)
     await msg.reply("💸 Введи сумму траты (например: 450): (или /cancel чтобы отменить)")
-    await ExpenseState.amount.set()
 
 @dp.message_handler(state=ExpenseState.amount)
 async def expense_amount(msg: types.Message, state: FSMContext):
@@ -416,7 +422,9 @@ async def expense_amount(msg: types.Message, state: FSMContext):
         for cat in ALL_CATEGORIES:
             kb.insert(InlineKeyboardButton(cat, callback_data=f"cat_{cat}"))
         await msg.reply("Выбери категорию:", reply_markup=kb)
-        await ExpenseState.category.set()
+        # set next FSM step explicitly
+        cur_state = dp.current_state(chat=msg.chat.id, user=msg.from_user.id)
+        await cur_state.set_state(ExpenseState.category.state)
     except Exception:
         await msg.reply("❌ Неверная сумма. Введите число, например: 450. Или нажмите /cancel, чтобы отменить.")
 
@@ -487,8 +495,10 @@ async def toggle_notify(msg: types.Message):
 
 @dp.message_handler(commands=['add_recurring'])
 async def add_recurring(msg: types.Message):
+    # set FSM explicitly
+    state = dp.current_state(chat=msg.chat.id, user=msg.from_user.id)
+    await state.set_state(RecurringState.amount.state)
     await msg.reply("Введи сумму регулярного расхода (или /cancel):")
-    await RecurringState.amount.set()
 
 @dp.message_handler(state=RecurringState.amount)
 async def recurring_amount(msg: types.Message, state: FSMContext):
@@ -518,7 +528,8 @@ async def recurring_amount(msg: types.Message, state: FSMContext):
         for cat in ALL_CATEGORIES:
             kb.insert(InlineKeyboardButton(cat, callback_data=f"rec_{cat}"))
         await msg.reply("Выбери категорию:", reply_markup=kb)
-        await RecurringState.category.set()
+        cur_state = dp.current_state(chat=msg.chat.id, user=msg.from_user.id)
+        await cur_state.set_state(RecurringState.category.state)
     except Exception:
         await msg.reply("❌ Неверная сумма. Введите число или /cancel.")
 
@@ -527,7 +538,7 @@ async def recurring_category(cb: types.CallbackQuery, state: FSMContext):
     cat = cb.data[4:]
     await state.update_data(category=cat)
     await cb.message.edit_text("Укажи день месяца (1–28):")
-    await RecurringState.day.set()
+    await state.set_state(RecurringState.day.state)
 
 @dp.message_handler(state=RecurringState.day)
 async def recurring_day(msg: types.Message, state: FSMContext):
