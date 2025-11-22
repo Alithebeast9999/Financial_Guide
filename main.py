@@ -1,4 +1,4 @@
-# main.py (webhook-only, optimized for Render) — обновлённый фрагмент с close_db
+# main.py (webhook-only, with Dispatcher.set_current fix)
 import os
 import logging
 import asyncio
@@ -13,8 +13,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # Render usually generates this
 PORT = int(os.environ.get("PORT", 10000))
-# This main.py is webhook-only by design. If WEBHOOK_URL is not provided,
-# the app will start but won't set webhook automatically.
 
 # Shared references from bot_app
 bot = bot_app.bot
@@ -43,20 +41,43 @@ def _register_signal_handlers(loop):
 async def webhook_worker():
     """Background worker that processes Update objects from the queue."""
     logger.info("Webhook worker started")
-    # try to set Bot as current for aiogram internals (best-effort)
+    # try to set Bot and Dispatcher as current for aiogram internals (best-effort)
     try:
-        bot_app.Bot.set_current(bot)
+        # set current Bot
+        try:
+            bot_app.Bot.set_current(bot)
+            logger.debug("Bot.set_current(bot) OK in worker startup")
+        except Exception:
+            logger.debug("Bot.set_current failed in worker startup", exc_info=True)
+        # set current Dispatcher (this is required for FSM state transitions)
+        try:
+            # Use Dispatcher class to set current instance
+            bot_app.Dispatcher.set_current(dp)
+            logger.debug("Dispatcher.set_current(dp) OK in worker startup")
+        except Exception:
+            # fallback: if Dispatcher class is not available, try instance method
+            try:
+                dp._set_current()  # rare; keep as fallback, may not exist
+                logger.debug("dp._set_current() fallback invoked")
+            except Exception:
+                logger.debug("Dispatcher.set_current failed in worker startup", exc_info=True)
     except Exception:
-        logger.debug("Bot.set_current failed in worker")
+        logger.debug("Unexpected exception during worker startup context set", exc_info=True)
+
     while True:
         try:
             update: Update = await _updates_queue.get()
             try:
-                # ensure current bot context for handlers
+                # ensure current bot + dispatcher context for each processing iteration (best-effort)
                 try:
                     bot_app.Bot.set_current(bot)
                 except Exception:
                     pass
+                try:
+                    bot_app.Dispatcher.set_current(dp)
+                except Exception:
+                    pass
+
                 await dp.process_update(update)
             except Exception:
                 logger.exception("Error while processing update (worker)")
