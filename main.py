@@ -1,4 +1,4 @@
-# main.py (webhook-only, optimized for Render)
+# main.py (webhook-only, optimized for Render) — обновлённый фрагмент с close_db
 import os
 import logging
 import asyncio
@@ -134,7 +134,7 @@ async def on_startup_app(app: web.Application):
     global _updates_queue, _worker_task
     logger.info("on_startup_app: initializing")
 
-    # initialize bot_app (db locks, scheduler jobs, etc.)
+    # initialize bot_app (db_lock, scheduler jobs, etc.)
     await bot_app.init_app_for_runtime(app)
 
     # create queue + worker for webhook updates
@@ -234,12 +234,11 @@ async def on_cleanup_app(app: web.Application):
     except Exception:
         logger.exception("Error while closing bot")
 
-    # close sqlite connection (bot_app.conn is sync connection right now)
+    # close aiosqlite DB (bot_app.close_db handles guard)
     try:
-        bot_app.conn.close()
-        logger.info("DB connection closed")
+        await bot_app.close_db()
     except Exception:
-        logger.debug("DB close failed", exc_info=True)
+        logger.exception("Error while closing DB via bot_app.close_db()")
 
     logger.info("Cleanup complete")
 
