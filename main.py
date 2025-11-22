@@ -54,7 +54,10 @@ async def webhook_worker():
 async def handle_webhook(request: web.Request):
     try:
         data = await request.json()
-        update = bot_app.TgUpdate.to_object(data)
+        # build aiogram Update object from raw json payload
+        # avoid relying on bot_app.TgUpdate (not present) — use aiogram.types.Update
+        from aiogram.types import Update
+        update = Update(**data)
     except Exception:
         logger.exception("handle_webhook: invalid payload")
         return web.Response(status=400, text="invalid")
