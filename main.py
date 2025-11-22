@@ -1,4 +1,4 @@
-# main.py (webhook-only, with Dispatcher.set_current fix)
+# main.py (webhook-only, with keep-alive ping to avoid sleeping on Render)
 import os
 import logging
 import asyncio
@@ -13,6 +13,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # Render usually generates this
 PORT = int(os.environ.get("PORT", 10000))
+
+# KEEP_BOT_ALIVE default True (matches previous working setup)
+KEEP_BOT_ALIVE = os.environ.get("KEEP_BOT_ALIVE", "1") != "0"
 
 # Shared references from bot_app
 bot = bot_app.bot
@@ -41,26 +44,18 @@ def _register_signal_handlers(loop):
 async def webhook_worker():
     """Background worker that processes Update objects from the queue."""
     logger.info("Webhook worker started")
-    # try to set Bot and Dispatcher as current for aiogram internals (best-effort)
+    # set current Bot/Dispatcher best-effort at worker startup
     try:
-        # set current Bot
         try:
             bot_app.Bot.set_current(bot)
             logger.debug("Bot.set_current(bot) OK in worker startup")
         except Exception:
             logger.debug("Bot.set_current failed in worker startup", exc_info=True)
-        # set current Dispatcher (this is required for FSM state transitions)
         try:
-            # Use Dispatcher class to set current instance
             bot_app.Dispatcher.set_current(dp)
             logger.debug("Dispatcher.set_current(dp) OK in worker startup")
         except Exception:
-            # fallback: if Dispatcher class is not available, try instance method
-            try:
-                dp._set_current()  # rare; keep as fallback, may not exist
-                logger.debug("dp._set_current() fallback invoked")
-            except Exception:
-                logger.debug("Dispatcher.set_current failed in worker startup", exc_info=True)
+            logger.debug("Dispatcher.set_current failed in worker startup", exc_info=True)
     except Exception:
         logger.debug("Unexpected exception during worker startup context set", exc_info=True)
 
@@ -141,6 +136,7 @@ async def debug_handler(request: web.Request):
         'worker_running': _worker_task is not None and not _worker_task.done(),
         'scheduler_running': getattr(scheduler, "running", None),
         'webhook_url_env': WEBHOOK_URL,
+        'keep_bot_alive': KEEP_BOT_ALIVE,
     }
     try:
         wh = await bot.get_webhook_info()
@@ -148,6 +144,25 @@ async def debug_handler(request: web.Request):
     except Exception as e:
         info['telegram_webhook_error'] = str(e)
     return web.json_response(info)
+
+
+async def keep_alive_ping():
+    """
+    Periodically call bot.get_me() to keep the process 'active' from the platform
+    perspective and to keep bot session warm. Runs until cancelled.
+    """
+    logger.info("keep_alive_ping started")
+    try:
+        while True:
+            try:
+                await bot.get_me()
+                logger.debug("keep_alive_ping: bot.get_me() OK")
+            except Exception:
+                logger.debug("keep_alive_ping: bot.get_me() failed", exc_info=True)
+            await asyncio.sleep(60)
+    except asyncio.CancelledError:
+        logger.info("keep_alive_ping cancelled")
+        raise
 
 
 async def on_startup_app(app: web.Application):
@@ -170,6 +185,15 @@ async def on_startup_app(app: web.Application):
         logger.info("Bot session ready")
     except Exception:
         logger.debug("Failed to get bot session on startup (non-fatal)", exc_info=True)
+
+    # start keep-alive ping if requested (this mirrors the earlier working code)
+    if KEEP_BOT_ALIVE:
+        app['keep_alive_ping'] = asyncio.create_task(keep_alive_ping())
+        logger.info("keep_alive_ping task created (KEEP_BOT_ALIVE=True)")
+
+    # small dummy to keep loop busy (mirrors previous working main.py)
+    app['keep_alive'] = asyncio.create_task(asyncio.sleep(3600 * 24))
+    logger.debug("keep_alive dummy task created")
 
     # set webhook if WEBHOOK_URL configured
     if WEBHOOK_URL:
@@ -194,6 +218,22 @@ async def on_cleanup_app(app: web.Application):
     """Shutdown tasks, delete webhook, shutdown scheduler and close DB/bot resources."""
     global _updates_queue, _worker_task
     logger.info("on_cleanup: starting cleanup (initiator=%s)", _shutdown_initiator.get("signal"))
+
+    # cancel keep_alive dummy
+    if app.get('keep_alive'):
+        app['keep_alive'].cancel()
+        try:
+            await app['keep_alive']
+        except Exception:
+            pass
+
+    # cancel keep_alive_ping
+    if app.get('keep_alive_ping'):
+        app['keep_alive_ping'].cancel()
+        try:
+            await app['keep_alive_ping']
+        except Exception:
+            pass
 
     # cancel worker task
     if _worker_task:
@@ -280,5 +320,5 @@ if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     _register_signal_handlers(loop)
     app = create_app()
-    logger.info(f"Starting webhook-only web app on 0.0.0.0:{PORT}")
+    logger.info(f"Starting webhook-only web app on 0.0.0.0:{PORT} (KEEP_BOT_ALIVE={KEEP_BOT_ALIVE})")
     web.run_app(app, host="0.0.0.0", port=PORT)
