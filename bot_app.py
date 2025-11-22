@@ -5,6 +5,8 @@ import sqlite3
 import asyncio
 from datetime import datetime, timedelta
 import pytz
+import threading
+import concurrent.futures
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -17,7 +19,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 logger = logging.getLogger(__name__)
 
-# Config (kept small here; main.py controls KEEP_BOT_ALIVE / FORCE_POLLING)
+# Config (kept small here; main.py controls lifecycle)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN not set")
@@ -31,16 +33,77 @@ dp = Dispatcher(bot, storage=storage)
 
 # ---------------- DB (sqlite) --------------------
 DB_FILE = "bot.db"
-# Keep sqlite synchronous but protect writes with asyncio.Lock
+# Keep sqlite synchronous but run queries in a threadpool to avoid blocking the event loop
 conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 conn.row_factory = sqlite3.Row
-cursor = conn.cursor()
-cursor.execute("""CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, income REAL DEFAULT 0, notifications BOOLEAN DEFAULT 1)""")
-cursor.execute("""CREATE TABLE IF NOT EXISTS expenses (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount REAL, category TEXT, timestamp DATETIME, recurring_id INTEGER DEFAULT NULL)""")
-cursor.execute("""CREATE TABLE IF NOT EXISTS recurring (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount REAL, category TEXT, day INTEGER)""")
-conn.commit()
 
-# db_lock will be created on app startup (because it uses asyncio loop)
+# create tables initially using the connection/cursor (safe at import time)
+_init_cursor = conn.cursor()
+_init_cursor.execute("""CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    income REAL DEFAULT 0,
+    notifications BOOLEAN DEFAULT 1
+)""")
+_init_cursor.execute("""CREATE TABLE IF NOT EXISTS expenses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    amount REAL,
+    category TEXT,
+    timestamp DATETIME,
+    recurring_id INTEGER DEFAULT NULL
+)""")
+_init_cursor.execute("""CREATE TABLE IF NOT EXISTS recurring (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    amount REAL,
+    category TEXT,
+    day INTEGER
+)""")
+# helpful indexes
+_init_cursor.execute("CREATE INDEX IF NOT EXISTS idx_expenses_user_timestamp ON expenses(user_id, timestamp)")
+_init_cursor.execute("CREATE INDEX IF NOT EXISTS idx_recurring_day ON recurring(day)")
+conn.commit()
+_init_cursor.close()
+
+# Threadpool + lock for DB operations
+_db_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+_sqlite_lock = threading.Lock()
+
+# Helper async wrappers for DB ops (run in threadpool)
+async def db_execute(query: str, params: tuple = ()):
+    """Execute a query that modifies DB (INSERT/UPDATE/DELETE)."""
+    loop = asyncio.get_event_loop()
+    def job():
+        with _sqlite_lock:
+            cur = conn.cursor()
+            cur.execute(query, params)
+            conn.commit()
+            cur.close()
+    return await loop.run_in_executor(_db_executor, job)
+
+async def db_fetchone(query: str, params: tuple = ()):
+    """Fetch a single row (sqlite3.Row) or None."""
+    loop = asyncio.get_event_loop()
+    def job():
+        cur = conn.cursor()
+        cur.execute(query, params)
+        r = cur.fetchone()
+        cur.close()
+        return r
+    return await loop.run_in_executor(_db_executor, job)
+
+async def db_fetchall(query: str, params: tuple = ()):
+    """Fetch all rows (list of sqlite3.Row)."""
+    loop = asyncio.get_event_loop()
+    def job():
+        cur = conn.cursor()
+        cur.execute(query, params)
+        rows = cur.fetchall()
+        cur.close()
+        return rows
+    return await loop.run_in_executor(_db_executor, job)
+
+# db_lock will be created on app startup (async lock) for coordination in async world
 db_lock = None
 
 # ---------------- Categories & states -------------
@@ -64,23 +127,23 @@ class RecurringState(StatesGroup):
     category = State()
     day = State()
 
-# ---------------- Helpers & DB access ------------
+# ---------------- Helpers & DB access (async wrappers) ------------
 async def ensure_user(uid: int):
     global db_lock
     if db_lock is None:
         db_lock = asyncio.Lock()
     async with db_lock:
-        cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (uid,))
-        conn.commit()
+        # insert if not exists (keep notifications default)
+        await db_execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (uid,))
 
-def get_income(uid: int) -> float:
-    cursor.execute("SELECT income FROM users WHERE user_id = ?", (uid,))
-    r = cursor.fetchone()
+async def get_income(uid: int) -> float:
+    r = await db_fetchone("SELECT income FROM users WHERE user_id = ?", (uid,))
     return float(r["income"]) if r and r["income"] is not None else 0.0
 
-def set_income(uid: int, v: float):
-    cursor.execute("INSERT OR REPLACE INTO users (user_id, income) VALUES (?, ?)", (uid, v))
-    conn.commit()
+async def set_income(uid: int, v: float):
+    # preserve other columns (notifications) -> insert if not exists then update
+    await db_execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (uid,))
+    await db_execute("UPDATE users SET income = ? WHERE user_id = ?", (v, uid))
 
 def format_amount(x):
     try:
@@ -92,34 +155,31 @@ def get_limits_from_income(income: float):
     return {cat: income * pct for group in CATEGORIES.values() for cat, pct in group.items()}
 
 async def add_expense(uid, amount, category, ts=None, rec_id=None):
-    ts = ts or datetime.now(TZ)
-    global db_lock
-    if db_lock is None:
-        db_lock = asyncio.Lock()
-    async with db_lock:
-        cursor.execute("INSERT INTO expenses (user_id, amount, category, timestamp, recurring_id) VALUES (?, ?, ?, ?, ?)",
-                       (uid, amount, category, ts.isoformat(), rec_id))
-        conn.commit()
+    ts = ts or datetime.now(TZ).isoformat()
+    async with (db_lock if db_lock is not None else asyncio.Lock()):
+        await db_execute(
+            "INSERT INTO expenses (user_id, amount, category, timestamp, recurring_id) VALUES (?, ?, ?, ?, ?)",
+            (uid, amount, category, ts, rec_id)
+        )
 
-def get_expenses(uid, limit=10):
-    cursor.execute("SELECT id, amount, category, timestamp FROM expenses WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?", (uid, limit))
-    return cursor.fetchall()
+async def get_expenses(uid, limit=10):
+    rows = await db_fetchall("SELECT id, amount, category, timestamp FROM expenses WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?", (uid, limit))
+    return rows
 
-def delete_expense(eid):
-    cursor.execute("DELETE FROM expenses WHERE id = ?", (eid,))
-    conn.commit()
+async def delete_expense(eid):
+    await db_execute("DELETE FROM expenses WHERE id = ?", (eid,))
 
-def check_limits(uid, category, amount):
-    limits = get_limits_from_income(get_income(uid))
+async def check_limits(uid, category, amount):
+    limits = get_limits_from_income(await get_income(uid))
     if category not in limits:
         return []
-    income = get_income(uid)
+    income = await get_income(uid)
     month_start = datetime.now(TZ).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     month_end = (month_start + timedelta(days=35)).replace(day=1) - timedelta(seconds=1)
-    cursor.execute("SELECT SUM(amount) as total FROM expenses WHERE user_id = ? AND timestamp BETWEEN ? AND ?", (uid, month_start.isoformat(), month_end.isoformat()))
-    total_spent = cursor.fetchone()["total"] or 0
-    cursor.execute("SELECT SUM(amount) as total FROM expenses WHERE user_id = ? AND category = ? AND timestamp BETWEEN ? AND ?", (uid, category, month_start.isoformat(), month_end.isoformat()))
-    cat_spent = cursor.fetchone()["total"] or 0
+    r_total = await db_fetchone("SELECT SUM(amount) as total FROM expenses WHERE user_id = ? AND timestamp BETWEEN ? AND ?", (uid, month_start.isoformat(), month_end.isoformat()))
+    total_spent = r_total["total"] or 0
+    r_cat = await db_fetchone("SELECT SUM(amount) as total FROM expenses WHERE user_id = ? AND category = ? AND timestamp BETWEEN ? AND ?", (uid, category, month_start.isoformat(), month_end.isoformat()))
+    cat_spent = r_cat["total"] or 0
     msgs = []
     if total_spent + amount > income:
         msgs.append("⚠️ Общий месячный лимит превышен!")
@@ -129,14 +189,13 @@ def check_limits(uid, category, amount):
         msgs.append(f"⚠️ Ты израсходовал более 90% лимита по '{category}'!")
     return msgs
 
-def format_stats(uid: int) -> str:
-    income = get_income(uid)
+async def format_stats(uid: int) -> str:
+    income = await get_income(uid)
     limits = get_limits_from_income(income)
     month_start = datetime.now(TZ).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     month_end = (month_start + timedelta(days=35)).replace(day=1) - timedelta(seconds=1)
-    cursor.execute("SELECT category, SUM(amount) as total FROM expenses WHERE user_id = ? AND timestamp BETWEEN ? AND ? GROUP BY category",
+    rows = await db_fetchall("SELECT category, SUM(amount) as total FROM expenses WHERE user_id = ? AND timestamp BETWEEN ? AND ? GROUP BY category",
                    (uid, month_start.isoformat(), month_end.isoformat()))
-    rows = cursor.fetchall()
     spent = {r["category"]: r["total"] for r in rows}
     text = f"💰 Ваш доход: {format_amount(income)} ₽\n\n"
     for group, cats in CATEGORIES.items():
@@ -153,31 +212,46 @@ def format_stats(uid: int) -> str:
 scheduler = AsyncIOScheduler(timezone=TZ)
 
 async def daily_reminders():
-    cursor.execute("SELECT user_id FROM users WHERE notifications = 1")
-    for (uid,) in cursor.fetchall():
-        try:
-            await bot.send_message(uid, "💡 Не забудь добавить траты за сегодня!")
-        except Exception:
-            logger.debug("Failed to send reminder to %s", uid)
+    rows = await db_fetchall("SELECT user_id FROM users WHERE notifications = 1")
+    uids = [r[0] if isinstance(r, tuple) else r["user_id"] for r in rows]
+    tasks = [asyncio.create_task(bot.send_message(uid, "💡 Не забудь добавить траты за сегодня!")) for uid in uids]
+    if tasks:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for uid, res in zip(uids, results):
+            if isinstance(res, Exception):
+                logger.debug("Failed to send reminder to %s: %s", uid, res)
 
 async def weekly_report():
-    cursor.execute("SELECT user_id FROM users")
-    for (uid,) in cursor.fetchall():
-        try:
-            await bot.send_message(uid, "📊 Еженедельный отчёт:\n\n" + format_stats(uid))
-        except Exception:
-            logger.debug("Failed to send weekly report to %s", uid)
+    rows = await db_fetchall("SELECT user_id FROM users")
+    uids = [r[0] if isinstance(r, tuple) else r["user_id"] for r in rows]
+    tasks = []
+    for uid in uids:
+        tasks.append(asyncio.create_task(bot.send_message(uid, "📊 Еженедельный отчёт:\n\n" + (await format_stats(uid)))))
+    if tasks:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for uid, res in zip(uids, results):
+            if isinstance(res, Exception):
+                logger.debug("Failed to send weekly report to %s: %s", uid, res)
 
 async def process_recurring():
     today = datetime.now(TZ).day
-    cursor.execute("SELECT id, user_id, amount, category FROM recurring WHERE day = ?", (today,))
-    for r in cursor.fetchall():
-        rec_id, uid, amt, cat = r
-        await add_expense(uid, amt, cat, rec_id=rec_id)
-        try:
-            await bot.send_message(uid, f"🔁 Добавлен регулярный расход: {amt:,.0f} ₽ — {cat}")
-        except Exception:
-            pass
+    rows = await db_fetchall("SELECT id, user_id, amount, category FROM recurring WHERE day = ?", (today,))
+    tasks = []
+    for r in rows:
+        rec_id = r["id"] if isinstance(r, sqlite3.Row) else r[0]
+        uid = r["user_id"] if isinstance(r, sqlite3.Row) else r[1]
+        amt = r["amount"] if isinstance(r, sqlite3.Row) else r[2]
+        cat = r["category"] if isinstance(r, sqlite3.Row) else r[3]
+        # add expense (async)
+        tasks.append(asyncio.create_task(add_expense(uid, amt, cat, rec_id=rec_id)))
+        # notify user (separately)
+        tasks.append(asyncio.create_task(bot.send_message(uid, f"🔁 Добавлен регулярный расход: {amt:,.0f} ₽ — {cat}")))
+    if tasks:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # ignore errors but log
+        for res in results:
+            if isinstance(res, Exception):
+                logger.debug("process_recurring error: %s", res)
 
 def _add_scheduler_jobs_once():
     try:
@@ -271,7 +345,7 @@ async def set_income_handler(msg: types.Message, state: FSMContext):
     except Exception:
         await msg.reply("❌ Неверный формат дохода. Введите число, например: 50 000 (или нажмите /cancel).")
         return
-    set_income(msg.from_user.id, income)
+    await set_income(msg.from_user.id, income)
     await state.finish()
     table_html = build_limits_table_html(income)
     buttons_expl = (
@@ -328,7 +402,7 @@ async def expense_category(cb: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     amount = data.get('amount')
     uid = cb.from_user.id
-    warnings = check_limits(uid, cat, amount)
+    warnings = await check_limits(uid, cat, amount)
     await add_expense(uid, amount, cat)
     try:
         await cb.message.edit_text(f"✅ Добавлено: {format_amount(amount)} ₽ — {cat}")
@@ -340,7 +414,7 @@ async def expense_category(cb: types.CallbackQuery, state: FSMContext):
 
 @dp.message_handler(lambda m: m.text == "📜 История")
 async def history(msg: types.Message):
-    exps = get_expenses(msg.from_user.id)
+    exps = await get_expenses(msg.from_user.id)
     if not exps:
         await msg.reply("Пока нет трат 💰")
         return
@@ -356,7 +430,7 @@ async def history(msg: types.Message):
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('del_'))
 async def delete_expense_cb(cb: types.CallbackQuery):
     eid = int(cb.data[4:])
-    delete_expense(eid)
+    await delete_expense(eid)
     await cb.answer("Удалено")
     try:
         await cb.message.delete()
@@ -365,7 +439,8 @@ async def delete_expense_cb(cb: types.CallbackQuery):
 
 @dp.message_handler(lambda m: m.text == "📊 Моя статистика")
 async def stats(msg: types.Message):
-    await msg.reply(format_stats(msg.from_user.id))
+    text = await format_stats(msg.from_user.id)
+    await msg.reply(text)
 
 @dp.message_handler(lambda m: m.text == "ℹ️ Помощь")
 async def help_cmd(msg: types.Message):
@@ -380,12 +455,10 @@ async def help_cmd(msg: types.Message):
 @dp.message_handler(commands=['notify'])
 async def toggle_notify(msg: types.Message):
     uid = msg.from_user.id
-    cursor.execute("SELECT notifications FROM users WHERE user_id = ?", (uid,))
-    r = cursor.fetchone()
+    r = await db_fetchone("SELECT notifications FROM users WHERE user_id = ?", (uid,))
     current = bool(r['notifications']) if r else True
     new_val = 0 if current else 1
-    cursor.execute("UPDATE users SET notifications = ? WHERE user_id = ?", (new_val, uid))
-    conn.commit()
+    await db_execute("UPDATE users SET notifications = ? WHERE user_id = ?", (new_val, uid))
     await msg.reply("🔔 Уведомления включены" if new_val else "🔕 Уведомления отключены")
 
 @dp.message_handler(commands=['add_recurring'])
@@ -458,9 +531,8 @@ async def recurring_day(msg: types.Message, state: FSMContext):
         if not (1 <= day <= 28):
             raise ValueError
         data = await state.get_data()
-        cursor.execute("INSERT INTO recurring (user_id, amount, category, day) VALUES (?, ?, ?, ?)",
-                       (msg.from_user.id, data["amount"], data["category"], day))
-        conn.commit()
+        await db_execute("INSERT INTO recurring (user_id, amount, category, day) VALUES (?, ?, ?, ?)",
+                         (msg.from_user.id, data["amount"], data["category"], day))
         await msg.reply(f"🔁 Регулярный расход сохранён: {format_amount(data['amount'])} ₽ — {data['category']} (каждое {day}-е число)")
         await state.finish()
     except Exception:
@@ -474,15 +546,15 @@ async def report_cmd(msg: types.Message):
         return
     now = datetime.now(TZ)
     start = now - timedelta(days=7) if args == 'week' else now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    cursor.execute("SELECT category, SUM(amount) as total FROM expenses WHERE user_id = ? AND timestamp >= ? GROUP BY category",
+    rows = await db_fetchall("SELECT category, SUM(amount) as total FROM expenses WHERE user_id = ? AND timestamp >= ? GROUP BY category",
                    (msg.from_user.id, start.isoformat()))
-    data = cursor.fetchall()
-    if not data:
+    if not rows:
         await msg.reply("Нет данных за выбранный период.")
         return
     text = f"📊 Отчёт за {'неделю' if args == 'week' else 'месяц'}:\n\n"
-    for r in data:
-        text += f"{r['category']}: {r['total']:,.0f} ₽\n"
+    for r in rows:
+        total = r["total"] if r and r["total"] is not None else 0
+        text += f"{r['category']}: {total:,.0f} ₽\n"
     await msg.reply(text)
 
 # ---------------- Init helper to be called from main.py on startup ------------
@@ -510,11 +582,10 @@ async def init_app_for_runtime(app):
 
     # ensure DB tables exist already (they are created at import but double-check)
     try:
-        async with asyncio.Lock():
-            cursor.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, income REAL DEFAULT 0, notifications BOOLEAN DEFAULT 1)")
-            cursor.execute("CREATE TABLE IF NOT EXISTS expenses (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount REAL, category TEXT, timestamp DATETIME, recurring_id INTEGER DEFAULT NULL)")
-            cursor.execute("CREATE TABLE IF NOT EXISTS recurring (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount REAL, category TEXT, day INTEGER)")
-            conn.commit()
+        # use db_execute helper to create tables (idempotent)
+        await db_execute("""CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, income REAL DEFAULT 0, notifications BOOLEAN DEFAULT 1)""")
+        await db_execute("""CREATE TABLE IF NOT EXISTS expenses (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount REAL, category TEXT, timestamp DATETIME, recurring_id INTEGER DEFAULT NULL)""")
+        await db_execute("""CREATE TABLE IF NOT EXISTS recurring (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount REAL, category TEXT, day INTEGER)""")
     except Exception:
         logger.debug("DB ensure tables failed (ignored)")
 
