@@ -534,20 +534,25 @@ async def report_cmd(msg: types.Message):
         text += f"{r['category']}: {r['total']:,.0f} ₽\n"
     await msg.reply(text)
 
-# Generic text handler for fallback (keeps previous button semantics)
-@dp.message_handler(state=None)
+# Generic text handler — unified entry point and safety router.
+@dp.message_handler()
 async def generic_text_handler(msg: types.Message):
-    """Fallback handler that only runs when user has NO active FSM state.
-    To avoid answering while the user is inside a state (income/expense/etc.) we explicitly
-    check the current FSM state at runtime — because in some webhook/task setups the
-    state-specific handlers might not get matched reliably. If a state is present we
-    skip responding here and allow the FSM handlers to process the message.
     """
-    t = (msg.text or "").strip()
+    Unified fallback that:
+    - lets command handlers run (we return early for commands),
+    - checks FSM state and, if present, manually routes the message to the correct state handler,
+      ensuring the user always gets a response even if the framework didn't call state handler,
+    - otherwise handles main buttons / quick-expense / fallback.
+    """
 
-    # If the user is in an FSM state, do NOT handle here (let state handlers run)
+    text = (msg.text or "").strip()
+
+    # 0) If it's a bot command — don't handle here (command handlers will run)
+    if text.startswith("/"):
+        return
+
+    # 1) Try to determine the FSM state for (chat, user) (fallback to user-only)
     try:
-        # Prefer checking by (chat, user) key; fall back to user-only if not available
         try:
             state = await dp.current_state(chat=msg.chat.id, user=msg.from_user.id).get_state()
         except Exception:
@@ -558,34 +563,78 @@ async def generic_text_handler(msg: types.Message):
     except Exception:
         state = None
 
+    # 2) If user has a state -> MANUAL ROUTING (safety net)
     if state:
-        logger.info("Skipping generic_text_handler because user %s is in state %s (chat=%s)", msg.from_user.id, state, getattr(msg.chat, 'id', None))
+        logger.info("User %s has FSM state: %s — manual routing attempt", msg.from_user.id, state)
+        # get a state object to pass if handlers expect state param
+        state_obj = dp.current_state(chat=msg.chat.id, user=msg.from_user.id)
+        s = (state or "").lower()
+
+        # Income input state
+        if "income" in s:
+            logger.info("Manual route -> set_income_handler for %s", msg.from_user.id)
+            try:
+                # call state handler; many handlers expect (msg, state) signature
+                await set_income_handler(msg, state_obj)
+            except Exception:
+                logger.exception("Manual routing to set_income_handler failed for %s", msg.from_user.id)
+            return
+
+        # Expense amount state
+        if "expense" in s and "amount" in s:
+            logger.info("Manual route -> expense_amount for %s", msg.from_user.id)
+            try:
+                await expense_amount(msg, state_obj)
+            except Exception:
+                logger.exception("Manual routing to expense_amount failed for %s", msg.from_user.id)
+            return
+
+        # Recurring amount/day/category
+        if "recurring" in s:
+            if "amount" in s:
+                try:
+                    await recurring_amount(msg, state_obj)
+                except Exception:
+                    logger.exception("Manual routing to recurring_amount failed for %s", msg.from_user.id)
+                return
+            if "day" in s:
+                try:
+                    await recurring_day(msg, state_obj)
+                except Exception:
+                    logger.exception("Manual routing to recurring_day failed for %s", msg.from_user.id)
+                return
+            if "category" in s:
+                # category selection usually via callback_query — just return
+                logger.info("Recurring category state for %s — waiting for callback_query", msg.from_user.id)
+                return
+
+        # Unknown state: don't respond here; allow framework a chance (or just return)
+        logger.info("State '%s' not explicitly routed for %s — returning", state, msg.from_user.id)
         return
 
+    # 3) No state -> normal UI routing
     # route based on main buttons
-    if t in MAIN_BUTTONS:
-        if t == "➕ Добавить трату":
+    if text in MAIN_BUTTONS:
+        if text == "➕ Добавить трату":
             await add_expense_cmd(msg)
             return
-        if t == "📜 История":
+        if text == "📜 История":
             await history(msg)
             return
-        if t == "📊 Моя статистика":
+        if text == "📊 Моя статистика":
             await stats(msg)
             return
-        if t == "ℹ️ Помощь":
+        if text == "ℹ️ Помощь":
             await help_cmd(msg)
             return
 
-    # If message looks like quick expense: "Продукты 550"
-    parts = t.split()
+    # Quick-expense heuristic: "<category> <amount>"
+    parts = text.split()
     if len(parts) >= 2 and parts[-1].replace(',', '').replace('.', '').isdigit():
-        # last token is amount
         amount_raw = parts[-1]
         try:
             amount = float(amount_raw.replace(' ', '').replace(',', '.'))
             category_guess = ' '.join(parts[:-1])
-            # try to map category_guess to existing category
             cat = None
             for c in ALL_CATEGORIES:
                 if c.lower() in category_guess.lower():
@@ -597,10 +646,9 @@ async def generic_text_handler(msg: types.Message):
             await msg.reply(f"✅ Добавлено: {format_amount(amount)} ₽ — {cat}")
             return
         except Exception:
-            logger.exception("Failed to parse quick-expense message: %s", t)
+            logger.exception("Failed to parse quick-expense message: %s", text)
 
     # fallback
     await msg.reply("Я не понял. Используй кнопки или нажми ℹ️ Помощь.")
-
 
 __all__ = ("bot", "dp", "scheduler", "init_app_for_runtime", "close_db", "get_main_keyboard", "format_stats")
