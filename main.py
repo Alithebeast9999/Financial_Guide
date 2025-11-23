@@ -3,8 +3,7 @@ import os
 import logging
 import asyncio
 import signal
-from aiohttp import web
-
+from aiohttp import web, ClientSession
 from aiogram.utils.exceptions import TerminatedByOtherGetUpdates
 from aiogram.types import Update
 
@@ -18,6 +17,9 @@ PORT = int(os.environ.get("PORT", 10000))
 FORCE_POLLING = os.environ.get("FORCE_POLLING", "0") == "1"
 KEEP_BOT_ALIVE = os.environ.get("KEEP_BOT_ALIVE", "1") != "0"
 
+# How often self-pings run (seconds). 20-60 is reasonable; shorter = more active traffic.
+PING_INTERVAL = int(os.environ.get("SELF_PING_INTERVAL", 25))
+
 # Shared references
 bot = bot_app.bot
 dp = bot_app.dp
@@ -26,12 +28,25 @@ scheduler = bot_app.scheduler
 # Runtime artifacts
 _updates_queue: asyncio.Queue | None = None
 _worker_task: asyncio.Task | None = None
+_self_ping_task: asyncio.Task | None = None
+_client_session: ClientSession | None = None
 
 _shutdown_initiator = {"signal": None}
 
 
+def _register_signal_handlers(loop: asyncio.AbstractEventLoop):
+    def _on_signal(sig):
+        _shutdown_initiator["signal"] = str(sig)
+        logger.info(f"Process received signal: {sig}. Marking shutdown_initiator.")
+    try:
+        loop.add_signal_handler(signal.SIGINT, _on_signal, signal.SIGINT)
+        loop.add_signal_handler(signal.SIGTERM, _on_signal, signal.SIGTERM)
+        logger.info("Signal handlers registered")
+    except NotImplementedError:
+        logger.debug("Signal handlers not supported on this platform")
+
+
 async def webhook_worker():
-    """Worker that takes Update objects from the queue and processes them via Dispatcher."""
     logger.info("Webhook worker started")
     while True:
         try:
@@ -50,10 +65,8 @@ async def webhook_worker():
 
 
 async def handle_webhook(request: web.Request):
-    """Handler for Telegram webhook POSTs. Enqueues Update for processing."""
     try:
         data = await request.json()
-        # Create aiogram Update object from dict. aiogram Update will accept kwargs for fields.
         update = Update(**data)
     except Exception:
         logger.exception("handle_webhook: invalid payload")
@@ -69,11 +82,11 @@ async def handle_root(request: web.Request):
     return web.Response(text="OK")
 
 
+async def health_handler(request: web.Request):
+    return web.Response(text="OK")
+
+
 async def metrics_handler(request: web.Request):
-    """
-    Simple JSON metrics: users_count, expenses_count, pending_count.
-    Uses bot_app.db_fetchone safely.
-    """
     try:
         try:
             r = await bot_app.db_fetchone("SELECT COUNT(*) as c FROM users", ())
@@ -103,58 +116,67 @@ async def metrics_handler(request: web.Request):
         return web.json_response({"ok": False}, status=500)
 
 
-async def debug_handler(request: web.Request):
-    """Admin debug endpoint — queue sizes, worker status, webhook info."""
-    info = {
-        'queue_size': _updates_queue.qsize() if _updates_queue else None,
-        'worker_running': _worker_task is not None and not _worker_task.done(),
-        'scheduler_running': getattr(scheduler, "running", None),
-        'force_polling': FORCE_POLLING,
-        'keep_bot_alive': KEEP_BOT_ALIVE,
-        'webhook_url_env': WEBHOOK_URL,
-    }
-    try:
-        wh = await bot.get_webhook_info()
-        info['telegram_webhook'] = wh.to_python() if wh else None
-    except Exception as e:
-        info['telegram_webhook_error'] = str(e)
-    return web.json_response(info)
+async def self_ping_loop(app: web.Application):
+    """
+    Periodic self-ping to keep the process considered active by hosters and to keep bot session alive.
+    Does:
+      - bot.get_me()
+      - GET to webhook health URL (preferred) OR localhost root
+      - GET to local /healthz
+    """
+    global _client_session
+    if _client_session is None:
+        _client_session = ClientSession()
+    session = _client_session
 
+    # Determine target URL to ping: prefer the publicly visible webhook domain if provided (WEBHOOK_URL),
+    # otherwise hit the local http endpoint on the same port.
+    if WEBHOOK_URL:
+        webhook_health = WEBHOOK_URL.rstrip("/")
+    else:
+        webhook_health = f"http://localhost:{PORT}"
 
-_shutdown_lock = asyncio.Lock()
+    logger.info("self_ping_loop started (interval=%s s), target=%s", PING_INTERVAL, webhook_health)
 
-
-def _register_signal_handlers(loop: asyncio.AbstractEventLoop):
-    def _on_signal(sig):
-        _shutdown_initiator["signal"] = str(sig)
-        logger.info(f"Process received signal: {sig}. Marking shutdown_initiator.")
-    try:
-        loop.add_signal_handler(signal.SIGINT, _on_signal, signal.SIGINT)
-        loop.add_signal_handler(signal.SIGTERM, _on_signal, signal.SIGTERM)
-        logger.info("Signal handlers registered")
-    except NotImplementedError:
-        logger.debug("Signal handlers not supported on this platform")
-
-
-async def keep_alive_ping():
-    """Periodically call bot.get_me() to keep underlying session alive (if desired)."""
     try:
         while True:
             try:
-                await bot.get_me()
+                # bot session keepalive
+                try:
+                    await bot.get_me()
+                except Exception as e:
+                    logger.debug("self_ping: bot.get_me() failed: %s", e)
+
+                # HTTP GET public domain (if accessible)
+                try:
+                    # we ping the root of the generated URL and /healthz as well
+                    async with session.get(webhook_health, timeout=10) as resp:
+                        logger.debug("self_ping: GET %s -> %s", webhook_health, resp.status)
+                except Exception as e:
+                    logger.debug("self_ping: public GET failed: %s", e)
+
+                # local healthz (should be super fast)
+                try:
+                    local = f"http://localhost:{PORT}/healthz"
+                    async with session.get(local, timeout=5) as resp:
+                        logger.debug("self_ping: local healthz -> %s", resp.status)
+                except Exception as e:
+                    logger.debug("self_ping: local healthz failed: %s", e)
+
             except Exception:
-                logger.debug("keep_alive_ping: bot.get_me() failed", exc_info=True)
-            await asyncio.sleep(60)
+                logger.exception("self_ping_loop encountered exception (continuing)")
+
+            # sleep for configured interval
+            await asyncio.sleep(PING_INTERVAL)
     except asyncio.CancelledError:
-        logger.info("keep_alive_ping cancelled")
+        logger.info("self_ping_loop cancelled")
         raise
+    finally:
+        # do not close session here; closed in app cleanup
+        pass
 
 
 async def polling_runner(app):
-    """
-    Start polling loop — used if webhook setup fails or FORCE_POLLING is True.
-    Robust restart/backoff logic included.
-    """
     backoff = 1
     max_backoff = 60
     logger.info("Polling runner started")
@@ -178,18 +200,10 @@ async def polling_runner(app):
 
 
 async def on_startup_app(app: web.Application):
-    """
-    Startup sequence:
-    - initialize bot_app (DB, scheduler, pending restore)
-    - start updates queue and worker
-    - create/get bot session
-    - optionally start keep-alive ping
-    - choose between webhook or polling
-    """
-    global _updates_queue, _worker_task
+    global _updates_queue, _worker_task, _self_ping_task, _client_session
     logger.info("on_startup_app: initializing")
 
-    # Initialize bot_app internals (db_lock, scheduler jobs, pending actions, etc.)
+    # init bot_app internals (db_lock, scheduler jobs, pending actions...)
     await bot_app.init_app_for_runtime(app)
 
     # Queue + worker for webhook handling
@@ -197,25 +211,21 @@ async def on_startup_app(app: web.Application):
     app['updates_queue'] = _updates_queue
     _worker_task = asyncio.create_task(webhook_worker())
 
-    # obtain bot session inside async context to avoid DeprecationWarning
-    try:
-        sess = await bot.get_session()
-        app['bot_session'] = sess
-        logger.info("Bot session ready")
-    except Exception:
-        logger.exception("Failed to get bot session on startup (non-fatal)")
+    # create aiohttp client session for self-ping and keep it in app
+    _client_session = ClientSession()
+    app['client_session'] = _client_session
 
-    # start keep-alive ping if requested
+    # start keep-alive ping if requested (also does public GET to avoid idling by host)
     if KEEP_BOT_ALIVE:
-        app['keep_alive_ping'] = asyncio.create_task(keep_alive_ping())
-        logger.info("keep_alive_ping started (KEEP_BOT_ALIVE=True)")
+        app['self_ping'] = asyncio.create_task(self_ping_loop(app))
+        _self_ping_task = app['self_ping']
+        logger.info("self_ping_loop started (KEEP_BOT_ALIVE=True)")
 
     # small dummy to keep loop busy (optional)
     app['keep_alive'] = asyncio.create_task(asyncio.sleep(3600 * 24))
 
-    # choose mode: webhook if WEBHOOK_URL provided and not forcing polling
+    # choose mode
     if FORCE_POLLING or KEEP_BOT_ALIVE or not WEBHOOK_URL:
-        # ensure no webhook blocking polling
         try:
             await bot.delete_webhook(drop_pending_updates=True)
             logger.info("Webhook deleted (pre-polling cleanup)")
@@ -245,18 +255,7 @@ async def on_startup_app(app: web.Application):
 
 
 async def on_cleanup_app(app: web.Application):
-    """
-    Cleanup procedure on shutdown:
-    - cancel keep_alive tasks
-    - cancel worker and drain queue shortly
-    - stop polling if any
-    - delete webhook (depending on KEEP_BOT_ALIVE)
-    - shutdown scheduler
-    - close dp.storage
-    - close bot session and bot
-    - close DB via bot_app.close_db()
-    """
-    global _updates_queue, _worker_task
+    global _updates_queue, _worker_task, _self_ping_task, _client_session
     logger.info("on_cleanup: starting cleanup (initiator=%s)", _shutdown_initiator.get("signal"))
 
     # cancel keep_alive dummy
@@ -267,13 +266,22 @@ async def on_cleanup_app(app: web.Application):
         except Exception:
             pass
 
-    # cancel keep_alive_ping
-    if app.get('keep_alive_ping'):
-        app['keep_alive_ping'].cancel()
+    # cancel self-ping
+    if app.get('self_ping'):
+        app['self_ping'].cancel()
         try:
-            await app['keep_alive_ping']
+            await app['self_ping']
         except Exception:
             pass
+
+    # close client session
+    if _client_session:
+        try:
+            await _client_session.close()
+            logger.info("ClientSession closed")
+        except Exception:
+            logger.exception("Error while closing client session")
+        _client_session = None
 
     # cancel worker
     if _worker_task:
@@ -379,11 +387,10 @@ def create_app():
     app = web.Application()
     app.router.add_get('/', handle_root)
     app.router.add_post('/webhook', handle_webhook)
-    app.router.add_get('/healthz', handle_root)
+    app.router.add_get('/healthz', health_handler)
     app.router.add_post('/set_webhook', set_webhook_handler)
-    app.router.add_get('/debug', debug_handler)
+    app.router.add_get('/debug', metrics_handler)  # keep /debug lightweight (maps to metrics here)
     app.router.add_get('/metrics', metrics_handler)
-    # startup / cleanup hooks
     app.on_startup.append(on_startup_app)
     app.on_cleanup.append(on_cleanup_app)
     return app
@@ -393,5 +400,5 @@ if __name__ == '__main__':
     loop = asyncio.get_event_loop()
     _register_signal_handlers(loop)
     app = create_app()
-    logger.info(f"Starting web app on 0.0.0.0:{PORT} (FORCE_POLLING={FORCE_POLLING}, KEEP_BOT_ALIVE={KEEP_BOT_ALIVE})")
+    logger.info(f"Starting web app on 0.0.0.0:{PORT} (FORCE_POLLING={FORCE_POLLING}, KEEP_BOT_ALIVE={KEEP_BOT_ALIVE}, PING_INTERVAL={PING_INTERVAL})")
     web.run_app(app, host='0.0.0.0', port=PORT)
