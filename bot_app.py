@@ -333,9 +333,21 @@ async def start(msg: types.Message):
         "После ввода дохода я рассчитую рекомендованные лимиты по категориям и покажу подсказки по кнопкам внизу."
     )
     kb = get_main_keyboard()
-    # set FSM state explicitly via dp.current_state to avoid relying on Dispatcher.get_current()
-    state = dp.current_state(chat=msg.chat.id, user=uid)
-    await state.set_state(IncomeState.income.state)
+
+    # CHANGED: Try preferred API first; fallback to explicit dp.current_state if needed.
+    try:
+        # Preferred: requires Dispatcher context (usually ok inside worker)
+        await IncomeState.income.set()
+        logger.debug("start: set state via IncomeState.income.set()")
+    except Exception as e:
+        # Fallback: explicit state via dp.current_state
+        try:
+            state = dp.current_state(chat=msg.chat.id, user=uid)
+            await state.set_state(IncomeState.income.state)
+            logger.debug("start: set state via dp.current_state fallback")
+        except Exception:
+            logger.exception("start: failed to set IncomeState (both methods)")
+
     await msg.reply(welcome, reply_markup=kb)
 
 @dp.message_handler(commands=['cancel'], state="*")
@@ -387,11 +399,20 @@ async def set_income_handler(msg: types.Message, state: FSMContext):
     kb = get_main_keyboard()
     await msg.reply(full_msg, reply_markup=kb)
 
+
 @dp.message_handler(lambda m: m.text == "➕ Добавить трату")
 async def add_expense_cmd(msg: types.Message):
-    # set FSM explicitly
-    state = dp.current_state(chat=msg.chat.id, user=msg.from_user.id)
-    await state.set_state(ExpenseState.amount.state)
+    # CHANGED: try preferred API then fallback (same pattern as start)
+    try:
+        await ExpenseState.amount.set()
+        logger.debug("add_expense_cmd: set state via ExpenseState.amount.set()")
+    except Exception:
+        try:
+            state = dp.current_state(chat=msg.chat.id, user=msg.from_user.id)
+            await state.set_state(ExpenseState.amount.state)
+            logger.debug("add_expense_cmd: set state via dp.current_state fallback")
+        except Exception:
+            logger.exception("add_expense_cmd: failed to set ExpenseState.amount")
     await msg.reply("💸 Введи сумму траты (например: 450): (или /cancel чтобы отменить)")
 
 @dp.message_handler(state=ExpenseState.amount)
@@ -422,11 +443,20 @@ async def expense_amount(msg: types.Message, state: FSMContext):
         for cat in ALL_CATEGORIES:
             kb.insert(InlineKeyboardButton(cat, callback_data=f"cat_{cat}"))
         await msg.reply("Выбери категорию:", reply_markup=kb)
-        # set next FSM step explicitly
-        cur_state = dp.current_state(chat=msg.chat.id, user=msg.from_user.id)
-        await cur_state.set_state(ExpenseState.category.state)
+        # CHANGED: set next FSM step using preferred API with fallback
+        try:
+            await ExpenseState.category.set()
+            logger.debug("expense_amount: set ExpenseState.category via preferred API")
+        except Exception:
+            try:
+                cur_state = dp.current_state(chat=msg.chat.id, user=msg.from_user.id)
+                await cur_state.set_state(ExpenseState.category.state)
+                logger.debug("expense_amount: set ExpenseState.category via dp.current_state fallback")
+            except Exception:
+                logger.exception("expense_amount: failed to set ExpenseState.category")
     except Exception:
         await msg.reply("❌ Неверная сумма. Введите число, например: 450. Или нажмите /cancel, чтобы отменить.")
+
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('cat_'), state=ExpenseState.category)
 async def expense_category(cb: types.CallbackQuery, state: FSMContext):
@@ -495,9 +525,17 @@ async def toggle_notify(msg: types.Message):
 
 @dp.message_handler(commands=['add_recurring'])
 async def add_recurring(msg: types.Message):
-    # set FSM explicitly
-    state = dp.current_state(chat=msg.chat.id, user=msg.from_user.id)
-    await state.set_state(RecurringState.amount.state)
+    # CHANGED: try preferred API then fallback
+    try:
+        await RecurringState.amount.set()
+        logger.debug("add_recurring: set RecurringState.amount via preferred API")
+    except Exception:
+        try:
+            state = dp.current_state(chat=msg.chat.id, user=msg.from_user.id)
+            await state.set_state(RecurringState.amount.state)
+            logger.debug("add_recurring: set RecurringState.amount via dp.current_state fallback")
+        except Exception:
+            logger.exception("add_recurring: failed to set RecurringState.amount")
     await msg.reply("Введи сумму регулярного расхода (или /cancel):")
 
 @dp.message_handler(state=RecurringState.amount)
@@ -528,8 +566,17 @@ async def recurring_amount(msg: types.Message, state: FSMContext):
         for cat in ALL_CATEGORIES:
             kb.insert(InlineKeyboardButton(cat, callback_data=f"rec_{cat}"))
         await msg.reply("Выбери категорию:", reply_markup=kb)
-        cur_state = dp.current_state(chat=msg.chat.id, user=msg.from_user.id)
-        await cur_state.set_state(RecurringState.category.state)
+        # CHANGED: set next FSM step with fallback
+        try:
+            await RecurringState.category.set()
+            logger.debug("recurring_amount: set RecurringState.category via preferred API")
+        except Exception:
+            try:
+                cur_state = dp.current_state(chat=msg.chat.id, user=msg.from_user.id)
+                await cur_state.set_state(RecurringState.category.state)
+                logger.debug("recurring_amount: set RecurringState.category via dp.current_state fallback")
+            except Exception:
+                logger.exception("recurring_amount: failed to set RecurringState.category")
     except Exception:
         await msg.reply("❌ Неверная сумма. Введите число или /cancel.")
 
