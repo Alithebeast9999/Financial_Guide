@@ -281,7 +281,7 @@ async def start(msg: types.Message):
         "После ввода дохода я рассчитую рекомендованные лимиты по категориям и покажу подсказки по кнопкам внизу."
     )
     kb = get_main_keyboard()
-    await IncomeState.income.set()
+    await dp.current_state(chat=msg.chat.id, user=msg.from_user.id).set_state(IncomeState.income.state)
     # explicit HTML parse_mode
     await msg.reply(welcome, reply_markup=kb, parse_mode=ParseMode.HTML)
 
@@ -338,7 +338,7 @@ async def set_income_handler(msg: types.Message, state: FSMContext):
 @dp.message_handler(lambda m: m.text == "➕ Добавить трату")
 async def add_expense_cmd(msg: types.Message):
     await msg.reply("💸 Введи сумму траты (например: 450): (или /cancel чтобы отменить)")
-    await ExpenseState.amount.set()
+    await dp.current_state(chat=msg.chat.id, user=msg.from_user.id).set_state(ExpenseState.amount.state)
 
 @dp.message_handler(state=ExpenseState.amount)
 async def expense_amount(msg: types.Message, state: FSMContext):
@@ -368,7 +368,7 @@ async def expense_amount(msg: types.Message, state: FSMContext):
         for cat in ALL_CATEGORIES:
             kb.insert(InlineKeyboardButton(cat, callback_data=f"cat_{cat}"))
         await msg.reply("Выбери категорию:", reply_markup=kb)
-        await ExpenseState.category.set()
+        await dp.current_state(chat=msg.chat.id, user=msg.from_user.id).set_state(ExpenseState.category.state)
     except Exception:
         await msg.reply("❌ Неверная сумма. Введите число, например: 450. Или нажмите /cancel, чтобы отменить.")
 
@@ -443,7 +443,7 @@ async def toggle_notify(msg: types.Message):
 @dp.message_handler(commands=['add_recurring'])
 async def add_recurring(msg: types.Message):
     await msg.reply("Введи сумму регулярного расхода (или /cancel):")
-    await RecurringState.amount.set()
+    await dp.current_state(chat=msg.chat.id, user=msg.from_user.id).set_state(RecurringState.amount.state)
 
 @dp.message_handler(state=RecurringState.amount)
 async def recurring_amount(msg: types.Message, state: FSMContext):
@@ -473,7 +473,7 @@ async def recurring_amount(msg: types.Message, state: FSMContext):
         for cat in ALL_CATEGORIES:
             kb.insert(InlineKeyboardButton(cat, callback_data=f"rec_{cat}"))
         await msg.reply("Выбери категорию:", reply_markup=kb)
-        await RecurringState.category.set()
+        await dp.current_state(chat=msg.chat.id, user=msg.from_user.id).set_state(RecurringState.category.state)
     except Exception:
         await msg.reply("❌ Неверная сумма. Введите число или /cancel.")
 
@@ -482,7 +482,7 @@ async def recurring_category(cb: types.CallbackQuery, state: FSMContext):
     cat = cb.data[4:]
     await state.update_data(category=cat)
     await cb.message.edit_text("Укажи день месяца (1–28):")
-    await RecurringState.day.set()
+    await dp.current_state(chat=msg.chat.id, user=msg.from_user.id).set_state(RecurringState.day.state)
 
 @dp.message_handler(state=RecurringState.day)
 async def recurring_day(msg: types.Message, state: FSMContext):
@@ -547,11 +547,16 @@ async def generic_text_handler(msg: types.Message):
 
     # If the user is in an FSM state, do NOT handle here (let state handlers run)
     try:
-        state = await dp.current_state(user=msg.from_user.id).get_state()
-    except Exception:
-        state = None
+        # Prefer checking by (chat, user) key; fall back to user-only if not available
+        try:
+            state = await dp.current_state(chat=msg.chat.id, user=msg.from_user.id).get_state()
+        except Exception:
+            try:
+                state = await dp.current_state(user=msg.from_user.id).get_state()
+            except Exception:
+                state = None
     if state:
-        logger.info("Skipping generic_text_handler because user %s is in state %s", msg.from_user.id, state)
+        logger.info("Skipping generic_text_handler because user %s is in state %s (chat=%s)", msg.from_user.id, state)
         return
 
     # route based on main buttons
