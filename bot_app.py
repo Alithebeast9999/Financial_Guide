@@ -537,7 +537,23 @@ async def report_cmd(msg: types.Message):
 # Generic text handler for fallback (keeps previous button semantics)
 @dp.message_handler(state=None)
 async def generic_text_handler(msg: types.Message):
+    """Fallback handler that only runs when user has NO active FSM state.
+    To avoid answering while the user is inside a state (income/expense/etc.) we explicitly
+    check the current FSM state at runtime — because in some webhook/task setups the
+    state-specific handlers might not get matched reliably. If a state is present we
+    skip responding here and allow the FSM handlers to process the message.
+    """
     t = (msg.text or "").strip()
+
+    # If the user is in an FSM state, do NOT handle here (let state handlers run)
+    try:
+        state = await dp.current_state(user=msg.from_user.id).get_state()
+    except Exception:
+        state = None
+    if state:
+        logger.info("Skipping generic_text_handler because user %s is in state %s", msg.from_user.id, state)
+        return
+
     # route based on main buttons
     if t in MAIN_BUTTONS:
         if t == "➕ Добавить трату":
@@ -552,8 +568,8 @@ async def generic_text_handler(msg: types.Message):
         if t == "ℹ️ Помощь":
             await help_cmd(msg)
             return
-    # if it looks like number during IncomeState or ExpenseState the FSM handles it
-    # Otherwise treat it as an expense short form like "Продукты 550"
+
+    # If message looks like quick expense: "Продукты 550"
     parts = t.split()
     if len(parts) >= 2 and parts[-1].replace(',', '').replace('.', '').isdigit():
         # last token is amount
@@ -574,7 +590,9 @@ async def generic_text_handler(msg: types.Message):
             return
         except Exception:
             pass
+
     # fallback
     await msg.reply("Я не понял. Используй кнопки или нажми ℹ️ Помощь.")
+
 
 __all__ = ("bot", "dp", "scheduler", "init_app_for_runtime", "close_db", "get_main_keyboard", "format_stats")
