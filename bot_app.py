@@ -535,7 +535,7 @@ async def report_cmd(msg: types.Message):
     await msg.reply(text)
 
 # Generic text handler for fallback (keeps previous button semantics)
-@dp.message_handler()
+@dp.message_handler(state=None)
 async def generic_text_handler(msg: types.Message):
     t = (msg.text or "").strip()
     # route based on main buttons
