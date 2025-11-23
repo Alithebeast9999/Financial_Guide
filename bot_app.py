@@ -535,29 +535,23 @@ async def report_cmd(msg: types.Message):
     await msg.reply(text)
 
 # Generic text handler for fallback (keeps previous button semantics)
-@dp.message_handler(state=None)
+@dp.message_handler(content_types=["text"])
 async def generic_text_handler(msg: types.Message):
-    """Fallback handler that only runs when user has NO active FSM state.
-    To avoid answering while the user is inside a state (income/expense/etc.) we explicitly
-    check the current FSM state at runtime — because in some webhook/task setups the
-    state-specific handlers might not get matched reliably. If a state is present we
-    skip responding here and allow the FSM handlers to process the message.
-    """
-    t = (msg.text or "").strip()
-
-    # If the user is in an FSM state, do NOT handle here (let state handlers run)
+    # 1) Проверяем состояние строго по chat+user
     try:
-        # Prefer checking by (chat, user) key; fall back to user-only if not available
-        try:
-            state = await dp.current_state(chat=msg.chat.id, user=msg.from_user.id).get_state()
-        except Exception:
-            try:
-                state = await dp.current_state(user=msg.from_user.id).get_state()
-            except Exception:
-                state = None
+        state = await dp.current_state(
+            chat=msg.chat.id,
+            user=msg.from_user.id
+        ).get_state()
+    except Exception:
+        state = None
+
+    # 2) Если состояние есть — молча пропускаем
     if state:
-        logger.info("Skipping generic_text_handler because user %s is in state %s (chat=%s)", msg.from_user.id, state)
         return
+
+    # 3) иначе — стандартная реакция
+    await msg.answer("Я не понял. Используй кнопки или нажми ℹ️ Помощь.")
 
     # route based on main buttons
     if t in MAIN_BUTTONS:
