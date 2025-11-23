@@ -555,8 +555,11 @@ async def generic_text_handler(msg: types.Message):
                 state = await dp.current_state(user=msg.from_user.id).get_state()
             except Exception:
                 state = None
+    except Exception:
+        state = None
+
     if state:
-        logger.info("Skipping generic_text_handler because user %s is in state %s (chat=%s)", msg.from_user.id, state)
+        logger.info("Skipping generic_text_handler because user %s is in state %s (chat=%s)", msg.from_user.id, state, getattr(msg.chat, 'id', None))
         return
 
     # route based on main buttons
@@ -594,7 +597,7 @@ async def generic_text_handler(msg: types.Message):
             await msg.reply(f"✅ Добавлено: {format_amount(amount)} ₽ — {cat}")
             return
         except Exception:
-            pass
+            logger.exception("Failed to parse quick-expense message: %s", t)
 
     # fallback
     await msg.reply("Я не понял. Используй кнопки или нажми ℹ️ Помощь.")
