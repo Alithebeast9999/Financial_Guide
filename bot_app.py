@@ -292,16 +292,10 @@ def build_limits_table_html(income: float) -> str:
 # ---------------- Handlers ----------------
 @dp.message_handler(commands=['start'])
 async def start(msg: types.Message):
-    """
-    /start handler now preserves existing user data.
-    If the user already has a non-zero monthly income stored, we consider the profile initialized
-    and show the limits + main keyboard without asking to re-enter income. Otherwise prompt for income.
-    """
     uid = msg.from_user.id
-    # ensure user exists in DB
+    # Ensure user row exists
     await ensure_user(uid)
 
-    # fetch stored income (async)
     try:
         income = await get_income(uid)
     except Exception:
@@ -310,7 +304,6 @@ async def start(msg: types.Message):
     kb = get_main_keyboard()
 
     if income and income > 0:
-        # user already initialized — show limits and do NOT set FSM state
         table_html = build_limits_table_html(income)
         welcome = ("<b>С возвращением! Я помню ваш профиль.</b>
 
@@ -322,16 +315,15 @@ async def start(msg: types.Message):
         try:
             await msg.reply(full_msg, reply_markup=kb, parse_mode=ParseMode.HTML)
         except Exception:
-            # fallback: send plain text (shouldn't normally happen)
             await msg.reply("С возвращением! Вот ваши лимиты.", reply_markup=kb)
-        # ensure any lingering FSM state is cleared for this user/chat
+        # Clear any lingering FSM state for this user/chat
         try:
             await dp.current_state(chat=msg.chat.id, user=uid).finish()
         except Exception:
             pass
         return
 
-    # new user (or no income set) — ask for monthly income
+    # New user flow: ask for income and set FSM
     welcome = ("<b>Привет! Я — твой финансовый помощник.</b>
 
 "
