@@ -293,7 +293,7 @@ def build_limits_table_html(income: float) -> str:
 @dp.message_handler(commands=['start'])
 async def start(msg: types.Message):
     uid = msg.from_user.id
-    # Ensure user row exists
+    # ensure user exists
     await ensure_user(uid)
 
     try:
@@ -305,38 +305,38 @@ async def start(msg: types.Message):
 
     if income and income > 0:
         table_html = build_limits_table_html(income)
-        welcome = ("<b>С возвращением! Я помню ваш профиль.</b>
+        welcome_html = ("<b>С возвращением! Я помню ваш профиль.</b>
 
 "
-                   "Ниже — ваши текущие рекомендованные лимиты и быстрые кнопки.")
-        full_msg = welcome + "
+                        "Ниже — ваши текущие рекомендованные лимиты и быстрые кнопки.")
+        full_msg = welcome_html + "
 
 " + table_html
         try:
             await msg.reply(full_msg, reply_markup=kb, parse_mode=ParseMode.HTML)
         except Exception:
             await msg.reply("С возвращением! Вот ваши лимиты.", reply_markup=kb)
-        # Clear any lingering FSM state for this user/chat
+        # clear any leftover FSM state for this chat/user
         try:
             await dp.current_state(chat=msg.chat.id, user=uid).finish()
         except Exception:
             pass
         return
 
-    # New user flow: ask for income and set FSM
-    welcome = ("<b>Привет! Я — твой финансовый помощник.</b>
+    # new user flow
+    welcome_html = ("<b>Привет! Я — твой финансовый помощник.</b>
 
 "
-               "Я помогу тебе отслеживать расходы, планировать бюджет, "
-               "настраивать регулярные платежи и вовремя предупреждать о превышениях лимитов.
+                    "Я помогу тебе отслеживать расходы, планировать бюджет, "
+                    "настраивать регулярные платежи и вовремя предупреждать о превышениях лимитов.
 
 "
-               "Чтобы начать — введите ваш ежемесячный доход (например: <b>50 000</b>)
+                    "Чтобы начать — введите ваш ежемесячный доход (например: <b>50 000</b>)
 
 "
-               "После ввода дохода я рассчитую рекомендованные лимиты по категориям и покажу подсказки по кнопкам внизу.")
+                    "После ввода дохода я рассчитую рекомендованные лимиты по категориям и покажу подсказки по кнопкам внизу.")
     try:
-        await msg.reply(welcome, reply_markup=kb, parse_mode=ParseMode.HTML)
+        await msg.reply(welcome_html, reply_markup=kb, parse_mode=ParseMode.HTML)
     except Exception:
         await msg.reply("Привет! Введите ваш ежемесячный доход (например: 50 000)", reply_markup=kb)
     await IncomeState.income.set()
