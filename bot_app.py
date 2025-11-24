@@ -1,12 +1,16 @@
 # bot_app.py
 """
-Refactored bot_app.py:
+Refactored bot_app.py (updated recurring category callback):
 - Uses aiosqlite for async DB access
 - Bot created with parse_mode=None (safe); explicit parse_mode used where HTML is intended
 - Escapes user-provided content before inserting into HTML messages
 - Robust helpers (db_execute, db_fetchone, db_fetchall)
 - Keeps scheduler jobs and handlers
 - Exports init_app_for_runtime and close_db for main.py
+
+This version fixes the recurring-category callback handler: it no longer requires an FSM state match
+in the decorator (which can be unreliable in webhook setups). Instead it retrieves the FSM state
+for the (chat, user) pair and updates it explicitly, then sets the next state (RecurringState.day).
 """
 import os
 import logging
@@ -377,18 +381,14 @@ async def expense_amount(msg: types.Message, state: FSMContext):
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('cat_'))
 async def expense_category(cb: types.CallbackQuery):
     """
-    Handle category selection buttons.
-    This handler intentionally does NOT require state=ExpenseState.category because
-    in webhook+worker setups callback_query state-matching may be unreliable.
-    We fetch FSM data manually using (chat, user) and finalize the expense.
+    Handle category selection buttons for one-off expenses.
     """
-    await cb.answer()  # immediate visual feedback to user
+    await cb.answer()
 
     cat = cb.data[4:]
     chat_id = cb.message.chat.id if cb.message else None
     user_id = cb.from_user.id
 
-    # Retrieve FSM state and data for this user/chat
     try:
         state = dp.current_state(chat=chat_id, user=user_id)
         data = await state.get_data()
@@ -397,7 +397,6 @@ async def expense_category(cb: types.CallbackQuery):
 
     amount = data.get('amount')
     if amount is None:
-        # No stored amount -> can't complete expense
         try:
             if cb.message:
                 await cb.message.answer("❌ Не удалось найти сумму траты. Пожалуйста, попробуй ещё раз через кнопку ➕ Добавить трату.")
@@ -405,14 +404,12 @@ async def expense_category(cb: types.CallbackQuery):
                 await cb.answer("Не найдена сумма. Повтори операцию.", show_alert=True)
         except Exception:
             pass
-        # Ensure we reset any stale state
         try:
             await state.finish()
         except Exception:
             pass
         return
 
-    # Add expense
     try:
         await add_expense(user_id, amount, cat)
     except Exception:
@@ -428,7 +425,6 @@ async def expense_category(cb: types.CallbackQuery):
         return
 
     safe_cat = html_lib.escape(cat)
-    # Acknowledge in chat: edit the message or send a new one
     try:
         if cb.message:
             await cb.message.edit_text(f"✅ Добавлено: {format_amount(amount)} ₽ — {safe_cat}")
@@ -440,7 +436,6 @@ async def expense_category(cb: types.CallbackQuery):
         except Exception:
             pass
 
-    # Optionally send warnings about limits
     try:
         warnings = await check_limits(user_id, cat, amount)
         if warnings:
@@ -448,7 +443,6 @@ async def expense_category(cb: types.CallbackQuery):
     except Exception:
         logger.debug("check_limits failed for user %s", user_id)
 
-    # Finish FSM (clear any stored state/data)
     try:
         await state.finish()
     except Exception:
@@ -493,7 +487,6 @@ async def help_cmd(msg: types.Message):
         "/notify — включить/выключить уведомления\n"
         "/cancel — отменить текущее действие"
     )
-    # send as plain text to avoid HTML parsing issues
     await msg.answer(help_text)
 
 @dp.message_handler(commands=['notify'])
@@ -538,22 +531,46 @@ async def recurring_amount(msg: types.Message, state: FSMContext):
         for cat in ALL_CATEGORIES:
             kb.insert(InlineKeyboardButton(cat, callback_data=f"rec_{cat}"))
         await msg.answer("Выбери категорию:", reply_markup=kb)
+        # set category state so UI expects a callback
         await RecurringState.category.set()
     except Exception:
         await msg.answer("❌ Неверная сумма. Введите число или /cancel.")
 
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith('rec_'), state=RecurringState.category)
-async def recurring_category(cb: types.CallbackQuery, state: FSMContext):
+# ---- FIXED: do not require FSM state in decorator; fetch and update state manually ----
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith('rec_'))
+async def recurring_category(cb: types.CallbackQuery):
+    """Handle category selection for recurring expenses (works even if aiogram's state matching fails).
+    We fetch the FSM state for (chat, user), update stored data and set next state (day).
+    """
+    await cb.answer()
+
     cat = cb.data[4:]
-    await state.update_data(category=cat)
+    chat_id = cb.message.chat.id if cb.message else None
+    user_id = cb.from_user.id
+
+    # retrieve FSMContext for this chat+user
     try:
-        await cb.message.edit_text("Укажи день месяца (1–28):")
+        state = dp.current_state(chat=chat_id, user=user_id)
+        await state.update_data(category=cat)
+        # set next expected state to 'day'
+        await state.set_state(RecurringState.day.state)
+    except Exception:
+        # fallback: try global set
+        try:
+            await RecurringState.day.set()
+        except Exception:
+            logger.exception("Failed to set recurring day state for %s", user_id)
+
+    try:
+        if cb.message:
+            await cb.message.edit_text("Укажи день месяца (1–28):")
+        else:
+            await bot.send_message(user_id, "Укажи день месяца (1–28):")
     except Exception:
         try:
-            await cb.message.answer("Укажи день месяца (1–28):")
+            await bot.send_message(user_id, "Укажи день месяца (1–28):")
         except Exception:
             pass
-    await RecurringState.day.set()
 
 @dp.message_handler(state=RecurringState.day)
 async def recurring_day(msg: types.Message, state: FSMContext):
