@@ -1,17 +1,17 @@
 # bot_app.py
 """
-Stable refactor of bot_app.py — syntactically correct and cleaned up.
-Features:
- - aiosqlite async DB helpers
- - safe HTML usage (explicit ParseMode.HTML only when needed)
- - fixed callback handlers for categories and recurring rules
- - format_stats builds text via list+join (no unterminated string literals)
- - exports init_app_for_runtime and close_db for main.py
+Refactored, syntax-clean version of bot_app.py.
+- Async DB via aiosqlite with helpers
+- Clear, single callback handler logic for categories and recurring
+- FSM-safe manual routing in generic_text_handler
+- HTML sent only with explicit ParseMode.HTML and escaping where needed
+- Recurring expenses added immediately for current month and stored in recurring table
+- Deletion of recurring entries made available from history
 """
 import os
 import logging
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import html as html_lib
 import aiosqlite
 import pytz
@@ -35,7 +35,7 @@ if not BOT_TOKEN:
 # timezone
 TZ = pytz.timezone("Europe/Moscow")
 
-# Bot/Dispatcher: use parse_mode=None by default
+# Bot/Dispatcher
 bot = Bot(token=BOT_TOKEN, timeout=30, parse_mode=None)
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
@@ -50,7 +50,15 @@ scheduler = AsyncIOScheduler(timezone=TZ)
 
 # Categories and UI
 CATEGORIES = {
-    "НАДО": {"Аренда жилья": 0.35, "Продуктовая корзина": 0.15, "Комм. услуги": 0.05, "Связь": 0.03, "Транспорт": 0.05, "Личный уход": 0.02, "Медицина": 0.08},
+    "НАДО": {
+        "Аренда жилья": 0.35,
+        "Продуктовая корзина": 0.15,
+        "Комм. услуги": 0.05,
+        "Связь": 0.03,
+        "Транспорт": 0.05,
+        "Личный уход": 0.02,
+        "Медицина": 0.08,
+    },
     "МОГУ": {"Инвестиции": 0.05, "Подушка безопасности": 0.05},
     "ХОЧУ": {"Развлечения": 0.07, "Отдых - путешествия": 0.05, "Покупки": 0.05},
 }
@@ -94,7 +102,7 @@ async def db_execute(query: str, params: tuple = ()):  # for INSERT/UPDATE/DELET
         await _db.commit()
         return cur
 
-async def db_fetchone(query: str, params: tuple = ()):  # returns aiosqlite.Row or None
+async def db_fetchone(query: str, params: tuple = ()):  # returns row or None
     async with _db_lock:
         cur = await _db.execute(query, params)
         row = await cur.fetchone()
@@ -133,9 +141,38 @@ async def init_app_for_runtime(app=None):
     # ensure tables
     try:
         async with _db_lock:
-            await _db.execute("""CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, income REAL DEFAULT 0, notifications INTEGER DEFAULT 1)""")
-            await _db.execute("""CREATE TABLE IF NOT EXISTS expenses (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount REAL, category TEXT, timestamp TEXT, recurring_id INTEGER)""")
-            await _db.execute("""CREATE TABLE IF NOT EXISTS recurring (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount REAL, category TEXT, day INTEGER)""")
+            await _db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    income REAL DEFAULT 0,
+                    notifications INTEGER DEFAULT 1
+                )
+                """
+            )
+            await _db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS expenses (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    amount REAL,
+                    category TEXT,
+                    timestamp TEXT,
+                    recurring_id INTEGER
+                )
+                """
+            )
+            await _db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS recurring (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    amount REAL,
+                    category TEXT,
+                    day INTEGER
+                )
+                """
+            )
             await _db.commit()
     except Exception:
         logger.exception("DB ensure tables failed (ignored)")
@@ -162,15 +199,23 @@ def get_limits_from_income(income: float):
 
 async def add_expense(uid, amount, category, ts=None, rec_id=None):
     ts = ts or datetime.now(TZ)
-    await db_execute("INSERT INTO expenses (user_id, amount, category, timestamp, recurring_id) VALUES (?, ?, ?, ?, ?)",
-                     (uid, amount, category, ts.isoformat(), rec_id))
+    await db_execute(
+        "INSERT INTO expenses (user_id, amount, category, timestamp, recurring_id) VALUES (?, ?, ?, ?, ?)",
+        (uid, amount, category, ts.isoformat(), rec_id),
+    )
 
 async def get_expenses(uid, limit=10):
-    rows = await db_fetchall("SELECT id, amount, category, timestamp FROM expenses WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?", (uid, limit))
+    rows = await db_fetchall(
+        "SELECT id, amount, category, timestamp, recurring_id FROM expenses WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?",
+        (uid, limit),
+    )
     return rows
 
 async def delete_expense(eid):
     await db_execute("DELETE FROM expenses WHERE id = ?", (eid,))
+
+async def delete_recurring(rid):
+    await db_execute("DELETE FROM recurring WHERE id = ?", (rid,))
 
 async def check_limits(uid, category, amount):
     limits = get_limits_from_income(await get_income(uid))
@@ -179,9 +224,15 @@ async def check_limits(uid, category, amount):
     income = await get_income(uid)
     month_start = datetime.now(TZ).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     month_end = (month_start + timedelta(days=35)).replace(day=1) - timedelta(seconds=1)
-    r = await db_fetchone("SELECT SUM(amount) as total FROM expenses WHERE user_id = ? AND timestamp BETWEEN ? AND ?", (uid, month_start.isoformat(), month_end.isoformat()))
+    r = await db_fetchone(
+        "SELECT SUM(amount) as total FROM expenses WHERE user_id = ? AND timestamp BETWEEN ? AND ?",
+        (uid, month_start.isoformat(), month_end.isoformat()),
+    )
     total_spent = r["total"] if r and r["total"] is not None else 0
-    r = await db_fetchone("SELECT SUM(amount) as total FROM expenses WHERE user_id = ? AND category = ? AND timestamp BETWEEN ? AND ?", (uid, category, month_start.isoformat(), month_end.isoformat()))
+    r = await db_fetchone(
+        "SELECT SUM(amount) as total FROM expenses WHERE user_id = ? AND category = ? AND timestamp BETWEEN ? AND ?",
+        (uid, category, month_start.isoformat(), month_end.isoformat()),
+    )
     cat_spent = r["total"] if r and r["total"] is not None else 0
     msgs = []
     if total_spent + amount > income:
@@ -197,9 +248,11 @@ async def format_stats(uid: int) -> str:
     limits = get_limits_from_income(income)
     month_start = datetime.now(TZ).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     month_end = (month_start + timedelta(days=35)).replace(day=1) - timedelta(seconds=1)
-    rows = await db_fetchall("SELECT category, SUM(amount) as total FROM expenses WHERE user_id = ? AND timestamp BETWEEN ? AND ? GROUP BY category", (uid, month_start.isoformat(), month_end.isoformat()))
+    rows = await db_fetchall(
+        "SELECT category, SUM(amount) as total FROM expenses WHERE user_id = ? AND timestamp BETWEEN ? AND ? GROUP BY category",
+        (uid, month_start.isoformat(), month_end.isoformat()),
+    )
     spent = {r["category"]: r["total"] for r in rows}
-
     lines = []
     lines.append(f"💰 Ваш доход: {format_amount(income)} ₽")
     lines.append("")
@@ -218,7 +271,7 @@ async def format_stats(uid: int) -> str:
 async def daily_reminders():
     rows = await db_fetchall("SELECT user_id FROM users WHERE notifications = 1", ())
     for r in rows:
-        uid = r["user_id"] if isinstance(r, dict) or hasattr(r, 'keys') else r[0]
+        uid = r[0]
         try:
             await bot.send_message(uid, "💡 Не забудь добавить траты за сегодня!")
         except Exception:
@@ -227,7 +280,7 @@ async def daily_reminders():
 async def weekly_report():
     rows = await db_fetchall("SELECT user_id FROM users", ())
     for r in rows:
-        uid = r["user_id"] if isinstance(r, dict) or hasattr(r, 'keys') else r[0]
+        uid = r[0]
         try:
             await bot.send_message(uid, "📊 Еженедельный отчёт:
 
@@ -236,26 +289,16 @@ async def weekly_report():
             logger.debug("Failed to send weekly report to %s", uid)
 
 async def process_recurring():
-    # Process recurring rules: if day > days in month -> run on last day
     today = datetime.now(TZ).day
-    rows = await db_fetchall("SELECT id, user_id, amount, category, day FROM recurring", ())
+    rows = await db_fetchall("SELECT id, user_id, amount, category, day FROM recurring WHERE day = ?", (today,))
     for r in rows:
-        rec_id = r["id"]
-        uid = r["user_id"]
-        amt = r["amount"]
-        cat = r["category"]
-        day = r["day"]
-        # compute if should run today
-        now = datetime.now(TZ)
-        last_day = (now.replace(day=1) + timedelta(days=35)).replace(day=1) - timedelta(days=1)
-        last_dom = last_day.day
-        effective_day = min(day, last_dom)
-        if today == effective_day:
-            await add_expense(uid, amt, cat, rec_id=rec_id)
-            try:
-                await bot.send_message(uid, f"🔁 Добавлен регулярный расход: {format_amount(amt)} ₽ — {html_lib.escape(cat)}")
-            except Exception:
-                pass
+        rec_id, uid, amt, cat, day = r
+        # add as regular expense for today
+        await add_expense(uid, amt, cat, ts=datetime.now(TZ), rec_id=rec_id)
+        try:
+            await bot.send_message(uid, f"🔁 Добавлен регулярный расход: {format_amount(amt)} ₽ — {html_lib.escape(cat)}")
+        except Exception:
+            pass
 
 # ---------------- UI helpers ----------------
 def get_main_keyboard():
@@ -271,7 +314,7 @@ def build_limits_table_html(income: float) -> str:
     lines.append("")
     lines.append("Рекомендуемые лимиты (процент / сумма):")
     lines.append("")
-    max_cat_len = max(len(cat) for cat in limits.keys()) if limits else 0
+    max_cat_len = max((len(cat) for cat in limits.keys()), default=0)
     for group, cats in CATEGORIES.items():
         lines.append(f"{group}:")
         for cat, pct in cats.items():
@@ -372,7 +415,7 @@ async def add_expense_cmd(msg: types.Message):
 
 @dp.message_handler(state=ExpenseState.amount)
 async def expense_amount(msg: types.Message, state: FSMContext):
-    text = msg.text or ""
+    text = (msg.text or "").strip()
     if text.startswith("/"):
         await state.finish()
         if text.startswith("/start"):
@@ -396,42 +439,34 @@ async def expense_amount(msg: types.Message, state: FSMContext):
         await state.update_data(amount=amount)
         kb = InlineKeyboardMarkup(row_width=2)
         for cat in ALL_CATEGORIES:
-            kb.insert(InlineKeyboardButton(cat, callback_data=f"cat_{cat}"))
+            kb.insert(InlineKeyboardButton(cat, callback_data=f"cat:{cat}"))
         await msg.reply("Выбери категорию:", reply_markup=kb)
         await ExpenseState.category.set()
     except Exception:
         await msg.reply("❌ Неверная сумма. Введите число, например: 450. Или нажмите /cancel, чтобы отменить.")
 
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith('cat_'))
-async def expense_category(cb: types.CallbackQuery):
-    await cb.answer()
-    cat = cb.data[4:]
+# Single callback handler for expense categories (works even if state matching is unreliable)
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith('cat:'))
+async def expense_category_handler(cb: types.CallbackQuery):
+    await cb.answer()  # small UI feedback
+    cat = cb.data.split(':', 1)[1]
+    # Try to get FSM data for chat+user
     chat_id = cb.message.chat.id if cb.message else None
     user_id = cb.from_user.id
-    # attempt to get FSM data
+    state = dp.current_state(chat=chat_id, user=user_id)
     try:
-        state = dp.current_state(chat=chat_id, user=user_id)
         data = await state.get_data()
     except Exception:
         data = {}
-        state = None
     amount = data.get('amount')
     if amount is None:
         try:
-            await cb.answer("Не найдена сумма. Повтори через ➕ Добавить трату.", show_alert=True)
+            await cb.answer("Не найдена сумма. Нажми ➕ Добавить трату и введи сумму.", show_alert=True)
         except Exception:
             pass
         return
-    # store expense
-    try:
-        await add_expense(user_id, amount, cat)
-    except Exception:
-        logger.exception("Failed to add expense for user %s: %s %s", user_id, amount, cat)
-        try:
-            await cb.answer("Ошибка при сохранении траты.", show_alert=True)
-        except Exception:
-            pass
-        return
+    warnings = await check_limits(user_id, cat, amount)
+    await add_expense(user_id, amount, cat)
     safe_cat = html_lib.escape(cat)
     try:
         await cb.message.edit_text(f"✅ Добавлено: {format_amount(amount)} ₽ — {safe_cat}")
@@ -440,25 +475,23 @@ async def expense_category(cb: types.CallbackQuery):
             await bot.send_message(user_id, f"✅ Добавлено: {format_amount(amount)} ₽ — {safe_cat}")
         except Exception:
             pass
-    # warnings
-    try:
-        warns = await check_limits(user_id, cat, amount)
-        if warns:
+    if warnings:
+        try:
             await bot.send_message(user_id, "
-".join(warns))
-    except Exception:
-        logger.debug("check_limits failed for user %s", user_id)
+".join(warnings))
+        except Exception:
+            pass
     # finish state
     try:
-        if state:
-            await state.finish()
+        await state.finish()
     except Exception:
         pass
 
 @dp.message_handler(lambda m: m.text == "📜 История")
 async def history(msg: types.Message):
-    exps = await get_expenses(msg.from_user.id)
-    if not exps:
+    exps = await get_expenses(msg.from_user.id, limit=20)
+    recs = await db_fetchall("SELECT id, amount, category, day FROM recurring WHERE user_id = ?", (msg.from_user.id,))
+    if not exps and not recs:
         await msg.reply("Пока нет трат 💰")
         return
     for e in exps:
@@ -467,14 +500,32 @@ async def history(msg: types.Message):
             dt = datetime.fromisoformat(ts).strftime('%d.%m %H:%M')
         except Exception:
             dt = ts
-        kb = InlineKeyboardMarkup().add(InlineKeyboardButton("❌ Удалить", callback_data=f"del_{e['id']}"))
+        kb = InlineKeyboardMarkup().add(InlineKeyboardButton("❌ Удалить", callback_data=f"del_exp:{e['id']}"))
         await msg.reply(f"{dt} | {e['amount']:,.0f} ₽ | {e['category']}", reply_markup=kb)
+    if recs:
+        await msg.reply("
+Регулярные расходы:")
+        for r in recs:
+            rid, amt, cat, day = r
+            kb = InlineKeyboardMarkup().add(InlineKeyboardButton("❌ Удалить регулярный", callback_data=f"del_rec:{rid}"))
+            await msg.reply(f"Каждое {day}-е | {amt:,.0f} ₽ | {cat}", reply_markup=kb)
 
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith('del_'))
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith('del_exp:'))
 async def delete_expense_cb(cb: types.CallbackQuery):
-    eid = int(cb.data[4:])
+    eid = int(cb.data.split(':', 1)[1])
     await delete_expense(eid)
     await cb.answer("Удалено")
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith('del_rec:'))
+async def delete_recurring_cb(cb: types.CallbackQuery):
+    rid = int(cb.data.split(':', 1)[1])
+    # also remove future recurring and optionally related future expenses (we only delete recurring rule here)
+    await delete_recurring(rid)
+    await cb.answer("Регулярный расход удалён")
     try:
         await cb.message.delete()
     except Exception:
@@ -514,7 +565,7 @@ async def add_recurring(msg: types.Message):
 
 @dp.message_handler(state=RecurringState.amount)
 async def recurring_amount(msg: types.Message, state: FSMContext):
-    text = msg.text or ""
+    text = (msg.text or "").strip()
     if text.startswith("/"):
         await state.finish()
         if text.startswith("/start"):
@@ -538,46 +589,49 @@ async def recurring_amount(msg: types.Message, state: FSMContext):
         await state.update_data(amount=amt)
         kb = InlineKeyboardMarkup(row_width=2)
         for cat in ALL_CATEGORIES:
-            kb.insert(InlineKeyboardButton(cat, callback_data=f"rec_{cat}"))
+            kb.insert(InlineKeyboardButton(cat, callback_data=f"rec_cat:{cat}"))
         await msg.reply("Выбери категорию:", reply_markup=kb)
         await RecurringState.category.set()
     except Exception:
         await msg.reply("❌ Неверная сумма. Введите число или /cancel.")
 
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith('rec_'))
-async def recurring_category(cb: types.CallbackQuery):
+# callback for recurring category selection
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith('rec_cat:'))
+async def recurring_category_cb(cb: types.CallbackQuery):
     await cb.answer()
-    cat = cb.data[4:]
+    cat = cb.data.split(':', 1)[1]
     chat_id = cb.message.chat.id if cb.message else None
     user_id = cb.from_user.id
+    state = dp.current_state(chat=chat_id, user=user_id)
     try:
-        state = dp.current_state(chat=chat_id, user=user_id)
         data = await state.get_data()
     except Exception:
         data = {}
-        state = None
-    amt = data.get('amount')
-    if amt is None:
+    amount = data.get('amount')
+    if amount is None:
         try:
-            await cb.answer("Не найдена сумма. Повтори через /add_recurring.", show_alert=True)
+            await cb.answer("Не найдена сумма. Повтори добавление регулярного расхода.", show_alert=True)
         except Exception:
             pass
         return
-    # store category and ask for day
+    # ask user for day
     try:
-        await state.update_data(category=cat)
         await cb.message.edit_text("Укажи день месяца (1–31):")
-        await RecurringState.day.set()
     except Exception:
-        logger.exception("Failed to set recurring category for %s", user_id)
         try:
-            await cb.answer("Ошибка.", show_alert=True)
+            await bot.send_message(user_id, "Укажи день месяца (1–31):")
         except Exception:
             pass
+    await RecurringState.day.set()
+    # Keep amount & category in state
+    try:
+        await state.update_data(category=cat)
+    except Exception:
+        pass
 
 @dp.message_handler(state=RecurringState.day)
 async def recurring_day(msg: types.Message, state: FSMContext):
-    text = msg.text or ""
+    text = (msg.text or "").strip()
     if text.startswith("/"):
         await state.finish()
         if text.startswith("/start"):
@@ -601,31 +655,75 @@ async def recurring_day(msg: types.Message, state: FSMContext):
         if not (1 <= day <= 31):
             raise ValueError
         data = await state.get_data()
-        # save recurring rule
-        await db_execute("INSERT INTO recurring (user_id, amount, category, day) VALUES (?, ?, ?, ?)",
-                         (msg.from_user.id, data["amount"], data["category"], day))
-        # also immediately add to expenses history for current month occurrence
-        now = datetime.now(TZ)
-        last_day = (now.replace(day=1) + timedelta(days=35)).replace(day=1) - timedelta(days=1)
-        effective_day = min(day, last_day.day)
-        ts = now.replace(day=effective_day, hour=0, minute=0, second=0, microsecond=0)
-        await add_expense(msg.from_user.id, data["amount"], data["category"], ts=ts)
-        await msg.reply(f"🔁 Регулярный расход сохранён: {format_amount(data['amount'])} ₽ — {data['category']} (каждое {day}-е число)")
+        cat = data.get('category')
+        amt = data.get('amount')
+        # store recurring rule
+        cur = await db_execute("INSERT INTO recurring (user_id, amount, category, day) VALUES (?, ?, ?, ?)", (msg.from_user.id, amt, cat, day))
+        # Add an expense for this month if the day is <= last day of current month (or we assume user wants to add for upcoming occurrence)
+        # We'll map requested day to a date in current month (or next month if day already passed)
+        today_dt = datetime.now(TZ)
+        year = today_dt.year
+        month = today_dt.month
+        # if requested day already passed in this month, schedule for next month when adding immediate expense
+        target_month = month
+        target_year = year
+        if day < 1:
+            day = 1
+        try:
+            target_date = date(year, month, day)
+            if target_date < today_dt.date():
+                # move to next month
+                if month == 12:
+                    target_month = 1
+                    target_year = year + 1
+                else:
+                    target_month = month + 1
+                    target_year = year
+                # cap day to last day of target month
+                from calendar import monthrange
+                last_day = monthrange(target_year, target_month)[1]
+                day_capped = min(day, last_day)
+                ts = datetime(target_year, target_month, day_capped, tzinfo=TZ)
+            else:
+                from calendar import monthrange
+                last_day = monthrange(target_year, target_month)[1]
+                day_capped = min(day, last_day)
+                ts = datetime(year, month, day_capped, tzinfo=TZ)
+        except Exception:
+            # fallback: use today timestamp
+            ts = datetime.now(TZ)
+        # add immediate expense entry to reflect that the user "has" that recurring expense
+        await add_expense(msg.from_user.id, amt, cat, ts=ts)
+        await msg.reply(f"🔁 Регулярный расход сохранён: {format_amount(amt)} ₽ — {cat} (каждое {day}-е число)")
         await state.finish()
     except Exception:
         await msg.reply("❌ Укажи число от 1 до 31 или /cancel")
 
-@dp.message_handler(commands=['reportweek', 'reportmonth'])
-async def report_cmd(msg: types.Message):
-    cmd = msg.text.lstrip('/').strip().lower()
-    args = 'week' if cmd == 'reportweek' else 'month'
+@dp.message_handler(commands=['reportweek'])
+async def reportweek_cmd(msg: types.Message):
     now = datetime.now(TZ)
-    start = now - timedelta(days=7) if args == 'week' else now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    start = now - timedelta(days=7)
     rows = await db_fetchall("SELECT category, SUM(amount) as total FROM expenses WHERE user_id = ? AND timestamp >= ? GROUP BY category", (msg.from_user.id, start.isoformat()))
     if not rows:
         await msg.reply("Нет данных за выбранный период.")
         return
-    text = f"📊 Отчёт за {'неделю' if args == 'week' else 'месяц'}:
+    text = "📊 Отчёт за неделю:
+
+"
+    for r in rows:
+        text += f"{r['category']}: {r['total']:,.0f} ₽
+"
+    await msg.reply(text)
+
+@dp.message_handler(commands=['reportmonth'])
+async def reportmonth_cmd(msg: types.Message):
+    now = datetime.now(TZ)
+    start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    rows = await db_fetchall("SELECT category, SUM(amount) as total FROM expenses WHERE user_id = ? AND timestamp >= ? GROUP BY category", (msg.from_user.id, start.isoformat()))
+    if not rows:
+        await msg.reply("Нет данных за выбранный период.")
+        return
+    text = "📊 Отчёт за месяц:
 
 "
     for r in rows:
@@ -637,9 +735,10 @@ async def report_cmd(msg: types.Message):
 @dp.message_handler()
 async def generic_text_handler(msg: types.Message):
     text = (msg.text or "").strip()
+    # 0) commands handled by their handlers
     if text.startswith("/"):
         return
-    # check FSM state
+    # 1) determine FSM state
     try:
         try:
             state = await dp.current_state(chat=msg.chat.id, user=msg.from_user.id).get_state()
@@ -650,10 +749,11 @@ async def generic_text_handler(msg: types.Message):
                 state = None
     except Exception:
         state = None
+    # 2) manual routing if in FSM state
     if state:
         logger.info("User %s has FSM state: %s — manual routing attempt", msg.from_user.id, state)
-        state_obj = dp.current_state(chat=msg.chat.id, user=msg.from_user.id)
         s = (state or "").lower()
+        state_obj = dp.current_state(chat=msg.chat.id, user=msg.from_user.id)
         if "income" in s:
             try:
                 await set_income_handler(msg, state_obj)
@@ -679,10 +779,11 @@ async def generic_text_handler(msg: types.Message):
                 except Exception:
                     logger.exception("Manual routing to recurring_day failed for %s", msg.from_user.id)
                 return
-            if "category" in s:
-                return
+            # category selection for recurring is via callback
+            logger.info("Recurring category state for %s — waiting for callback_query", msg.from_user.id)
+            return
         return
-    # No state -> normal UI routing
+    # 3) No state -> normal UI routing
     if text in MAIN_BUTTONS:
         if text == "➕ Добавить трату":
             await add_expense_cmd(msg)
@@ -696,7 +797,7 @@ async def generic_text_handler(msg: types.Message):
         if text == "ℹ️ Помощь":
             await help_cmd(msg)
             return
-    # Quick-expense heuristic
+    # Quick-expense: "Category 550"
     parts = text.split()
     if len(parts) >= 2 and parts[-1].replace(',', '').replace('.', '').isdigit():
         amount_raw = parts[-1]
@@ -715,6 +816,7 @@ async def generic_text_handler(msg: types.Message):
             return
         except Exception:
             logger.exception("Failed to parse quick-expense message: %s", text)
+    # fallback
     await msg.reply("Я не понял. Используй кнопки или нажми ℹ️ Помощь.")
 
 __all__ = ("bot", "dp", "scheduler", "init_app_for_runtime", "close_db", "get_main_keyboard", "format_stats")
