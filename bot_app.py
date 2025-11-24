@@ -292,19 +292,67 @@ def build_limits_table_html(income: float) -> str:
 # ---------------- Handlers ----------------
 @dp.message_handler(commands=['start'])
 async def start(msg: types.Message):
+    """
+    /start handler now preserves existing user data.
+    If the user already has a non-zero monthly income stored, we consider the profile initialized
+    and show the limits + main keyboard without asking to re-enter income. Otherwise prompt for income.
+    """
     uid = msg.from_user.id
+    # ensure user exists in DB
     await ensure_user(uid)
+
+    # fetch stored income (async)
+    try:
+        income = await get_income(uid)
+    except Exception:
+        income = 0.0
+
+    kb = get_main_keyboard()
+
+    if income and income > 0:
+        # user already initialized — show limits and do NOT set FSM state
+        table_html = build_limits_table_html(income)
+        welcome = (
+            "<b>С возвращением! Я помню ваш профиль.</b>
+
+"
+            "Ниже — ваши текущие рекомендованные лимиты и быстрые кнопки."
+        )
+        full_msg = welcome + "
+
+" + table_html
+        try:
+            await msg.reply(full_msg, reply_markup=kb, parse_mode=ParseMode.HTML)
+        except Exception:
+            # fallback: send plain text (shouldn't normally happen)
+            await msg.reply("С возвращением! Вот ваши лимиты.", reply_markup=kb)
+        # ensure any lingering FSM state is cleared for this user/chat
+        try:
+            await dp.current_state(chat=msg.chat.id, user=uid).finish()
+        except Exception:
+            pass
+        return
+
+    # new user (or no income set) — ask for monthly income
     welcome = (
-        "<b>Привет! Я — твой финансовый помощник.</b>\n\n"
+        "<b>Привет! Я — твой финансовый помощник.</b>
+
+"
         "Я помогу тебе отслеживать расходы, планировать бюджет, "
-        "настраивать регулярные платежи и вовремя предупреждать о превышениях лимитов.\n\n"
-        "Чтобы начать — введите ваш ежемесячный доход (например: <b>50 000</b>)\n\n"
+        "настраивать регулярные платежи и вовремя предупреждать о превышениях лимитов.
+
+"
+        "Чтобы начать — введите ваш ежемесячный доход (например: <b>50 000</b>)
+
+"
         "После ввода дохода я рассчитую рекомендованные лимиты по категориям и покажу подсказки по кнопкам внизу."
     )
-    kb = get_main_keyboard()
+    try:
+        await msg.reply(welcome, reply_markup=kb, parse_mode=ParseMode.HTML)
+    except Exception:
+        await msg.reply("Привет! Введите ваш ежемесячный доход (например: 50 000)", reply_markup=kb)
     await IncomeState.income.set()
-    # explicit HTML parse_mode
-    await msg.reply(welcome, reply_markup=kb, parse_mode=ParseMode.HTML)
+
 
 @dp.message_handler(commands=['cancel'], state="*")
 async def cmd_cancel(msg: types.Message, state: FSMContext):
