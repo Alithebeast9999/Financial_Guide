@@ -372,22 +372,75 @@ async def expense_amount(msg: types.Message, state: FSMContext):
     except Exception:
         await msg.reply("❌ Неверная сумма. Введите число, например: 450. Или нажмите /cancel, чтобы отменить.")
 
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith('cat_'), state=ExpenseState.category)
-async def expense_category(cb: types.CallbackQuery, state: FSMContext):
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith('cat_'))
+async def expense_category(cb: types.CallbackQuery):
+    """
+    Handle category selection buttons.
+    This handler intentionally does NOT require state=ExpenseState.category because
+    in webhook+worker setups callback_query state-matching may be unreliable.
+    We instead fetch FSM data manually using (chat, user) and finalize the expense.
+    """
+    await cb.answer()  # immediate visual feedback to user
+
     cat = cb.data[4:]
-    data = await state.get_data()
-    amount = data.get('amount')
-    uid = cb.from_user.id
-    warnings = await check_limits(uid, cat, amount)
-    await add_expense(uid, amount, cat)
-    safe_cat = html_lib.escape(cat)
+    chat_id = cb.message.chat.id if cb.message else None
+    user_id = cb.from_user.id
+
+    # Try to retrieve FSM data for this user+chat
     try:
-        await cb.message.edit_text(f"✅ Добавлено: {format_amount(amount)} ₽ — {safe_cat}")
+        state = dp.current_state(chat=chat_id, user=user_id)
+        data = await state.get_data()
     except Exception:
-        await bot.send_message(uid, f"✅ Добавлено: {format_amount(amount)} ₽ — {safe_cat}")
-    if warnings:
-        await bot.send_message(uid, "\n".join(warnings))
-    await state.finish()
+        data = {}
+
+    amount = data.get('amount')
+    if amount is None:
+        # No stored amount -> can't complete expense
+        try:
+            await cb.message.reply("❌ Не удалось найти сумму траты. Пожалуйста, попробуй ещё раз через кнопку ➕ Добавить трату.")
+        except Exception:
+            await cb.answer("Не найдена сумма. Повтори операцию.", show_alert=True)
+        # Ensure we reset any stale state
+        try:
+            await state.finish()
+        except Exception:
+            pass
+        return
+
+    # Add expense and notify user
+    try:
+        await add_expense(user_id, amount, cat)
+    except Exception:
+        logger.exception("Failed to add expense for user %s: %s %s", user_id, amount, cat)
+        try:
+            await cb.answer("Ошибка при сохранении траты.", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    # Acknowledge in chat: edit the message or send a new one
+    try:
+        await cb.message.edit_text(f"✅ Добавлено: {format_amount(amount)} ₽ — {cat}")
+    except Exception:
+        # editing can fail if message modified previously; fallback to sending a message
+        try:
+            await cb.message.reply(f"✅ Добавлено: {format_amount(amount)} ₽ — {cat}")
+        except Exception:
+            pass
+
+    # Optionally send warnings about limits (reuse existing check_limits)
+    try:
+        warnings = check_limits(user_id, cat, amount)
+        if warnings:
+            await cb.message.reply("\n".join(warnings))
+    except Exception:
+        logger.debug("check_limits failed for user %s", user_id)
+
+    # Finish FSM (clear any stored state/data)
+    try:
+        await state.finish()
+    except Exception:
+        pass
 
 @dp.message_handler(lambda m: m.text == "📜 История")
 async def history(msg: types.Message):
