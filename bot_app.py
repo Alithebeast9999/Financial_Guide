@@ -283,16 +283,16 @@ async def start(msg: types.Message):
     kb = get_main_keyboard()
     await IncomeState.income.set()
     # explicit HTML parse_mode
-    await msg.reply(welcome, reply_markup=kb, parse_mode=ParseMode.HTML)
+    await msg.answer(welcome, reply_markup=kb, parse_mode=ParseMode.HTML)
 
 @dp.message_handler(commands=['cancel'], state="*")
 async def cmd_cancel(msg: types.Message, state: FSMContext):
     cur = await state.get_state()
     if cur is None:
-        await msg.reply("Нечего отменять.")
+        await msg.answer("Нечего отменять.")
         return
     await state.finish()
-    await msg.reply("Действие отменено. Можешь использовать кнопки ниже.", reply_markup=get_main_keyboard())
+    await msg.answer("Действие отменено. Можешь использовать кнопки ниже.", reply_markup=get_main_keyboard())
 
 @dp.message_handler(state=IncomeState.income)
 async def set_income_handler(msg: types.Message, state: FSMContext):
@@ -302,7 +302,7 @@ async def set_income_handler(msg: types.Message, state: FSMContext):
         if text.startswith("/start"):
             await start(msg)
         else:
-            await msg.reply("Команда выполнена. Если вы хотели ввести доход — введите число.")
+            await msg.answer("Команда выполнена. Если вы хотели ввести доход — введите число.")
         return
     if text in MAIN_BUTTONS:
         await state.finish()
@@ -318,7 +318,7 @@ async def set_income_handler(msg: types.Message, state: FSMContext):
     try:
         income = float(text.replace(" ", "").replace(",", "."))
     except Exception:
-        await msg.reply("❌ Неверный формат дохода. Введите число, например: 50 000 (или нажмите /cancel).")
+        await msg.answer("❌ Неверный формат дохода. Введите число, например: 50 000 (или нажмите /cancel).")
         return
     await set_income(msg.from_user.id, income)
     await state.finish()
@@ -333,11 +333,11 @@ async def set_income_handler(msg: types.Message, state: FSMContext):
     full_msg = table_html + "\n\n" + buttons_expl
     kb = get_main_keyboard()
     # send as HTML
-    await msg.reply(full_msg, reply_markup=kb, parse_mode=ParseMode.HTML)
+    await msg.answer(full_msg, reply_markup=kb, parse_mode=ParseMode.HTML)
 
 @dp.message_handler(lambda m: m.text == "➕ Добавить трату")
 async def add_expense_cmd(msg: types.Message):
-    await msg.reply("💸 Введи сумму траты (например: 450): (или /cancel чтобы отменить)")
+    await msg.answer("💸 Введи сумму траты (например: 450): (или /cancel чтобы отменить)")
     await ExpenseState.amount.set()
 
 @dp.message_handler(state=ExpenseState.amount)
@@ -348,7 +348,7 @@ async def expense_amount(msg: types.Message, state: FSMContext):
         if text.startswith("/start"):
             await start(msg)
         else:
-            await msg.reply("Команда зарегистрирована. Если вы хотели ввести сумму — попробуйте снова.", reply_markup=get_main_keyboard())
+            await msg.answer("Команда зарегистрирована. Если вы хотели ввести сумму — попробуйте снова.", reply_markup=get_main_keyboard())
         return
     if text in MAIN_BUTTONS:
         await state.finish()
@@ -367,86 +367,33 @@ async def expense_amount(msg: types.Message, state: FSMContext):
         kb = InlineKeyboardMarkup(row_width=2)
         for cat in ALL_CATEGORIES:
             kb.insert(InlineKeyboardButton(cat, callback_data=f"cat_{cat}"))
-        await msg.reply("Выбери категорию:", reply_markup=kb)
+        await msg.answer("Выбери категорию:", reply_markup=kb)
         await ExpenseState.category.set()
     except Exception:
-        await msg.reply("❌ Неверная сумма. Введите число, например: 450. Или нажмите /cancel, чтобы отменить.")
+        await msg.answer("❌ Неверная сумма. Введите число, например: 450. Или нажмите /cancel, чтобы отменить.")
 
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith('cat_'))
-async def expense_category(cb: types.CallbackQuery):
-    """
-    Handle category selection buttons.
-    This handler intentionally does NOT require state=ExpenseState.category because
-    in webhook+worker setups callback_query state-matching may be unreliable.
-    We instead fetch FSM data manually using (chat, user) and finalize the expense.
-    """
-    await cb.answer()  # immediate visual feedback to user
-
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith('cat_'), state=ExpenseState.category)
+async def expense_category(cb: types.CallbackQuery, state: FSMContext):
     cat = cb.data[4:]
-    chat_id = cb.message.chat.id if cb.message else None
-    user_id = cb.from_user.id
-
-    # Try to retrieve FSM data for this user+chat
-    try:
-        state = dp.current_state(chat=chat_id, user=user_id)
-        data = await state.get_data()
-    except Exception:
-        data = {}
-
+    data = await state.get_data()
     amount = data.get('amount')
-    if amount is None:
-        # No stored amount -> can't complete expense
-        try:
-            await cb.message.reply("❌ Не удалось найти сумму траты. Пожалуйста, попробуй ещё раз через кнопку ➕ Добавить трату.")
-        except Exception:
-            await cb.answer("Не найдена сумма. Повтори операцию.", show_alert=True)
-        # Ensure we reset any stale state
-        try:
-            await state.finish()
-        except Exception:
-            pass
-        return
-
-    # Add expense and notify user
+    uid = cb.from_user.id
+    warnings = await check_limits(uid, cat, amount)
+    await add_expense(uid, amount, cat)
+    safe_cat = html_lib.escape(cat)
     try:
-        await add_expense(user_id, amount, cat)
+        await cb.message.edit_text(f"✅ Добавлено: {format_amount(amount)} ₽ — {safe_cat}")
     except Exception:
-        logger.exception("Failed to add expense for user %s: %s %s", user_id, amount, cat)
-        try:
-            await cb.answer("Ошибка при сохранении траты.", show_alert=True)
-        except Exception:
-            pass
-        return
-
-    # Acknowledge in chat: edit the message or send a new one
-    try:
-        await cb.message.edit_text(f"✅ Добавлено: {format_amount(amount)} ₽ — {cat}")
-    except Exception:
-        # editing can fail if message modified previously; fallback to sending a message
-        try:
-            await cb.message.reply(f"✅ Добавлено: {format_amount(amount)} ₽ — {cat}")
-        except Exception:
-            pass
-
-    # Optionally send warnings about limits (reuse existing check_limits)
-    try:
-        warnings = check_limits(user_id, cat, amount)
-        if warnings:
-            await cb.message.reply("\n".join(warnings))
-    except Exception:
-        logger.debug("check_limits failed for user %s", user_id)
-
-    # Finish FSM (clear any stored state/data)
-    try:
-        await state.finish()
-    except Exception:
-        pass
+        await bot.send_message(uid, f"✅ Добавлено: {format_amount(amount)} ₽ — {safe_cat}")
+    if warnings:
+        await bot.send_message(uid, "\n".join(warnings))
+    await state.finish()
 
 @dp.message_handler(lambda m: m.text == "📜 История")
 async def history(msg: types.Message):
     exps = await get_expenses(msg.from_user.id)
     if not exps:
-        await msg.reply("Пока нет трат 💰")
+        await msg.answer("Пока нет трат 💰")
         return
     for e in exps:
         ts = e['timestamp']
@@ -455,7 +402,7 @@ async def history(msg: types.Message):
         except Exception:
             dt = ts
         kb = InlineKeyboardMarkup().add(InlineKeyboardButton("❌ Удалить", callback_data=f"del_{e['id']}"))
-        await msg.reply(f"{dt} | {e['amount']:,.0f} ₽ | {e['category']}", reply_markup=kb)
+        await msg.answer(f"{dt} | {e['amount']:,.0f} ₽ | {e['category']}", reply_markup=kb)
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('del_'))
 async def delete_expense_cb(cb: types.CallbackQuery):
@@ -469,7 +416,7 @@ async def delete_expense_cb(cb: types.CallbackQuery):
 
 @dp.message_handler(lambda m: m.text == "📊 Моя статистика")
 async def stats(msg: types.Message):
-    await msg.reply(await format_stats(msg.from_user.id))
+    await msg.answer(await format_stats(msg.from_user.id))
 
 # Help command - send plain text (no HTML parsing) and escape any dynamic data
 @dp.message_handler(lambda m: m.text == "ℹ️ Помощь")
@@ -482,7 +429,7 @@ async def help_cmd(msg: types.Message):
         "/cancel — отменить текущее действие"
     )
     # send as plain text to avoid HTML parsing issues
-    await msg.reply(help_text)
+    await msg.answer(help_text)
 
 @dp.message_handler(commands=['notify'])
 async def toggle_notify(msg: types.Message):
@@ -491,11 +438,11 @@ async def toggle_notify(msg: types.Message):
     current = bool(r['notifications']) if r else True
     new_val = 0 if current else 1
     await db_execute("UPDATE users SET notifications = ? WHERE user_id = ?", (new_val, uid))
-    await msg.reply("🔔 Уведомления включены" if new_val else "🔕 Уведомления отключены")
+    await msg.answer("🔔 Уведомления включены" if new_val else "🔕 Уведомления отключены")
 
 @dp.message_handler(commands=['add_recurring'])
 async def add_recurring(msg: types.Message):
-    await msg.reply("Введи сумму регулярного расхода (или /cancel):")
+    await msg.answer("Введи сумму регулярного расхода (или /cancel):")
     await RecurringState.amount.set()
 
 @dp.message_handler(state=RecurringState.amount)
@@ -506,7 +453,7 @@ async def recurring_amount(msg: types.Message, state: FSMContext):
         if text.startswith("/start"):
             await start(msg)
         else:
-            await msg.reply("Команда выполнена. Если вы хотели ввести сумму — введите число.")
+            await msg.answer("Команда выполнена. Если вы хотели ввести сумму — введите число.")
         return
     if text in MAIN_BUTTONS:
         await state.finish()
@@ -525,10 +472,10 @@ async def recurring_amount(msg: types.Message, state: FSMContext):
         kb = InlineKeyboardMarkup(row_width=2)
         for cat in ALL_CATEGORIES:
             kb.insert(InlineKeyboardButton(cat, callback_data=f"rec_{cat}"))
-        await msg.reply("Выбери категорию:", reply_markup=kb)
+        await msg.answer("Выбери категорию:", reply_markup=kb)
         await RecurringState.category.set()
     except Exception:
-        await msg.reply("❌ Неверная сумма. Введите число или /cancel.")
+        await msg.answer("❌ Неверная сумма. Введите число или /cancel.")
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('rec_'), state=RecurringState.category)
 async def recurring_category(cb: types.CallbackQuery, state: FSMContext):
@@ -545,7 +492,7 @@ async def recurring_day(msg: types.Message, state: FSMContext):
         if text.startswith("/start"):
             await start(msg)
         else:
-            await msg.reply("Команда выполнена. Если вы хотели указать день — введите число.")
+            await msg.answer("Команда выполнена. Если вы хотели указать день — введите число.")
         return
     if text in MAIN_BUTTONS:
         await state.finish()
@@ -565,47 +512,42 @@ async def recurring_day(msg: types.Message, state: FSMContext):
         data = await state.get_data()
         await db_execute("INSERT INTO recurring (user_id, amount, category, day) VALUES (?, ?, ?, ?)",
                          (msg.from_user.id, data["amount"], data["category"], day))
-        await msg.reply(f"🔁 Регулярный расход сохранён: {format_amount(data['amount'])} ₽ — {data['category']} (каждое {day}-е число)")
+        await msg.answer(f"🔁 Регулярный расход сохранён: {format_amount(data['amount'])} ₽ — {data['category']} (каждое {day}-е число)")
         await state.finish()
     except Exception:
-        await msg.reply("❌ Укажи число от 1 до 28 или /cancel")
+        await msg.answer("❌ Укажи число от 1 до 28 или /cancel")
 
 @dp.message_handler(commands=['report'])
 async def report_cmd(msg: types.Message):
     args = msg.get_args().strip().lower()
     if args not in ('week', 'month'):
-        await msg.reply("Используй: /report week или /report month")
+        await msg.answer("Используй: /report week или /report month")
         return
     now = datetime.now(TZ)
     start = now - timedelta(days=7) if args == 'week' else now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     rows = await db_fetchall("SELECT category, SUM(amount) as total FROM expenses WHERE user_id = ? AND timestamp >= ? GROUP BY category", (msg.from_user.id, start.isoformat()))
     if not rows:
-        await msg.reply("Нет данных за выбранный период.")
+        await msg.answer("Нет данных за выбранный период.")
         return
     text = f"📊 Отчёт за {'неделю' if args == 'week' else 'месяц'}:\n\n"
     for r in rows:
         text += f"{r['category']}: {r['total']:,.0f} ₽\n"
-    await msg.reply(text)
+    await msg.answer(text)
 
-# Generic text handler — unified entry point and safety router.
-@dp.message_handler()
+# Generic text handler for fallback (keeps previous button semantics)
+@dp.message_handler(state=None)
 async def generic_text_handler(msg: types.Message):
+    """Fallback handler that only runs when user has NO active FSM state.
+    To avoid answering while the user is inside a state (income/expense/etc.) we explicitly
+    check the current FSM state at runtime — because in some webhook/task setups the
+    state-specific handlers might not get matched reliably. If a state is present we
+    skip responding here and allow the FSM handlers to process the message.
     """
-    Unified fallback that:
-    - lets command handlers run (we return early for commands),
-    - checks FSM state and, if present, manually routes the message to the correct state handler,
-      ensuring the user always gets a response even if the framework didn't call state handler,
-    - otherwise handles main buttons / quick-expense / fallback.
-    """
+    t = (msg.text or "").strip()
 
-    text = (msg.text or "").strip()
-
-    # 0) If it's a bot command — don't handle here (command handlers will run)
-    if text.startswith("/"):
-        return
-
-    # 1) Try to determine the FSM state for (chat, user) (fallback to user-only)
+    # If the user is in an FSM state, do NOT handle here (let state handlers run)
     try:
+        # Prefer checking by (chat, user) key; fall back to user-only if not available
         try:
             state = await dp.current_state(chat=msg.chat.id, user=msg.from_user.id).get_state()
         except Exception:
@@ -616,78 +558,34 @@ async def generic_text_handler(msg: types.Message):
     except Exception:
         state = None
 
-    # 2) If user has a state -> MANUAL ROUTING (safety net)
     if state:
-        logger.info("User %s has FSM state: %s — manual routing attempt", msg.from_user.id, state)
-        # get a state object to pass if handlers expect state param
-        state_obj = dp.current_state(chat=msg.chat.id, user=msg.from_user.id)
-        s = (state or "").lower()
-
-        # Income input state
-        if "income" in s:
-            logger.info("Manual route -> set_income_handler for %s", msg.from_user.id)
-            try:
-                # call state handler; many handlers expect (msg, state) signature
-                await set_income_handler(msg, state_obj)
-            except Exception:
-                logger.exception("Manual routing to set_income_handler failed for %s", msg.from_user.id)
-            return
-
-        # Expense amount state
-        if "expense" in s and "amount" in s:
-            logger.info("Manual route -> expense_amount for %s", msg.from_user.id)
-            try:
-                await expense_amount(msg, state_obj)
-            except Exception:
-                logger.exception("Manual routing to expense_amount failed for %s", msg.from_user.id)
-            return
-
-        # Recurring amount/day/category
-        if "recurring" in s:
-            if "amount" in s:
-                try:
-                    await recurring_amount(msg, state_obj)
-                except Exception:
-                    logger.exception("Manual routing to recurring_amount failed for %s", msg.from_user.id)
-                return
-            if "day" in s:
-                try:
-                    await recurring_day(msg, state_obj)
-                except Exception:
-                    logger.exception("Manual routing to recurring_day failed for %s", msg.from_user.id)
-                return
-            if "category" in s:
-                # category selection usually via callback_query — just return
-                logger.info("Recurring category state for %s — waiting for callback_query", msg.from_user.id)
-                return
-
-        # Unknown state: don't respond here; allow framework a chance (or just return)
-        logger.info("State '%s' not explicitly routed for %s — returning", state, msg.from_user.id)
+        logger.info("Skipping generic_text_handler because user %s is in state %s (chat=%s)", msg.from_user.id, state, getattr(msg.chat, 'id', None))
         return
 
-    # 3) No state -> normal UI routing
     # route based on main buttons
-    if text in MAIN_BUTTONS:
-        if text == "➕ Добавить трату":
+    if t in MAIN_BUTTONS:
+        if t == "➕ Добавить трату":
             await add_expense_cmd(msg)
             return
-        if text == "📜 История":
+        if t == "📜 История":
             await history(msg)
             return
-        if text == "📊 Моя статистика":
+        if t == "📊 Моя статистика":
             await stats(msg)
             return
-        if text == "ℹ️ Помощь":
+        if t == "ℹ️ Помощь":
             await help_cmd(msg)
             return
 
-    # Quick-expense heuristic: "<category> <amount>"
-    parts = text.split()
+    # If message looks like quick expense: "Продукты 550"
+    parts = t.split()
     if len(parts) >= 2 and parts[-1].replace(',', '').replace('.', '').isdigit():
+        # last token is amount
         amount_raw = parts[-1]
         try:
             amount = float(amount_raw.replace(' ', '').replace(',', '.'))
             category_guess = ' '.join(parts[:-1])
+            # try to map category_guess to existing category
             cat = None
             for c in ALL_CATEGORIES:
                 if c.lower() in category_guess.lower():
@@ -696,12 +594,13 @@ async def generic_text_handler(msg: types.Message):
             if not cat:
                 cat = 'Другое'
             await add_expense(msg.from_user.id, amount, cat)
-            await msg.reply(f"✅ Добавлено: {format_amount(amount)} ₽ — {cat}")
+            await msg.answer(f"✅ Добавлено: {format_amount(amount)} ₽ — {cat}")
             return
         except Exception:
-            logger.exception("Failed to parse quick-expense message: %s", text)
+            logger.exception("Failed to parse quick-expense message: %s", t)
 
     # fallback
-    await msg.reply("Я не понял. Используй кнопки или нажми ℹ️ Помощь.")
+    await msg.answer("Я не понял. Используй кнопки или нажми ℹ️ Помощь.")
+
 
 __all__ = ("bot", "dp", "scheduler", "init_app_for_runtime", "close_db", "get_main_keyboard", "format_stats")
