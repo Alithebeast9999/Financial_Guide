@@ -59,7 +59,15 @@ async def get_pending(uid: int) -> Optional[Dict[str, Any]]:
 
 # ---------------- Categories & states -------------
 CATEGORIES = {
-    "НАДО": {"Аренда жилья": 0.35, "Продуктовая корзина": 0.15, "Комм. услуги": 0.05, "Связь": 0.03, "Транспорт": 0.05, "Личный уход": 0.02, "Медицина": 0.08},
+    "НАДО": {
+        "Аренда жилья": 0.35,
+        "Продуктовая корзина": 0.15,
+        "Комм. услуги": 0.05,
+        "Связь": 0.03,
+        "Транспорт": 0.05,
+        "Личный уход": 0.02,
+        "Медицина": 0.08,
+    },
     "МОГУ": {"Инвестиции": 0.05, "Подушка безопасности": 0.05},
     "ХОЧУ": {"Развлечения": 0.07, "Отдых - путешествия": 0.05, "Покупки": 0.05},
 }
@@ -80,10 +88,7 @@ class RecurringState(StatesGroup):
 
 # ---------------- Helpers & DB access (aiosqlite) ------------
 async def init_db():
-    """
-    Initialize aiosqlite connection, pragmas and tables.
-    Called from init_app_for_runtime.
-    """
+    """Initialize aiosqlite connection, pragmas and tables."""
     global db
     db = await aiosqlite.connect(DB_FILE)
     db.row_factory = aiosqlite.Row  # type: ignore[attr-defined]
@@ -91,26 +96,32 @@ async def init_db():
     await db.execute("PRAGMA synchronous=NORMAL;")
     await db.execute("PRAGMA foreign_keys=ON;")
     await db.commit()
-    await db.execute("""CREATE TABLE IF NOT EXISTS users (
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
         income REAL DEFAULT 0,
         notifications BOOLEAN DEFAULT 1
-    )""")
-    await db.execute("""CREATE TABLE IF NOT EXISTS expenses (
+    )"""
+    )
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS expenses (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
         amount REAL,
         category TEXT,
         timestamp TEXT,
         recurring_id INTEGER DEFAULT NULL
-    )""")
-    await db.execute("""CREATE TABLE IF NOT EXISTS recurring (
+    )"""
+    )
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS recurring (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
         amount REAL,
         category TEXT,
         day INTEGER
-    )""")
+    )"""
+    )
     await db.execute("CREATE INDEX IF NOT EXISTS idx_expenses_user_timestamp ON expenses(user_id, timestamp)")
     await db.execute("CREATE INDEX IF NOT EXISTS idx_recurring_day ON recurring(day)")
     await db.commit()
@@ -179,13 +190,13 @@ async def add_expense(uid, amount, category, ts=None, rec_id=None):
     ts = ts or datetime.utcnow().isoformat()
     await db_execute(
         "INSERT INTO expenses (user_id, amount, category, timestamp, recurring_id) VALUES (?, ?, ?, ?, ?)",
-        (uid, amount, category, ts, rec_id)
+        (uid, amount, category, ts, rec_id),
     )
 
 async def get_expenses(uid, limit=10):
     rows = await db_fetchall(
         "SELECT id, amount, category, timestamp FROM expenses WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?",
-        (uid, limit)
+        (uid, limit),
     )
     return rows
 
@@ -204,12 +215,12 @@ async def check_limits(uid, category, amount):
     month_end = month_end_dt.isoformat()
     r_total = await db_fetchone(
         "SELECT SUM(amount) as total FROM expenses WHERE user_id = ? AND timestamp BETWEEN ? AND ?",
-        (uid, month_start, month_end)
+        (uid, month_start, month_end),
     )
     total_spent = r_total["total"] if r_total and r_total["total"] is not None else 0
     r_cat = await db_fetchone(
         "SELECT SUM(amount) as total FROM expenses WHERE user_id = ? AND category = ? AND timestamp BETWEEN ? AND ?",
-        (uid, category, month_start, month_end)
+        (uid, category, month_start, month_end),
     )
     cat_spent = r_cat["total"] if r_cat and r_cat["total"] is not None else 0
     msgs = []
@@ -231,7 +242,7 @@ async def format_stats(uid: int) -> str:
     month_end = month_end_dt.isoformat()
     rows = await db_fetchall(
         "SELECT category, SUM(amount) as total FROM expenses WHERE user_id = ? AND timestamp BETWEEN ? AND ? GROUP BY category",
-        (uid, month_start, month_end)
+        (uid, month_start, month_end),
     )
     spent = {r["category"]: r["total"] for r in rows}
     text = f"💰 Ваш доход: {format_amount(income)} ₽\n\n"
@@ -320,10 +331,7 @@ def get_main_keyboard():
     return kb
 
 def build_limits_table_html(income: float) -> str:
-    """
-    Build a human-friendly HTML text for limits.
-    NOTE: do NOT use <pre> / <code> to avoid Telegram's 'Copy' UI affordance.
-    """
+    """Build a human-friendly HTML text for limits."""
     limits = get_limits_from_income(income)
     lines = []
     lines.append(f"<b>Доход:</b> {format_amount(income)} ₽")
@@ -337,15 +345,14 @@ def build_limits_table_html(income: float) -> str:
             pct_str = f"{int(pct*100)}%"
             lines.append(f"• {cat}: {pct_str} — {format_amount(sum_rub)} ₽")
         lines.append("")
-    return "
-".join(lines)
+    return "\n".join(lines)
 
 # ---------------- small util to normalize user-visible text (robust to VS16 etc) ----------------
 def _norm_text(s: str) -> str:
     if not s:
         return ""
     # remove variation selectors and zero-width spaces, trim
-    s = re.sub(r"[︎️​]", "", s)
+    s = re.sub(r"[\uFE0E\uFE0F\u200B]", "", s)
     return s.strip()
 
 # ---------------- Handlers (registered to dp) ----------------
@@ -445,8 +452,10 @@ async def generic_text_handler(msg: types.Message):
                 await db_execute("INSERT INTO recurring (user_id, amount, category, day) VALUES (?, ?, ?, ?)",
                                  (uid, data["amount"], data["category"], day))
                 # fetch newly created recurring id
-                r = await db_fetchone("SELECT id FROM recurring WHERE user_id = ? AND amount = ? AND category = ? AND day = ? ORDER BY id DESC LIMIT 1",
-                                      (uid, data["amount"], data["category"], day))
+                r = await db_fetchone(
+                    "SELECT id FROM recurring WHERE user_id = ? AND amount = ? AND category = ? AND day = ? ORDER BY id DESC LIMIT 1",
+                    (uid, data["amount"], data["category"], day),
+                )
                 rec_id = r["id"] if r else None
                 # calculate target day for current month (clamp to last day)
                 now = datetime.utcnow()
@@ -591,12 +600,13 @@ async def stats(msg: types.Message):
 
 @dp.message_handler(lambda m: m.text == "ℹ️ Помощь")
 async def help_cmd(msg: types.Message):
-    await bot.send_message(msg.chat.id,
+    text = (
         "/reportweek — отчёт за неделю\n"
         "/reportmonth — отчёт за месяц\n"
         "/add_recurring — добавить регулярный расход\n"
         "/help — краткая справка\n"
     )
+    await bot.send_message(msg.chat.id, text)
 
 # Short handlers for compact commands (слитно)
 @dp.message_handler(commands=['reportweek', 'reportmonth'])
@@ -609,8 +619,10 @@ async def report_compact(msg: types.Message):
 
     now = datetime.utcnow()
     start = now - timedelta(days=7) if args == 'week' else now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    rows = await db_fetchall("SELECT category, SUM(amount) as total FROM expenses WHERE user_id = ? AND timestamp >= ? GROUP BY category",
-                   (msg.from_user.id, start.isoformat()))
+    rows = await db_fetchall(
+        "SELECT category, SUM(amount) as total FROM expenses WHERE user_id = ? AND timestamp >= ? GROUP BY category",
+        (msg.from_user.id, start.isoformat()),
+    )
     if not rows:
         await bot.send_message(msg.chat.id, "Нет данных за выбранный период.")
         return
@@ -659,8 +671,10 @@ async def report_cmd(msg: types.Message):
         return
     now = datetime.utcnow()
     start = now - timedelta(days=7) if args == 'week' else now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    rows = await db_fetchall("SELECT category, SUM(amount) as total FROM expenses WHERE user_id = ? AND timestamp >= ? GROUP BY category",
-                   (msg.from_user.id, start.isoformat()))
+    rows = await db_fetchall(
+        "SELECT category, SUM(amount) as total FROM expenses WHERE user_id = ? AND timestamp >= ? GROUP BY category",
+        (msg.from_user.id, start.isoformat()),
+    )
     if not rows:
         await bot.send_message(msg.chat.id, "Нет данных за выбранный период.")
         return
