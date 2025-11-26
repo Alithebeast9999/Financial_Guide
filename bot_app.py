@@ -5,56 +5,42 @@ import asyncio
 from datetime import datetime, timedelta
 import pytz
 from typing import Dict, Any, Optional
-
 import aiosqlite
-
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-
 from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.dispatcher import FSMContext
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-
 logger = logging.getLogger(__name__)
-
 # Config
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN not set")
-
-TZ = pytz.timezone("Europe/Moscow")  # used for display; DB stores UTC timestamps
-
+TZ = pytz.timezone("Europe/Moscow") # used for display; DB stores UTC timestamps
 # ---------------- Bot / Dispatcher ---------------
 bot = Bot(token=BOT_TOKEN, timeout=30, parse_mode=types.ParseMode.HTML)
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
-
 # ---------------- DB (aiosqlite) --------------------
 DB_FILE = "bot.db"
 db: Optional[aiosqlite.Connection] = None
-
 # db_lock for async coordination
 db_lock: Optional[asyncio.Lock] = None
-
 # ---------------- Pending actions (conversation shim, PENDING) --------------
 pending_actions: Dict[int, Dict[str, Any]] = {}
 pending_lock = asyncio.Lock()
-
 async def set_pending(uid: int, action_type: str, data: Optional[Dict[str, Any]] = None):
     async with pending_lock:
         pending_actions[uid] = {"type": action_type, "data": data or {}}
         logger.info("PENDING: set for %s -> %s", uid, action_type)
-
 async def pop_pending(uid: int) -> Optional[Dict[str, Any]]:
     async with pending_lock:
         return pending_actions.pop(uid, None)
-
 async def get_pending(uid: int) -> Optional[Dict[str, Any]]:
     async with pending_lock:
         return pending_actions.get(uid)
-
 # ---------------- Categories & states -------------
 CATEGORIES = {
     "НАДО": {"Аренда жилья": 0.35, "Продуктовая корзина": 0.15, "Комм. услуги": 0.05, "Связь": 0.03, "Транспорт": 0.05, "Личный уход": 0.02, "Медицина": 0.08},
@@ -63,19 +49,15 @@ CATEGORIES = {
 }
 ALL_CATEGORIES = [c for g in CATEGORIES.values() for c in g]
 MAIN_BUTTONS = {"➕ Добавить трату", "📜 История", "📊 Моя статистика", "ℹ️ Помощь"}
-
 class IncomeState(StatesGroup):
     income = State()
-
 class ExpenseState(StatesGroup):
     amount = State()
     category = State()
-
 class RecurringState(StatesGroup):
     amount = State()
     category = State()
     day = State()
-
 # ---------------- Helpers & DB access (aiosqlite) ------------
 async def init_db():
     """
@@ -84,7 +66,7 @@ async def init_db():
     """
     global db
     db = await aiosqlite.connect(DB_FILE)
-    db.row_factory = aiosqlite.Row  # type: ignore[attr-defined]
+    db.row_factory = aiosqlite.Row # type: ignore[attr-defined]
     await db.execute("PRAGMA journal_mode=WAL;")
     await db.execute("PRAGMA synchronous=NORMAL;")
     await db.execute("PRAGMA foreign_keys=ON;")
@@ -112,7 +94,6 @@ async def init_db():
     await db.execute("CREATE INDEX IF NOT EXISTS idx_expenses_user_timestamp ON expenses(user_id, timestamp)")
     await db.execute("CREATE INDEX IF NOT EXISTS idx_recurring_day ON recurring(day)")
     await db.commit()
-
 async def close_db():
     global db
     try:
@@ -123,15 +104,13 @@ async def close_db():
         logger.exception("Error while closing DB")
     finally:
         db = None
-
 async def db_execute(query: str, params: tuple = ()):
     if db is None:
         raise RuntimeError("DB not initialized")
     async with (db_lock if db_lock is not None else asyncio.Lock()):
         await db.execute(query, params)
         await db.commit()
-
-async def db_fetchone(query: str, params: tuple = ()): 
+async def db_fetchone(query: str, params: tuple = ()):
     if db is None:
         raise RuntimeError("DB not initialized")
     async with (db_lock if db_lock is not None else asyncio.Lock()):
@@ -139,8 +118,7 @@ async def db_fetchone(query: str, params: tuple = ()):
         row = await cur.fetchone()
         await cur.close()
         return row
-
-async def db_fetchall(query: str, params: tuple = ()): 
+async def db_fetchall(query: str, params: tuple = ()):
     if db is None:
         raise RuntimeError("DB not initialized")
     async with (db_lock if db_lock is not None else asyncio.Lock()):
@@ -148,48 +126,39 @@ async def db_fetchall(query: str, params: tuple = ()):
         rows = await cur.fetchall()
         await cur.close()
         return rows
-
 # ---------------- DB-backed helpers ------------
 async def ensure_user(uid: int):
     global db_lock
     if db_lock is None:
         db_lock = asyncio.Lock()
     await db_execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (uid,))
-
 async def get_income(uid: int) -> float:
     r = await db_fetchone("SELECT income FROM users WHERE user_id = ?", (uid,))
     return float(r["income"]) if r and r["income"] is not None else 0.0
-
 async def set_income(uid: int, v: float):
     await db_execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (uid,))
     await db_execute("UPDATE users SET income = ? WHERE user_id = ?", (v, uid))
-
 def format_amount(x):
     try:
         return f"{x:,.0f}".replace(",", " ")
     except Exception:
         return str(x)
-
 def get_limits_from_income(income: float):
     return {cat: income * pct for group in CATEGORIES.values() for cat, pct in group.items()}
-
 async def add_expense(uid, amount, category, ts=None, rec_id=None):
     ts = ts or datetime.utcnow().isoformat()
     await db_execute(
         "INSERT INTO expenses (user_id, amount, category, timestamp, recurring_id) VALUES (?, ?, ?, ?, ?)",
         (uid, amount, category, ts, rec_id)
     )
-
 async def get_expenses(uid, limit=10):
     rows = await db_fetchall(
         "SELECT id, amount, category, timestamp FROM expenses WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?",
         (uid, limit)
     )
     return rows
-
 async def delete_expense(eid):
     await db_execute("DELETE FROM expenses WHERE id = ?", (eid,))
-
 async def check_limits(uid, category, amount):
     limits = get_limits_from_income(await get_income(uid))
     if category not in limits:
@@ -218,34 +187,40 @@ async def check_limits(uid, category, amount):
     elif cat_spent + amount > 0.9 * limits[category]:
         msgs.append(f"⚠️ Ты израсходовал более 90% лимита по '{category}'!")
     return msgs
-
-async def format_stats(uid: int) -> str:
+async def format_stats(uid: int, period: str = 'month') -> str:
     income = await get_income(uid)
     limits = get_limits_from_income(income)
     now_utc = datetime.utcnow()
-    month_start_dt = now_utc.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    month_start = month_start_dt.isoformat()
-    month_end_dt = (month_start_dt + timedelta(days=35)).replace(day=1) - timedelta(seconds=1)
-    month_end = month_end_dt.isoformat()
+    if period == 'month':
+        start_dt = now_utc.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        end_dt = (start_dt + timedelta(days=35)).replace(day=1) - timedelta(seconds=1)
+        title = "Моя статистика (месяц)"
+    elif period == 'week':
+        start_dt = now_utc - timedelta(days=now_utc.weekday())
+        start_dt = start_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_dt = start_dt + timedelta(days=6, hours=23, minutes=59, seconds=59)
+        title = "Моя статистика (неделя)"
+    else:
+        raise ValueError("Invalid period")
+    start = start_dt.isoformat()
+    end = end_dt.isoformat()
     rows = await db_fetchall(
         "SELECT category, SUM(amount) as total FROM expenses WHERE user_id = ? AND timestamp BETWEEN ? AND ? GROUP BY category",
-        (uid, month_start, month_end)
+        (uid, start, end)
     )
-    spent = {r["category"]: r["total"] for r in rows}
-    text = f"💰 Ваш доход: {format_amount(income)} ₽\n\n"
+    spent = {r["category"]: r["total"] for r in rows if r["total"] is not None}
+    text = f"💰 {title}\nВаш доход: {format_amount(income)} ₽\n\n"
     for group, cats in CATEGORIES.items():
         text += f"📂 {group}\n"
         for cat, pct in cats.items():
             lim = limits.get(cat, 0)
-            s = spent.get(cat, 0) or 0
+            s = spent.get(cat, 0)
             perc = (s / lim * 100) if lim else 0
-            text += f"• {cat}: {s:,.0f} ₽ / {lim:,.0f} ₽ ({perc:.0f}%)\n"
+            text += f"• {cat}: {format_amount(s)} ₽ / {format_amount(lim)} ₽ ({perc:.0f}%)\n"
         text += "\n"
     return text
-
 # ---------------- Scheduler ----------------
 scheduler = AsyncIOScheduler(timezone=TZ)
-
 async def daily_reminders():
     rows = await db_fetchall("SELECT user_id FROM users WHERE notifications = 1")
     uids = [r["user_id"] for r in rows]
@@ -257,20 +232,18 @@ async def daily_reminders():
     tasks = [asyncio.create_task(_send(uid)) for uid in uids]
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
-
 async def weekly_report():
     rows = await db_fetchall("SELECT user_id FROM users")
     uids = [r["user_id"] for r in rows]
     async def _send(uid):
         try:
-            text = "📊 Еженедельный отчёт:\n\n" + await format_stats(uid)
+            text = "📊 Еженедельный отчёт:\n\n" + await format_stats(uid, 'week')
             await bot.send_message(uid, text)
         except Exception as e:
             logger.debug("Failed to send weekly report to %s: %s", uid, e)
     tasks = [asyncio.create_task(_send(uid)) for uid in uids]
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
-
 async def process_recurring():
     today = datetime.utcnow().day
     rows = await db_fetchall("SELECT id, user_id, amount, category FROM recurring WHERE day = ?", (today,))
@@ -282,7 +255,7 @@ async def process_recurring():
             cat = r["category"]
             await add_expense(uid, amt, cat, rec_id=rec_id)
             try:
-                await bot.send_message(uid, f"🔁 Добавлен регулярный расход: {amt:,.0f} ₽ — {cat}")
+                await bot.send_message(uid, f"🔁 Добавлен регулярный расход: {format_amount(amt)} ₽ — {cat}")
             except Exception:
                 logger.debug("Failed to notify user %s about recurring expense", uid)
         except Exception as e:
@@ -290,7 +263,6 @@ async def process_recurring():
     tasks = [asyncio.create_task(_handle_row(r)) for r in rows]
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
-
 def _add_scheduler_jobs_once():
     try:
         if not scheduler.get_job("daily_reminders"):
@@ -301,14 +273,12 @@ def _add_scheduler_jobs_once():
             scheduler.add_job(process_recurring, CronTrigger(hour=6, minute=0), id="process_recurring")
     except Exception:
         logger.exception("Failed to add scheduler jobs")
-
 # ---------------- UI helpers ----------------
 def get_main_keyboard():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.add("➕ Добавить трату", "📜 История")
     kb.add("📊 Моя статистика", "ℹ️ Помощь")
     return kb
-
 def build_limits_table_html(income: float) -> str:
     """
     Build a human-friendly HTML text for limits.
@@ -328,9 +298,7 @@ def build_limits_table_html(income: float) -> str:
             lines.append(f"• {cat}: {pct_str} — {format_amount(sum_rub)} ₽")
         lines.append("")
     return "\n".join(lines)
-
 # ---------------- Handlers (registered to dp) ----------------
-
 @dp.message_handler(commands=['start'])
 async def start(msg: types.Message):
     uid = msg.from_user.id
@@ -343,7 +311,6 @@ async def start(msg: types.Message):
         "После ввода дохода я рассчитую рекомендованные лимиты по категориям и покажу подсказки по кнопкам внизу."
     )
     kb = get_main_keyboard()
-
     # PENDING: set conversation shim to expect income input
     await set_pending(uid, "income")
     # Attempt to set FSM state as well (best-effort)
@@ -351,29 +318,15 @@ async def start(msg: types.Message):
         await IncomeState.income.set()
     except Exception:
         logger.debug("start: IncomeState.income.set() failed (ignored)")
-
     # send without quoting the user (use bot.send_message)
     await bot.send_message(msg.chat.id, welcome, reply_markup=kb)
-
-@dp.message_handler(commands=['cancel'], state="*")
-async def cmd_cancel(msg: types.Message, state: FSMContext):
-    # clear pending if present
-    await pop_pending(msg.from_user.id)
-    cur = await state.get_state()
-    if cur is None:
-        await bot.send_message(msg.chat.id, "Нечего отменять.")
-        return
-    await state.finish()
-    await bot.send_message(msg.chat.id, "Действие отменено. Можешь использовать кнопки ниже.", reply_markup=get_main_keyboard())
-
 # --- Generic text handler that first looks at pending_actions (PENDING) ---
 @dp.message_handler(content_types=['text'])
 async def generic_text_handler(msg: types.Message):
     uid = msg.from_user.id
     text = (msg.text or "").strip()
     if text.startswith("/"):
-        return  # let command handlers process
-
+        return # let command handlers process
     pending = await get_pending(uid)
     if pending:
         ptype = pending.get("type")
@@ -394,7 +347,7 @@ async def generic_text_handler(msg: types.Message):
                 )
                 await bot.send_message(uid, table_html + "\n\n" + buttons_expl, parse_mode=types.ParseMode.HTML, reply_markup=get_main_keyboard())
             except Exception:
-                await bot.send_message(uid, "❌ Неверный формат дохода. Введите число, например: 50 000 (или нажмите /cancel).")
+                await bot.send_message(uid, "❌ Неверный формат дохода. Введите число, например: 50 000.")
             return
         elif ptype == "expense_amount":
             try:
@@ -408,7 +361,7 @@ async def generic_text_handler(msg: types.Message):
                     kb.insert(InlineKeyboardButton(cat, callback_data=f"cat_{cat}"))
                 await bot.send_message(uid, "Выбери категорию:", reply_markup=kb)
             except Exception:
-                await bot.send_message(uid, "❌ Неверная сумма. Введите число, например: 450. Или нажмите /cancel, чтобы отменить.")
+                await bot.send_message(uid, "❌ Неверная сумма. Введите число, например: 450.")
             return
         elif ptype == "recurring_amount":
             try:
@@ -422,27 +375,30 @@ async def generic_text_handler(msg: types.Message):
                     kb.insert(InlineKeyboardButton(cat, callback_data=f"rec_{cat}"))
                 await bot.send_message(uid, "Выбери категорию:", reply_markup=kb)
             except Exception:
-                await bot.send_message(uid, "❌ Неверная сумма. Введите число или /cancel.")
+                await bot.send_message(uid, "❌ Неверная сумма. Введите число.")
             return
         elif ptype == "recurring_day":
             try:
                 day = int(text)
-                if not (1 <= day <= 28):
+                if not (1 <= day <= 31):
                     raise ValueError
                 data = pdata
                 await db_execute("INSERT INTO recurring (user_id, amount, category, day) VALUES (?, ?, ?, ?)",
                                  (uid, data["amount"], data["category"], day))
                 await pop_pending(uid)
+                today = datetime.utcnow().day
+                if day == today:
+                    await add_expense(uid, data["amount"], data["category"], rec_id=await db.lastrowid)
+                    await bot.send_message(uid, f"🔁 Регулярный расход добавлен сразу за сегодня: {format_amount(data['amount'])} ₽ — {data['category']}")
                 await bot.send_message(uid, f"🔁 Регулярный расход сохранён: {format_amount(data['amount'])} ₽ — {data['category']} (каждое {day}-е число)")
             except Exception:
-                await bot.send_message(uid, "❌ Укажи число от 1 до 28 или /cancel")
+                await bot.send_message(uid, "❌ Укажи число от 1 до 31")
             return
         else:
             await pop_pending(uid)
             logger.warning("PENDING: unknown type %s for user %s - cleared", ptype, uid)
             await bot.send_message(uid, "Произошла ошибка, пожалуйста повторите действие.")
             return
-
     # If no pending action, handle main keyboard texts
     if text == "➕ Добавить трату":
         await set_pending(uid, "expense_amount")
@@ -450,7 +406,7 @@ async def generic_text_handler(msg: types.Message):
             await ExpenseState.amount.set()
         except Exception:
             logger.debug("ExpenseState.amount.set() failed (ignored)")
-        await bot.send_message(uid, "💸 Введи сумму траты (например: 450): (или /cancel чтобы отменить)")
+        await bot.send_message(uid, "💸 Введи сумму траты (например: 450):")
         return
     if text == "📜 История":
         await history(msg)
@@ -461,9 +417,7 @@ async def generic_text_handler(msg: types.Message):
     if text == "ℹ️ Помощь":
         await help_cmd(msg)
         return
-
     await bot.send_message(uid, "Не понял. Используйте кнопки или /start, /help.")
-
 # ---------------- Callback handlers (no strict FSM dependency) ----------------
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('cat_'))
 async def expense_category(cb: types.CallbackQuery):
@@ -476,7 +430,7 @@ async def expense_category(cb: types.CallbackQuery):
         if amount is None:
             await cb.answer("Сначала укажите сумму траты.")
             try:
-                await cb.message.edit_text("💸 Введи сумму траты (например: 450): (или /cancel чтобы отменить)")
+                await cb.message.edit_text("💸 Введи сумму траты (например: 450):")
             except Exception:
                 pass
             async with pending_lock:
@@ -495,12 +449,11 @@ async def expense_category(cb: types.CallbackQuery):
     else:
         await cb.answer("Сначала укажите сумму траты.")
         try:
-            await cb.message.edit_text("💸 Введи сумму траты (например: 450): (или /cancel чтобы отменить)")
+            await cb.message.edit_text("💸 Введи сумму траты (например: 450):")
         except Exception:
             pass
         await set_pending(uid, "expense_amount")
         return
-
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('rec_'))
 async def recurring_category(cb: types.CallbackQuery):
     cat = cb.data[4:]
@@ -512,7 +465,7 @@ async def recurring_category(cb: types.CallbackQuery):
         if amount is None:
             await cb.answer("Сначала укажите сумму регулярного расхода.")
             try:
-                await cb.message.edit_text("Введи сумму регулярного расхода (или /cancel):")
+                await cb.message.edit_text("Введи сумму регулярного расхода:")
             except Exception:
                 pass
             async with pending_lock:
@@ -521,20 +474,19 @@ async def recurring_category(cb: types.CallbackQuery):
         async with pending_lock:
             pending_actions[uid] = {"type": "recurring_day", "data": {"amount": amount, "category": cat}}
         try:
-            await cb.message.edit_text("Укажи день месяца (1–28):")
+            await cb.message.edit_text("Укажи день месяца (1–31):")
         except Exception:
-            await bot.send_message(uid, "Укажи день месяца (1–28):")
+            await bot.send_message(uid, "Укажи день месяца (1–31):")
         return
     else:
         await cb.answer("Сначала укажите сумму регулярного расхода.")
         try:
-            await cb.message.edit_text("Введи сумму регулярного расхода (или /cancel):")
+            await cb.message.edit_text("Введи сумму регулярного расхода:")
         except Exception:
             pass
         await set_pending(uid, "recurring_amount")
         return
-
-# ---------------- Other handlers unchanged (history, delete, stats, help, notify, add_recurring, report) ----------------
+# ---------------- Other handlers unchanged (history, delete, stats, help, add_recurring, report) ----------------
 @dp.message_handler(lambda m: m.text == "📜 История")
 async def history(msg: types.Message):
     exps = await get_expenses(msg.from_user.id)
@@ -548,8 +500,7 @@ async def history(msg: types.Message):
         except Exception:
             dt = ts
         kb = InlineKeyboardMarkup().add(InlineKeyboardButton("❌ Удалить", callback_data=f"del_{e['id']}"))
-        await bot.send_message(msg.chat.id, f"{dt} | {e['amount']:,.0f} ₽ | {e['category']}", reply_markup=kb)
-
+        await bot.send_message(msg.chat.id, f"{dt} | {format_amount(e['amount'])} ₽ | {e['category']}", reply_markup=kb)
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('del_'))
 async def delete_expense_cb(cb: types.CallbackQuery):
     eid = int(cb.data[4:])
@@ -559,31 +510,17 @@ async def delete_expense_cb(cb: types.CallbackQuery):
         await cb.message.delete()
     except Exception:
         pass
-
 @dp.message_handler(lambda m: m.text == "📊 Моя статистика")
 async def stats(msg: types.Message):
     text = await format_stats(msg.from_user.id)
     await bot.send_message(msg.chat.id, text)
-
 @dp.message_handler(lambda m: m.text == "ℹ️ Помощь")
 async def help_cmd(msg: types.Message):
     await bot.send_message(msg.chat.id,
-        "/report week — отчёт за неделю\n"
-        "/report month — отчёт за месяц\n"
-        "/add_recurring — добавить регулярный расход\n"
-        "/notify — включить/выключить уведомления\n"
-        "/cancel — отменить текущее действие"
+        "/reportweek — отчёт за неделю\n"
+        "/reportmonth — отчёт за месяц\n"
+        "/add_recurring — добавить регулярный расход"
     )
-
-@dp.message_handler(commands=['notify'])
-async def toggle_notify(msg: types.Message):
-    uid = msg.from_user.id
-    r = await db_fetchone("SELECT notifications FROM users WHERE user_id = ?", (uid,))
-    current = bool(r['notifications']) if r else True
-    new_val = 0 if current else 1
-    await db_execute("UPDATE users SET notifications = ? WHERE user_id = ?", (new_val, uid))
-    await bot.send_message(msg.chat.id, "🔔 Уведомления включены" if new_val else "🔕 Уведомления отключены")
-
 @dp.message_handler(commands=['add_recurring'])
 async def add_recurring(msg: types.Message):
     uid = msg.from_user.id
@@ -592,8 +529,7 @@ async def add_recurring(msg: types.Message):
         await RecurringState.amount.set()
     except Exception:
         logger.debug("RecurringState.amount.set() failed (ignored)")
-    await bot.send_message(msg.chat.id, "Введи сумму регулярного расхода (или /cancel):")
-
+    await bot.send_message(msg.chat.id, "Введи сумму регулярного расхода:")
 @dp.message_handler(state=RecurringState.amount)
 async def recurring_amount(msg: types.Message, state: FSMContext):
     text = msg.text or ""
@@ -609,51 +545,34 @@ async def recurring_amount(msg: types.Message, state: FSMContext):
         except Exception:
             logger.debug("RecurringState.category.set() failed (ignored)")
     except Exception:
-        await bot.send_message(msg.chat.id, "❌ Неверная сумма. Введите число или /cancel.")
-
+        await bot.send_message(msg.chat.id, "❌ Неверная сумма. Введите число.")
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('rec_'), state='*')
 async def recurring_category_fallback(cb: types.CallbackQuery):
     await recurring_category(cb)
-
-@dp.message_handler(commands=['report'])
-async def report_cmd(msg: types.Message):
-    args = msg.get_args().strip().lower()
-    if args not in ('week', 'month'):
-        await bot.send_message(msg.chat.id, "Используй: /report week или /report month")
-        return
-    now = datetime.utcnow()
-    start = now - timedelta(days=7) if args == 'week' else now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    rows = await db_fetchall("SELECT category, SUM(amount) as total FROM expenses WHERE user_id = ? AND timestamp >= ? GROUP BY category",
-                   (msg.from_user.id, start.isoformat()))
-    if not rows:
-        await bot.send_message(msg.chat.id, "Нет данных за выбранный период.")
-        return
-    text = f"📊 Отчёт за {'неделю' if args == 'week' else 'месяц'}:\n\n"
-    for r in rows:
-        total = r["total"] if r and r["total"] is not None else 0
-        text += f"{r['category']}: {total:,.0f} ₽\n"
+@dp.message_handler(commands=['reportweek'])
+async def report_week(msg: types.Message):
+    text = await format_stats(msg.from_user.id, 'week')
     await bot.send_message(msg.chat.id, text)
-
+@dp.message_handler(commands=['reportmonth'])
+async def report_month(msg: types.Message):
+    text = await format_stats(msg.from_user.id, 'month')
+    await bot.send_message(msg.chat.id, text)
 # ---------------- Init helper to be called from main.py on startup ------------
 async def init_app_for_runtime(app):
     global db_lock
     if db_lock is None:
         db_lock = asyncio.Lock()
-
     await init_db()
-
     _add_scheduler_jobs_once()
     try:
         scheduler.start()
         logger.info("Scheduler started (bot_app)")
     except Exception:
         logger.exception("Failed to start scheduler (bot_app)")
-
     try:
         sess = await bot.get_session()
         app['bot_session'] = sess
     except Exception:
         logger.debug("bot.get_session() failed during bot_app init (may be fine)")
-
 # Exported names for main.py convenience
 __all__ = ("bot", "dp", "scheduler", "init_app_for_runtime", "get_main_keyboard", "format_stats", "close_db")
