@@ -293,54 +293,18 @@ def build_limits_table_html(income: float) -> str:
 @dp.message_handler(commands=['start'])
 async def start(msg: types.Message):
     uid = msg.from_user.id
-    # ensure user exists
     await ensure_user(uid)
-
-    try:
-        income = await get_income(uid)
-    except Exception:
-        income = 0.0
-
+    welcome = (
+        "<b>Привет! Я — твой финансовый помощник.</b>\n\n"
+        "Я помогу тебе отслеживать расходы, планировать бюджет, "
+        "настраивать регулярные платежи и вовремя предупреждать о превышениях лимитов.\n\n"
+        "Чтобы начать — введите ваш ежемесячный доход (например: <b>50 000</b>)\n\n"
+        "После ввода дохода я рассчитую рекомендованные лимиты по категориям и покажу подсказки по кнопкам внизу."
+    )
     kb = get_main_keyboard()
-
-    if income and income > 0:
-        table_html = build_limits_table_html(income)
-        welcome_html = ("<b>С возвращением! Я помню ваш профиль.</b>
-
-"
-                        "Ниже — ваши текущие рекомендованные лимиты и быстрые кнопки.")
-        full_msg = welcome_html + "
-
-" + table_html
-        try:
-            await msg.reply(full_msg, reply_markup=kb, parse_mode=ParseMode.HTML)
-        except Exception:
-            await msg.reply("С возвращением! Вот ваши лимиты.", reply_markup=kb)
-        # clear any leftover FSM state for this chat/user
-        try:
-            await dp.current_state(chat=msg.chat.id, user=uid).finish()
-        except Exception:
-            pass
-        return
-
-    # new user flow
-    welcome_html = ("<b>Привет! Я — твой финансовый помощник.</b>
-
-"
-                    "Я помогу тебе отслеживать расходы, планировать бюджет, "
-                    "настраивать регулярные платежи и вовремя предупреждать о превышениях лимитов.
-
-"
-                    "Чтобы начать — введите ваш ежемесячный доход (например: <b>50 000</b>)
-
-"
-                    "После ввода дохода я рассчитую рекомендованные лимиты по категориям и покажу подсказки по кнопкам внизу.")
-    try:
-        await msg.reply(welcome_html, reply_markup=kb, parse_mode=ParseMode.HTML)
-    except Exception:
-        await msg.reply("Привет! Введите ваш ежемесячный доход (например: 50 000)", reply_markup=kb)
     await IncomeState.income.set()
-
+    # explicit HTML parse_mode
+    await msg.reply(welcome, reply_markup=kb, parse_mode=ParseMode.HTML)
 
 @dp.message_handler(commands=['cancel'], state="*")
 async def cmd_cancel(msg: types.Message, state: FSMContext):
