@@ -2,6 +2,7 @@
 import os
 import logging
 import asyncio
+import re
 from datetime import datetime, timedelta
 import pytz
 from typing import Dict, Any, Optional
@@ -124,14 +125,14 @@ async def close_db():
     finally:
         db = None
 
-async def db_execute(query: str, params: tuple = ()):
+async def db_execute(query: str, params: tuple = ()): 
     if db is None:
         raise RuntimeError("DB not initialized")
     async with (db_lock if db_lock is not None else asyncio.Lock()):
         await db.execute(query, params)
         await db.commit()
 
-async def db_fetchone(query: str, params: tuple = ()):
+async def db_fetchone(query: str, params: tuple = ()): 
     if db is None:
         raise RuntimeError("DB not initialized")
     async with (db_lock if db_lock is not None else asyncio.Lock()):
@@ -140,7 +141,7 @@ async def db_fetchone(query: str, params: tuple = ()):
         await cur.close()
         return row
 
-async def db_fetchall(query: str, params: tuple = ()):
+async def db_fetchall(query: str, params: tuple = ()): 
     if db is None:
         raise RuntimeError("DB not initialized")
     async with (db_lock if db_lock is not None else asyncio.Lock()):
@@ -232,15 +233,20 @@ async def format_stats(uid: int) -> str:
         (uid, month_start, month_end)
     )
     spent = {r["category"]: r["total"] for r in rows}
-    text = f"💰 Ваш доход: {format_amount(income)} ₽\n\n"
+    text = f"💰 Ваш доход: {format_amount(income)} ₽
+
+"
     for group, cats in CATEGORIES.items():
-        text += f"📂 {group}\n"
+        text += f"📂 {group}
+"
         for cat, pct in cats.items():
             lim = limits.get(cat, 0)
             s = spent.get(cat, 0) or 0
             perc = (s / lim * 100) if lim else 0
-            text += f"• {cat}: {s:,.0f} ₽ / {lim:,.0f} ₽ ({perc:.0f}%)\n"
-        text += "\n"
+            text += f"• {cat}: {s:,.0f} ₽ / {lim:,.0f} ₽ ({perc:.0f}%)
+"
+        text += "
+"
     return text
 
 # ---------------- Scheduler ----------------
@@ -263,7 +269,9 @@ async def weekly_report():
     uids = [r["user_id"] for r in rows]
     async def _send(uid):
         try:
-            text = "📊 Еженедельный отчёт:\n\n" + await format_stats(uid)
+            text = "📊 Еженедельный отчёт:
+
+" + await format_stats(uid)
             await bot.send_message(uid, text)
         except Exception as e:
             logger.debug("Failed to send weekly report to %s: %s", uid, e)
@@ -327,7 +335,16 @@ def build_limits_table_html(income: float) -> str:
             pct_str = f"{int(pct*100)}%"
             lines.append(f"• {cat}: {pct_str} — {format_amount(sum_rub)} ₽")
         lines.append("")
-    return "\n".join(lines)
+    return "
+".join(lines)
+
+# ---------------- small util to normalize user-visible text (robust to VS16 etc) ----------------
+def _norm_text(s: str) -> str:
+    if not s:
+        return ""
+    # remove variation selectors and zero-width spaces, trim
+    s = re.sub(r"[︎️​]", "", s)
+    return s.strip()
 
 # ---------------- Handlers (registered to dp) ----------------
 
@@ -336,10 +353,16 @@ async def start(msg: types.Message):
     uid = msg.from_user.id
     await ensure_user(uid)
     welcome = (
-        "<b>Привет! Я — твой финансовый помощник.</b>\n\n"
+        "<b>Привет! Я — твой финансовый помощник.</b>
+
+"
         "Я помогу тебе отслеживать расходы, планировать бюджет, "
-        "настраивать регулярные платежи и вовремя предупреждать о превышениях лимитов.\n\n"
-        "Чтобы начать — введите ваш ежемесячный доход (например: <b>50 000</b>)\n\n"
+        "настраивать регулярные платежи и вовремя предупреждать о превышениях лимитов.
+
+"
+        "Чтобы начать — введите ваш ежемесячный доход (например: <b>50 000</b>)
+
+"
         "После ввода дохода я рассчитую рекомендованные лимиты по категориям и покажу подсказки по кнопкам внизу."
     )
     kb = get_main_keyboard()
@@ -370,7 +393,8 @@ async def cmd_cancel(msg: types.Message, state: FSMContext):
 @dp.message_handler(content_types=['text'])
 async def generic_text_handler(msg: types.Message):
     uid = msg.from_user.id
-    text = (msg.text or "").strip()
+    raw = (msg.text or "")
+    text = raw.strip()
     if text.startswith("/"):
         return  # let command handlers process
 
@@ -386,13 +410,22 @@ async def generic_text_handler(msg: types.Message):
                 await pop_pending(uid)
                 table_html = build_limits_table_html(income)
                 buttons_expl = (
-                    "<b>Кнопки:</b>\n"
-                    "➕ <b>Добавить трату</b> — добавьте расход вручную: введите сумму и выберите категорию.\n\n"
-                    "📜 <b>История</b> — просмотр последних трат с категориями, временем и кнопкой удаления.\n\n"
-                    "📊 <b>Моя статистика</b> — текущие расходы по категориям и сравнение с лимитами.\n\n"
+                    "<b>Кнопки:</b>
+"
+                    "➕ <b>Добавить трату</b> — добавьте расход вручную: введите сумму и выберите категорию.
+
+"
+                    "📜 <b>История</b> — просмотр последних трат с категориями, временем и кнопкой удаления.
+
+"
+                    "📊 <b>Моя статистика</b> — текущие расходы по категориям и сравнение с лимитами.
+
+"
                     "ℹ️ <b>Помощь</b> — список доступных команд и быстрых подсказок."
                 )
-                await bot.send_message(uid, table_html + "\n\n" + buttons_expl, parse_mode=types.ParseMode.HTML, reply_markup=get_main_keyboard())
+                await bot.send_message(uid, table_html + "
+
+" + buttons_expl, parse_mode=types.ParseMode.HTML, reply_markup=get_main_keyboard())
             except Exception:
                 await bot.send_message(uid, "❌ Неверный формат дохода. Введите число, например: 50 000 (или нажмите /cancel).")
             return
@@ -444,7 +477,8 @@ async def generic_text_handler(msg: types.Message):
             return
 
     # If no pending action, handle main keyboard texts
-    if text == "➕ Добавить трату":
+    ntext = _norm_text(text)
+    if ntext == _norm_text("➕ Добавить трату"):
         await set_pending(uid, "expense_amount")
         try:
             await ExpenseState.amount.set()
@@ -452,13 +486,13 @@ async def generic_text_handler(msg: types.Message):
             logger.debug("ExpenseState.amount.set() failed (ignored)")
         await bot.send_message(uid, "💸 Введи сумму траты (например: 450): (или /cancel чтобы отменить)")
         return
-    if text == "📜 История":
+    if ntext == _norm_text("📜 История"):
         await history(msg)
         return
-    if text == "📊 Моя статистика":
+    if ntext == _norm_text("📊 Моя статистика"):
         await stats(msg)
         return
-    if text == "ℹ️ Помощь":
+    if "помощ" in ntext.lower() or ntext == _norm_text("ℹ️ Помощь"):
         await help_cmd(msg)
         return
 
@@ -490,7 +524,8 @@ async def expense_category(cb: types.CallbackQuery):
             await bot.send_message(uid, f"✅ Добавлено: {format_amount(amount)} ₽ — {cat}")
         warnings = await check_limits(uid, cat, amount)
         if warnings:
-            await bot.send_message(uid, "\n".join(warnings))
+            await bot.send_message(uid, "
+".join(warnings))
         return
     else:
         await cb.answer("Сначала укажите сумму траты.")
@@ -568,12 +603,41 @@ async def stats(msg: types.Message):
 @dp.message_handler(lambda m: m.text == "ℹ️ Помощь")
 async def help_cmd(msg: types.Message):
     await bot.send_message(msg.chat.id,
-        "/report week — отчёт за неделю\n"
-        "/report month — отчёт за месяц\n"
-        "/add_recurring — добавить регулярный расход\n"
-        "/notify — включить/выключить уведомления\n"
+        "/reportweek — отчёт за неделю
+"
+        "/reportmonth — отчёт за месяц
+"
+        "/add_recurring — добавить регулярный расход
+"
+        "/notify — включить/выключить уведомления
+"
         "/cancel — отменить текущее действие"
     )
+
+# Short handlers for compact commands (слитно)
+@dp.message_handler(commands=['reportweek', 'reportmonth'])
+async def report_compact(msg: types.Message):
+    cmd = (msg.text or '').lstrip('/').split('@')[0].lower()
+    if cmd == 'reportweek':
+        args = 'week'
+    else:
+        args = 'month'
+
+    now = datetime.utcnow()
+    start = now - timedelta(days=7) if args == 'week' else now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    rows = await db_fetchall("SELECT category, SUM(amount) as total FROM expenses WHERE user_id = ? AND timestamp >= ? GROUP BY category",
+                   (msg.from_user.id, start.isoformat()))
+    if not rows:
+        await bot.send_message(msg.chat.id, "Нет данных за выбранный период.")
+        return
+    text = f"📊 Отчёт за {'неделю' if args == 'week' else 'месяц'}:
+
+"
+    for r in rows:
+        total = r["total"] if r and r["total"] is not None else 0
+        text += f"{r['category']}: {total:,.0f} ₽
+"
+    await bot.send_message(msg.chat.id, text)
 
 @dp.message_handler(commands=['notify'])
 async def toggle_notify(msg: types.Message):
@@ -628,10 +692,13 @@ async def report_cmd(msg: types.Message):
     if not rows:
         await bot.send_message(msg.chat.id, "Нет данных за выбранный период.")
         return
-    text = f"📊 Отчёт за {'неделю' if args == 'week' else 'месяц'}:\n\n"
+    text = f"📊 Отчёт за {'неделю' if args == 'week' else 'месяц'}:
+
+"
     for r in rows:
         total = r["total"] if r and r["total"] is not None else 0
-        text += f"{r['category']}: {total:,.0f} ₽\n"
+        text += f"{r['category']}: {total:,.0f} ₽
+"
     await bot.send_message(msg.chat.id, text)
 
 # ---------------- Init helper to be called from main.py on startup ------------
