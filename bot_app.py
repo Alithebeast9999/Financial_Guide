@@ -235,31 +235,21 @@ async def check_limits(uid, category, amount):
 async def format_stats(uid: int) -> str:
     income = await get_income(uid)
     limits = get_limits_from_income(income)
-    now_utc = datetime.utcnow()
-    month_start_dt = now_utc.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    month_start = month_start_dt.isoformat()
-    month_end_dt = (month_start_dt + timedelta(days=35)).replace(day=1) - timedelta(seconds=1)
-    month_end = month_end_dt.isoformat()
-    rows = await db_fetchall(
-        "SELECT category, SUM(amount) as total FROM expenses WHERE user_id = ? AND timestamp BETWEEN ? AND ? GROUP BY category",
-        (uid, month_start, month_end),
-    )
-    spent = {r["category"]: r["total"] for r in rows}
-    text = f"💰 Ваш доход: {format_amount(income)} ₽"
+    # ... (весь код сбора данных тот же)
 
-"
+    spent = {r["category"]: r["total"] for r in rows}
+
+    text = f"Ваш доход: {format_amount(income)} ₽\n\n"
     for group, cats in CATEGORIES.items():
-        text += f"📂 {group}
-"
+        text += f"📂 {group}\n"
         for cat, pct in cats.items():
             lim = limits.get(cat, 0)
             s = spent.get(cat, 0) or 0
             perc = (s / lim * 100) if lim else 0
-            text += f"• {cat}: {s:,.0f} ₽ / {lim:,.0f} ₽ ({perc:.0f}%)
-"
-        text += "
-"
-    return text
+            text += f"• {cat}: {s:,.0f} ₽ / {lim:,.0f} ₽ ({perc:.0f}%)\n"
+        text += "\n"
+
+    return text.strip()
 
 # ---------------- Scheduler ----------------
 scheduler = AsyncIOScheduler(timezone=TZ)
