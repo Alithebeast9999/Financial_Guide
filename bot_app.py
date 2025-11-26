@@ -245,7 +245,7 @@ async def format_stats(uid: int) -> str:
         (uid, month_start, month_end),
     )
     spent = {r["category"]: r["total"] for r in rows}
-    text = f"💰 Ваш доход: {format_amount(income)} ₽
+    text = f"💰 Ваш доход: {format_amount(income)} ₽"
 
 "
     for group, cats in CATEGORIES.items():
