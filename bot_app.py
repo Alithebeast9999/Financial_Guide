@@ -1,3 +1,4 @@
+```python
 # bot_app.py
 import os
 import logging
@@ -104,12 +105,13 @@ async def close_db():
         logger.exception("Error while closing DB")
     finally:
         db = None
-async def db_execute(query: str, params: tuple = ()):
+async def db_execute(query: str, params: tuple = ()) -> Optional[int]:
     if db is None:
         raise RuntimeError("DB not initialized")
     async with (db_lock if db_lock is not None else asyncio.Lock()):
-        await db.execute(query, params)
+        cursor = await db.execute(query, params)
         await db.commit()
+        return cursor.lastrowid
 async def db_fetchone(query: str, params: tuple = ()):
     if db is None:
         raise RuntimeError("DB not initialized")
@@ -308,7 +310,7 @@ async def start(msg: types.Message):
         "Я помогу тебе отслеживать расходы, планировать бюджет, "
         "настраивать регулярные платежи и вовремя предупреждать о превышениях лимитов.\n\n"
         "Чтобы начать — введите ваш ежемесячный доход (например: <b>50 000</b>)\n\n"
-        "После ввода дохода я рассчитую рекомендованные лимиты по категориям и покажу подсказки по кнопкам внизу."
+        "После ввода дохода я рассчитаю рекомендованные лимиты по категориям и покажу подсказки по кнопкам внизу."
     )
     kb = get_main_keyboard()
     # PENDING: set conversation shim to expect income input
@@ -383,12 +385,12 @@ async def generic_text_handler(msg: types.Message):
                 if not (1 <= day <= 31):
                     raise ValueError
                 data = pdata
-                await db_execute("INSERT INTO recurring (user_id, amount, category, day) VALUES (?, ?, ?, ?)",
+                rec_id = await db_execute("INSERT INTO recurring (user_id, amount, category, day) VALUES (?, ?, ?, ?)",
                                  (uid, data["amount"], data["category"], day))
                 await pop_pending(uid)
                 today = datetime.utcnow().day
                 if day == today:
-                    await add_expense(uid, data["amount"], data["category"], rec_id=await db.lastrowid)
+                    await add_expense(uid, data["amount"], data["category"], rec_id=rec_id)
                     await bot.send_message(uid, f"🔁 Регулярный расход добавлен сразу за сегодня: {format_amount(data['amount'])} ₽ — {data['category']}")
                 await bot.send_message(uid, f"🔁 Регулярный расход сохранён: {format_amount(data['amount'])} ₽ — {data['category']} (каждое {day}-е число)")
             except Exception:
@@ -576,3 +578,4 @@ async def init_app_for_runtime(app):
         logger.debug("bot.get_session() failed during bot_app init (may be fine)")
 # Exported names for main.py convenience
 __all__ = ("bot", "dp", "scheduler", "init_app_for_runtime", "get_main_keyboard", "format_stats", "close_db")
+```
