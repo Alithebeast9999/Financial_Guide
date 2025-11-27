@@ -160,55 +160,95 @@ async def get_expenses(uid, limit=10):
 async def delete_expense(eid):
     await db_execute("DELETE FROM expenses WHERE id = ?", (eid,))
 async def check_limits(uid, category, amount):
-    limits = get_limits_from_income(await get_income(uid))
+    """Проверка лимитов с исправленной математикой"""
+    income = await get_income(uid)
+    if income <= 0:
+        return []
+        
+    limits = get_limits_from_income(income)
     if category not in limits:
         return []
-    income = await get_income(uid)
+
     now_utc = datetime.utcnow()
-    month_start_dt = now_utc.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    month_start = month_start_dt.isoformat()
-    month_end_dt = (month_start_dt + timedelta(days=35)).replace(day=1) - timedelta(seconds=1)
-    month_end = month_end_dt.isoformat()
-    r_total = await db_fetchone(
-        "SELECT SUM(amount) as total FROM expenses WHERE user_id = ? AND timestamp BETWEEN ? AND ?",
-        (uid, month_start, month_end)
-    )
-    total_spent = r_total["total"] if r_total and r_total["total"] is not None else 0
-    r_cat = await db_fetchone(
-        "SELECT SUM(amount) as total FROM expenses WHERE user_id = ? AND category = ? AND timestamp BETWEEN ? AND ?",
-        (uid, category, month_start, month_end)
-    )
-    cat_spent = r_cat["total"] if r_cat and r_cat["total"] is not None else 0
-    msgs = []
+    month_start = now_utc.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    next_month = (month_start + timedelta(days=32)).replace(day=1)
+    month_end = next_month - timedelta(seconds=1)
+
+    # Один запрос для получения всех данных
+    query = """
+    SELECT 
+        SUM(CASE WHEN category = ? THEN amount ELSE 0 END) as cat_total,
+        SUM(amount) as total_spent
+    FROM expenses 
+    WHERE user_id = ? AND timestamp BETWEEN ? AND ?
+    """
+    
+    result = await db_fetchone(query, (category, uid, month_start.isoformat(), month_end.isoformat()))
+    
+    if not result:
+        cat_spent = 0
+        total_spent = 0
+    else:
+        cat_spent = result["cat_total"] or 0
+        total_spent = result["total_spent"] or 0
+    
+    category_limit = limits[category]
+    
+    warnings = []
+    
+    # Проверка общего лимита (доход)
     if total_spent + amount > income:
-        msgs.append("⚠️ Общий месячный лимит превышен!")
-    if cat_spent + amount > limits[category]:
-        msgs.append(f"⚠️ Лимит по '{category}' превышен!")
-    elif cat_spent + amount > 0.9 * limits[category]:
-        msgs.append(f"⚠️ Ты израсходовал более 90% лимита по '{category}'!")
-    return msgs
+        warnings.append("⚠️ Общий месячный лимит превышен!")
+        
+    # Проверка лимита по категории
+    if cat_spent + amount > category_limit:
+        warnings.append(f"⚠️ Лимит по '{category}' превышен!")
+    elif cat_spent + amount > 0.9 * category_limit:
+        warnings.append(f"⚠️ Ты израсходовал более 90% лимита по '{category}'!")
+    
+    return warnings
 async def format_stats(uid: int) -> str:
+    """Статистика с исправленной математикой процентов"""
     income = await get_income(uid)
     limits = get_limits_from_income(income)
     now_utc = datetime.utcnow()
-    month_start_dt = now_utc.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    month_start = month_start_dt.isoformat()
-    month_end_dt = (month_start_dt + timedelta(days=35)).replace(day=1) - timedelta(seconds=1)
-    month_end = month_end_dt.isoformat()
+    month_start = now_utc.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    next_month = (month_start + timedelta(days=32)).replace(day=1)
+    month_end = next_month - timedelta(seconds=1)
+    
     rows = await db_fetchall(
         "SELECT category, SUM(amount) as total FROM expenses WHERE user_id = ? AND timestamp BETWEEN ? AND ? GROUP BY category",
-        (uid, month_start, month_end)
+        (uid, month_start.isoformat(), month_end.isoformat())
     )
-    spent = {r["category"]: r["total"] for r in rows}
+    
+    spent = {r["category"]: (r["total"] or 0) for r in rows}
+    
     text = f"💰 Ваш доход: {format_amount(income)} ₽\n\n"
+    
     for group, cats in CATEGORIES.items():
         text += f"📂 {group}\n"
         for cat, pct in cats.items():
             lim = limits.get(cat, 0)
-            s = spent.get(cat, 0) or 0
-            perc = (s / lim * 100) if lim else 0
-            text += f"• {cat}: {s:,.0f} ₽ / {lim:,.0f} ₽ ({perc:.0f}%)\n"
+            s = spent.get(cat, 0)
+            
+            # Исправленный расчет процента
+            if lim > 0:
+                perc = (s / lim) * 100
+                perc_text = f"{perc:.0f}%"
+            else:
+                perc_text = "0%"
+                
+            text += f"• {cat}: {format_amount(s)} ₽ / {format_amount(lim)} ₽ ({perc_text})\n"
         text += "\n"
+    
+    # Добавляем общую статистику
+    total_spent = sum(spent.values())
+    if income > 0:
+        total_perc = (total_spent / income) * 100
+        text += f"📊 Всего потрачено: {format_amount(total_spent)} ₽ / {format_amount(income)} ₽ ({total_perc:.0f}%)"
+    else:
+        text += f"📊 Всего потрачено: {format_amount(total_spent)} ₽"
+        
     return text
 # ---------------- Scheduler ----------------
 scheduler = AsyncIOScheduler(timezone=TZ)
@@ -424,7 +464,7 @@ async def generic_text_handler(msg: types.Message):
                 )
                 await bot.send_message(uid, table_html + "\n\n" + buttons_expl, parse_mode=types.ParseMode.HTML, reply_markup=get_main_keyboard())
             except Exception:
-                await bot.send_message(uid, "❌ Неверный формат дохода. Введите число, например: 50 000 (или нажмите /cancel).")
+                await bot.send_message(uid, "❌ Неверный формат дохода. Введите число, например: 50 000.")
             return
         elif ptype == "expense_amount":
             try:
@@ -438,7 +478,7 @@ async def generic_text_handler(msg: types.Message):
                     kb.insert(InlineKeyboardButton(cat, callback_data=f"cat_{cat}"))
                 await bot.send_message(uid, "Выбери категорию:", reply_markup=kb)
             except Exception:
-                await bot.send_message(uid, "❌ Неверная сумма. Введите число, например: 450. Или нажмите /cancel, чтобы отменить.")
+                await bot.send_message(uid, "❌ Неверная сумма. Введите число, например: 450.")
             return
         elif ptype == "recurring_amount":
             try:
@@ -452,7 +492,7 @@ async def generic_text_handler(msg: types.Message):
                     kb.insert(InlineKeyboardButton(cat, callback_data=f"rec_{cat}"))
                 await bot.send_message(uid, "Выбери категорию:", reply_markup=kb)
             except Exception:
-                await bot.send_message(uid, "❌ Неверная сумма. Введите число или /cancel.")
+                await bot.send_message(uid, "❌ Неверная сумма. Введите число.")
             return
         elif ptype == "recurring_day":
             try:
@@ -499,7 +539,7 @@ async def generic_text_handler(msg: types.Message):
             await ExpenseState.amount.set()
         except Exception:
             logger.debug("ExpenseState.amount.set() failed (ignored)")
-        await bot.send_message(uid, "💸 Введи сумму траты (например: 450): (или /cancel чтобы отменить)")
+        await bot.send_message(uid, "💸 Введи сумму траты (например: 450):")
         return
     if text == "📜 История":
         await history(msg)
@@ -523,7 +563,7 @@ async def expense_category(cb: types.CallbackQuery):
         if amount is None:
             await cb.answer("Сначала укажите сумму траты.")
             try:
-                await cb.message.edit_text("💸 Введи сумму траты (например: 450): (или /cancel чтобы отменить)")
+                await cb.message.edit_text("💸 Введи сумму траты (например: 450):")
             except Exception:
                 pass
             async with pending_lock:
@@ -542,7 +582,7 @@ async def expense_category(cb: types.CallbackQuery):
     else:
         await cb.answer("Сначала укажите сумму траты.")
         try:
-            await cb.message.edit_text("💸 Введи сумму траты (например: 450): (или /cancel чтобы отменить)")
+            await cb.message.edit_text("💸 Введи сумму траты (например: 450):")
         except Exception:
             pass
         await set_pending(uid, "expense_amount")
@@ -558,7 +598,7 @@ async def recurring_category(cb: types.CallbackQuery):
         if amount is None:
             await cb.answer("Сначала укажите сумму регулярного расхода.")
             try:
-                await cb.message.edit_text("Введи сумму регулярного расхода (или /cancel):")
+                await cb.message.edit_text("Введи сумму регулярного расхода:")
             except Exception:
                 pass
             async with pending_lock:
@@ -574,7 +614,7 @@ async def recurring_category(cb: types.CallbackQuery):
     else:
         await cb.answer("Сначала укажите сумму регулярного расхода.")
         try:
-            await cb.message.edit_text("Введи сумму регулярного расхода (или /cancel):")
+            await cb.message.edit_text("Введи сумму регулярного расхода:")
         except Exception:
             pass
         await set_pending(uid, "recurring_amount")
