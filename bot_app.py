@@ -74,7 +74,11 @@ async def init_db():
     await db.execute("""CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
         income REAL DEFAULT 0,
-        notifications BOOLEAN DEFAULT 1
+        notifications BOOLEAN DEFAULT 1,
+        first_name TEXT,
+        username TEXT,
+        created_at TEXT,
+        last_active TEXT
     )""")
     await db.execute("""CREATE TABLE IF NOT EXISTS expenses (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -127,17 +131,56 @@ async def db_fetchall(query: str, params: tuple = ()):
         await cur.close()
         return rows
 # ---------------- DB-backed helpers ------------
-async def ensure_user(uid: int):
+async def ensure_user(uid: int, first_name: str = "", username: str = ""):
     global db_lock
     if db_lock is None:
         db_lock = asyncio.Lock()
-    await db_execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (uid,))
+    
+    now = datetime.utcnow().isoformat()
+    # Проверяем, существует ли пользователь
+    existing = await db_fetchone("SELECT user_id FROM users WHERE user_id = ?", (uid,))
+    
+    if existing:
+        # Обновляем последнюю активность
+        await db_execute("UPDATE users SET last_active = ? WHERE user_id = ?", (now, uid))
+    else:
+        # Создаем нового пользователя
+        await db_execute(
+            "INSERT INTO users (user_id, first_name, username, created_at, last_active) VALUES (?, ?, ?, ?, ?)",
+            (uid, first_name, username, now, now)
+        )
 async def get_income(uid: int) -> float:
     r = await db_fetchone("SELECT income FROM users WHERE user_id = ?", (uid,))
     return float(r["income"]) if r and r["income"] is not None else 0.0
 async def set_income(uid: int, v: float):
     await db_execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (uid,))
     await db_execute("UPDATE users SET income = ? WHERE user_id = ?", (v, uid))
+async def get_user_stats(uid: int) -> Dict[str, Any]:
+    """Получить статистику пользователя для приветствия"""
+    income = await get_income(uid)
+    
+    # Получаем количество трат за текущий месяц
+    now_utc = datetime.utcnow()
+    month_start = now_utc.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    next_month = (month_start + timedelta(days=32)).replace(day=1)
+    month_end = next_month - timedelta(seconds=1)
+    
+    expenses_count = await db_fetchone(
+        "SELECT COUNT(*) as count FROM expenses WHERE user_id = ? AND timestamp BETWEEN ? AND ?",
+        (uid, month_start.isoformat(), month_end.isoformat())
+    )
+    
+    # Получаем общую сумму трат за месяц
+    total_spent = await db_fetchone(
+        "SELECT SUM(amount) as total FROM expenses WHERE user_id = ? AND timestamp BETWEEN ? AND ?",
+        (uid, month_start.isoformat(), month_end.isoformat())
+    )
+    
+    return {
+        "income": income,
+        "expenses_count": expenses_count["count"] if expenses_count else 0,
+        "total_spent": total_spent["total"] if total_spent and total_spent["total"] else 0
+    }
 def format_amount(x):
     try:
         return f"{x:,.0f}".replace(",", " ")
@@ -365,24 +408,47 @@ def build_limits_table_html(income: float) -> str:
 @dp.message_handler(commands=['start'])
 async def start(msg: types.Message):
     uid = msg.from_user.id
-    await ensure_user(uid)
-    welcome = (
-        "<b>Привет! Я — твой финансовый помощник.</b>\n\n"
-        "Я помогу тебе отслеживать расходы, планировать бюджет, "
-        "настраивать регулярные платежи и вовремя предупреждать о превышениях лимитов.\n\n"
-        "Чтобы начать — введите ваш ежемесячный доход (например: <b>50 000</b>)\n\n"
-        "После ввода дохода я рассчитую рекомендованные лимиты по категориям и покажу подсказки по кнопкам внизу."
-    )
-    kb = get_main_keyboard()
-    # PENDING: set conversation shim to expect income input
-    await set_pending(uid, "income")
-    # Attempt to set FSM state as well (best-effort)
-    try:
-        await IncomeState.income.set()
-    except Exception:
-        logger.debug("start: IncomeState.income.set() failed (ignored)")
-    # send without quoting the user (use bot.send_message)
-    await bot.send_message(msg.chat.id, welcome, reply_markup=kb)
+    first_name = msg.from_user.first_name or ""
+    username = msg.from_user.username or ""
+    
+    await ensure_user(uid, first_name, username)
+    
+    # Получаем статистику пользователя
+    user_stats = await get_user_stats(uid)
+    income = user_stats["income"]
+    
+    if income > 0:
+        # Пользователь уже существует с установленным доходом
+        welcome = (
+            f"<b>С возвращением, {first_name}! 👋</b>\n\n"
+            f"Рад снова видеть тебя! Продолжим оптимизировать твои финансы?\n\n"
+            f"<b>Твоя текущая статистика:</b>\n"
+            f"• Доход: {format_amount(income)} ₽\n"
+            f"• Траты в этом месяце: {format_amount(user_stats['total_spent'])} ₽\n"
+            f"• Количество операций: {user_stats['expenses_count']}\n\n"
+            f"Используй кнопки ниже для управления бюджетом или посмотри статистику детальнее!"
+        )
+        kb = get_main_keyboard()
+        await bot.send_message(msg.chat.id, welcome, reply_markup=kb, parse_mode=types.ParseMode.HTML)
+    else:
+        # Новый пользователь
+        welcome = (
+            "<b>Привет! Я — твой финансовый помощник. 🤖💰</b>\n\n"
+            "Я помогу тебе отслеживать расходы, планировать бюджет, "
+            "настраивать регулярные платежи и вовремя предупреждать о превышениях лимитов.\n\n"
+            "<b>Чтобы начать — введи свой ежемесячный доход</b> (например: <b>50 000</b>)\n\n"
+            "После ввода дохода я рассчитаю рекомендованные лимиты по категориям и покажу подсказки по кнопкам внизу."
+        )
+        kb = get_main_keyboard()
+        # PENDING: set conversation shim to expect income input
+        await set_pending(uid, "income")
+        # Attempt to set FSM state as well (best-effort)
+        try:
+            await IncomeState.income.set()
+        except Exception:
+            logger.debug("start: IncomeState.income.set() failed (ignored)")
+        # send without quoting the user (use bot.send_message)
+        await bot.send_message(msg.chat.id, welcome, reply_markup=kb, parse_mode=types.ParseMode.HTML)
 
 # ---------------- Новые команды отчетов ----------------
 @dp.message_handler(commands=['reportweek'])
