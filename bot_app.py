@@ -10,9 +10,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
-from aiogram.dispatcher.filters.state import State, StatesGroup
-from aiogram.dispatcher import FSMContext
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 logger = logging.getLogger(__name__)
 # Config
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -49,15 +47,50 @@ CATEGORIES = {
 }
 ALL_CATEGORIES = [c for g in CATEGORIES.values() for c in g]
 MAIN_BUTTONS = {"➕ Добавить трату", "📜 История", "📊 Моя статистика", "ℹ️ Помощь"}
-class IncomeState(StatesGroup):
-    income = State()
-class ExpenseState(StatesGroup):
-    amount = State()
-    category = State()
-class RecurringState(StatesGroup):
-    amount = State()
-    category = State()
-    day = State()
+# ---------------- Keyboard helpers ----------------
+def get_main_keyboard():
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add("➕ Добавить трату", "📜 История")
+    kb.add("📊 Моя статистика", "ℹ️ Помощь")
+    return kb
+
+def get_cancel_keyboard():
+    """Клавиатура только с кнопкой отмены"""
+    kb = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    kb.add("❌ Отмена")
+    return kb
+
+def get_digits_keyboard():
+    """Цифровая клавиатура для ввода суммы"""
+    kb = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    row1 = [KeyboardButton("1"), KeyboardButton("2"), KeyboardButton("3")]
+    row2 = [KeyboardButton("4"), KeyboardButton("5"), KeyboardButton("6")]
+    row3 = [KeyboardButton("7"), KeyboardButton("8"), KeyboardButton("9")]
+    row4 = [KeyboardButton("0"), KeyboardButton("."), KeyboardButton("❌ Отмена")]
+    kb.add(*row1)
+    kb.add(*row2)
+    kb.add(*row3)
+    kb.add(*row4)
+    return kb
+
+def get_days_keyboard():
+    """Клавиатура для выбора дня месяца"""
+    kb = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    row1 = [KeyboardButton("1"), KeyboardButton("2"), KeyboardButton("3"), KeyboardButton("4"), KeyboardButton("5")]
+    row2 = [KeyboardButton("6"), KeyboardButton("7"), KeyboardButton("8"), KeyboardButton("9"), KeyboardButton("10")]
+    row3 = [KeyboardButton("11"), KeyboardButton("12"), KeyboardButton("13"), KeyboardButton("14"), KeyboardButton("15")]
+    row4 = [KeyboardButton("16"), KeyboardButton("17"), KeyboardButton("18"), KeyboardButton("19"), KeyboardButton("20")]
+    row5 = [KeyboardButton("21"), KeyboardButton("22"), KeyboardButton("23"), KeyboardButton("24"), KeyboardButton("25")]
+    row6 = [KeyboardButton("26"), KeyboardButton("27"), KeyboardButton("28"), KeyboardButton("29"), KeyboardButton("30")]
+    row7 = [KeyboardButton("31"), KeyboardButton("❌ Отмена")]
+    kb.add(*row1)
+    kb.add(*row2)
+    kb.add(*row3)
+    kb.add(*row4)
+    kb.add(*row5)
+    kb.add(*row6)
+    kb.add(*row7)
+    return kb
 # ---------------- Helpers & DB access (aiosqlite) ------------
 async def init_db():
     """
@@ -380,11 +413,6 @@ def _add_scheduler_jobs_once():
     except Exception:
         logger.exception("Failed to add scheduler jobs")
 # ---------------- UI helpers ----------------
-def get_main_keyboard():
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add("➕ Добавить трату", "📜 История")
-    kb.add("📊 Моя статистика", "ℹ️ Помощь")
-    return kb
 def build_limits_table_html(income: float) -> str:
     """
     Build a human-friendly HTML text for limits.
@@ -442,12 +470,6 @@ async def start(msg: types.Message):
         kb = get_main_keyboard()
         # PENDING: set conversation shim to expect income input
         await set_pending(uid, "income")
-        # Attempt to set FSM state as well (best-effort)
-        try:
-            await IncomeState.income.set()
-        except Exception:
-            logger.debug("start: IncomeState.income.set() failed (ignored)")
-        # send without quoting the user (use bot.send_message)
         await bot.send_message(msg.chat.id, welcome, reply_markup=kb, parse_mode=types.ParseMode.HTML)
 
 # ---------------- Новые команды отчетов ----------------
@@ -508,13 +530,26 @@ async def report_month_cmd(msg: types.Message):
 async def generic_text_handler(msg: types.Message):
     uid = msg.from_user.id
     text = (msg.text or "").strip()
+    
+    # Обработка отмены для всех pending действий
+    if text == "❌ Отмена":
+        await pop_pending(uid)
+        await bot.send_message(
+            uid, 
+            "❌ Действие отменено. Используйте кнопки ниже для продолжения.", 
+            reply_markup=get_main_keyboard()
+        )
+        return
+    
     if text.startswith("/"):
         return # let command handlers process
+        
     pending = await get_pending(uid)
     if pending:
         ptype = pending.get("type")
         pdata = pending.get("data", {})
         logger.info("PENDING: processing %s input from %s -> %s", ptype, uid, text[:50])
+        
         if ptype == "income":
             try:
                 income = float(text.replace(" ", "").replace(",", "."))
@@ -530,8 +565,9 @@ async def generic_text_handler(msg: types.Message):
                 )
                 await bot.send_message(uid, table_html + "\n\n" + buttons_expl, parse_mode=types.ParseMode.HTML, reply_markup=get_main_keyboard())
             except Exception:
-                await bot.send_message(uid, "❌ Неверный формат дохода. Введите число, например: 50 000.")
+                await bot.send_message(uid, "❌ Неверный формат дохода. Введите число, например: 50 000.", reply_markup=get_cancel_keyboard())
             return
+            
         elif ptype == "expense_amount":
             try:
                 amount = float(text.replace(" ", "").replace(",", "."))
@@ -544,8 +580,9 @@ async def generic_text_handler(msg: types.Message):
                     kb.insert(InlineKeyboardButton(cat, callback_data=f"cat_{cat}"))
                 await bot.send_message(uid, "Выбери категорию:", reply_markup=kb)
             except Exception:
-                await bot.send_message(uid, "❌ Неверная сумма. Введите число, например: 450.")
+                await bot.send_message(uid, "❌ Неверная сумма. Введите число, например: 450.", reply_markup=get_digits_keyboard())
             return
+            
         elif ptype == "recurring_amount":
             try:
                 amount = float(text.replace(" ", "").replace(",", "."))
@@ -558,8 +595,9 @@ async def generic_text_handler(msg: types.Message):
                     kb.insert(InlineKeyboardButton(cat, callback_data=f"rec_{cat}"))
                 await bot.send_message(uid, "Выбери категорию:", reply_markup=kb)
             except Exception:
-                await bot.send_message(uid, "❌ Неверная сумма. Введите число.")
+                await bot.send_message(uid, "❌ Неверная сумма. Введите число.", reply_markup=get_digits_keyboard())
             return
+            
         elif ptype == "recurring_day":
             try:
                 day = int(text)
@@ -585,38 +623,46 @@ async def generic_text_handler(msg: types.Message):
                     f"• Дата: каждое {day}-е число\n"
                     f"• <i>Расход также добавлен в текущие траты</i>"
                 )
-                await bot.send_message(uid, response_text, parse_mode=types.ParseMode.HTML)
+                await bot.send_message(uid, response_text, parse_mode=types.ParseMode.HTML, reply_markup=get_main_keyboard())
                 
             except Exception:
                 await bot.send_message(
                     uid, 
-                    "❌ Укажи число от 1 до 31. Если выбранного дня нет в месяце, расход будет добавлен в последний день месяца."
+                    "❌ Укажи число от 1 до 31. Если выбранного дня нет в месяце, расход будет добавлен в последний день месяца.",
+                    reply_markup=get_days_keyboard()
                 )
             return
+            
         else:
             await pop_pending(uid)
             logger.warning("PENDING: unknown type %s for user %s - cleared", ptype, uid)
-            await bot.send_message(uid, "Произошла ошибка, пожалуйста повторите действие.")
+            await bot.send_message(uid, "Произошла ошибка, пожалуйста повторите действие.", reply_markup=get_main_keyboard())
             return
+            
     # If no pending action, handle main keyboard texts
     if text == "➕ Добавить трату":
         await set_pending(uid, "expense_amount")
-        try:
-            await ExpenseState.amount.set()
-        except Exception:
-            logger.debug("ExpenseState.amount.set() failed (ignored)")
-        await bot.send_message(uid, "💸 Введи сумму траты (например: 450):")
+        await bot.send_message(
+            uid, 
+            "💸 Введи сумму траты (например: 450):", 
+            reply_markup=get_digits_keyboard()
+        )
         return
+        
     if text == "📜 История":
         await history(msg)
         return
+        
     if text == "📊 Моя статистика":
         await stats(msg)
         return
+        
     if text == "ℹ️ Помощь":
         await help_cmd(msg)
         return
-    await bot.send_message(uid, "Не понял. Используйте кнопки или /start, /help.")
+        
+    await bot.send_message(uid, "Не понял. Используйте кнопки или /start, /help.", reply_markup=get_main_keyboard())
+    
 # ---------------- Callback handlers (no strict FSM dependency) ----------------
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('cat_'))
 async def expense_category(cb: types.CallbackQuery):
@@ -653,6 +699,7 @@ async def expense_category(cb: types.CallbackQuery):
             pass
         await set_pending(uid, "expense_amount")
         return
+        
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('rec_'))
 async def recurring_category(cb: types.CallbackQuery):
     cat = cb.data[4:]
@@ -675,7 +722,7 @@ async def recurring_category(cb: types.CallbackQuery):
         try:
             await cb.message.edit_text("Укажи день месяца (1–31):")
         except Exception:
-            await bot.send_message(uid, "Укажи день месяца (1–31):")
+            await bot.send_message(uid, "Укажи день месяца (1–31):", reply_markup=get_days_keyboard())
         return
     else:
         await cb.answer("Сначала укажите сумму регулярного расхода.")
@@ -685,7 +732,8 @@ async def recurring_category(cb: types.CallbackQuery):
             pass
         await set_pending(uid, "recurring_amount")
         return
-# ---------------- Other handlers unchanged (history, delete, stats, help, notify, add_recurring, report) ----------------
+        
+# ---------------- Other handlers ----------------
 @dp.message_handler(lambda m: m.text == "📜 История")
 async def history(msg: types.Message):
     exps = await get_expenses(msg.from_user.id)
@@ -700,6 +748,7 @@ async def history(msg: types.Message):
             dt = ts
         kb = InlineKeyboardMarkup().add(InlineKeyboardButton("❌ Удалить", callback_data=f"del_{e['id']}"))
         await bot.send_message(msg.chat.id, f"{dt} | {e['amount']:,.0f} ₽ | {e['category']}", reply_markup=kb)
+        
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('del_'))
 async def delete_expense_cb(cb: types.CallbackQuery):
     eid = int(cb.data[4:])
@@ -709,6 +758,7 @@ async def delete_expense_cb(cb: types.CallbackQuery):
         await cb.message.delete()
     except Exception:
         pass
+        
 @dp.message_handler(lambda m: m.text == "📊 Моя статистика")
 async def stats(msg: types.Message):
     text = await format_stats(msg.from_user.id)
@@ -734,10 +784,13 @@ async def add_recurring(msg: types.Message):
     """Добавление регулярного расхода с выбором дня 1-31"""
     uid = msg.from_user.id
     await set_pending(uid, "recurring_amount")
-    await bot.send_message(msg.chat.id, 
-                         "💸 <b>Добавление регулярного расхода</b>\n\n"
-                         "Введи сумму регулярного расхода (например: 5000):",
-                         parse_mode=types.ParseMode.HTML)
+    await bot.send_message(
+        msg.chat.id, 
+        "💸 <b>Добавление регулярного расхода</b>\n\n"
+        "Введи сумму регулярного расхода (например: 5000):",
+        parse_mode=types.ParseMode.HTML,
+        reply_markup=get_digits_keyboard()
+    )
 
 # ---------------- Init helper to be called from main.py on startup ------------
 async def init_app_for_runtime(app):
@@ -756,5 +809,6 @@ async def init_app_for_runtime(app):
         app['bot_session'] = sess
     except Exception:
         logger.debug("bot.get_session() failed during bot_app init (may be fine)")
+        
 # Exported names for main.py convenience
 __all__ = ("bot", "dp", "scheduler", "init_app_for_runtime", "get_main_keyboard", "format_stats", "close_db")
