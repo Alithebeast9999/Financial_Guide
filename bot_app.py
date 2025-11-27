@@ -57,17 +57,17 @@ def get_main_keyboard():
 def get_cancel_keyboard():
     """Клавиатура только с кнопкой отмены"""
     kb = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-    kb.add("❌")
+    kb.add("❌ Отмена")
     return kb
 
 def get_digits_keyboard():
-    """Улучшенная цифровая клавиатура для ввода суммы"""
-    kb = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    """Статичная цифровая клавиатура - не меняется при вводе"""
+    kb = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)  # one_time_keyboard=False чтобы клавиатура не пропадала
     row1 = [KeyboardButton("1"), KeyboardButton("2"), KeyboardButton("3")]
     row2 = [KeyboardButton("4"), KeyboardButton("5"), KeyboardButton("6")]
     row3 = [KeyboardButton("7"), KeyboardButton("8"), KeyboardButton("9")]
     row4 = [KeyboardButton("⬅️"), KeyboardButton("0"), KeyboardButton("✅")]
-    row5 = [KeyboardButton("❌")]
+    row5 = [KeyboardButton("❌ Отмена")]
     kb.add(*row1)
     kb.add(*row2)
     kb.add(*row3)
@@ -84,7 +84,7 @@ def get_days_keyboard():
     row4 = [KeyboardButton("16"), KeyboardButton("17"), KeyboardButton("18"), KeyboardButton("19"), KeyboardButton("20")]
     row5 = [KeyboardButton("21"), KeyboardButton("22"), KeyboardButton("23"), KeyboardButton("24"), KeyboardButton("25")]
     row6 = [KeyboardButton("26"), KeyboardButton("27"), KeyboardButton("28"), KeyboardButton("29"), KeyboardButton("30")]
-    row7 = [KeyboardButton("31"), KeyboardButton("❌")]
+    row7 = [KeyboardButton("31"), KeyboardButton("❌ Отмена")]
     kb.add(*row1)
     kb.add(*row2)
     kb.add(*row3)
@@ -435,6 +435,10 @@ def build_limits_table_html(income: float) -> str:
             lines.append(f"• {cat}: {pct_str} — {format_amount(sum_rub)} ₽")
         lines.append("")
     return "\n".join(lines)
+
+# Переменная для хранения сообщений с вводом суммы
+amount_input_messages = {}
+
 # ---------------- Handlers (registered to dp) ----------------
 @dp.message_handler(commands=['start'])
 async def start(msg: types.Message):
@@ -535,75 +539,22 @@ async def generic_text_handler(msg: types.Message):
     text = (msg.text or "").strip()
     
     # Обработка отмены для всех pending действий
-    if text == "❌":
+    if text == "❌ Отмена":
         await pop_pending(uid)
+        # Удаляем сообщение с вводом суммы если оно есть
+        if uid in amount_input_messages:
+            try:
+                await bot.delete_message(uid, amount_input_messages[uid])
+            except:
+                pass
+            amount_input_messages.pop(uid, None)
+            
         await bot.send_message(
             uid, 
             "❌ Действие отменено. Используйте кнопки ниже для продолжения.", 
             reply_markup=get_main_keyboard()
         )
         return
-    
-    # Обработка специальных кнопок цифровой клавиатуры
-    if text in ["✅", "⬅️"]:
-        pending = await get_pending(uid)
-        if not pending:
-            await bot.send_message(uid, "Нечего подтверждать. Используйте кнопки ниже.", reply_markup=get_main_keyboard())
-            return
-            
-        ptype = pending.get("type")
-        pdata = pending.get("data", {})
-        current_input = pdata.get("current_input", "")
-        
-        if text == "⬅️":
-            # Удаляем последнюю цифру
-            current_input = current_input[:-1]
-            pdata["current_input"] = current_input
-            async with pending_lock:
-                pending_actions[uid]["data"] = pdata
-            
-            display_amount = format_amount(float(current_input)) if current_input else "0"
-            await bot.send_message(
-                uid, 
-                f"💳 Вводимая сумма: {display_amount} ₽\n\nПродолжайте ввод цифр или нажмите '✅' для подтверждения", 
-                reply_markup=get_digits_keyboard()
-            )
-            return
-            
-        elif text == "✅":
-            if not current_input:
-                await bot.send_message(
-                    uid, 
-                    "❌ Сначала введите сумму!", 
-                    reply_markup=get_digits_keyboard()
-                )
-                return
-                
-            try:
-                amount = float(current_input)
-                if ptype == "expense_amount":
-                    pdata['amount'] = amount
-                    async with pending_lock:
-                        pending_actions[uid]['data'] = pdata
-                        pending_actions[uid]['type'] = "expense_choose_category"
-                    kb = InlineKeyboardMarkup(row_width=2)
-                    for cat in ALL_CATEGORIES:
-                        kb.insert(InlineKeyboardButton(cat, callback_data=f"cat_{cat}"))
-                    await bot.send_message(uid, f"💸 Сумма: {format_amount(amount)} ₽\n\nВыбери категорию:", reply_markup=kb)
-                    
-                elif ptype == "recurring_amount":
-                    pdata['amount'] = amount
-                    async with pending_lock:
-                        pending_actions[uid]['data'] = pdata
-                        pending_actions[uid]['type'] = "recurring_choose_category"
-                    kb = InlineKeyboardMarkup(row_width=2)
-                    for cat in ALL_CATEGORIES:
-                        kb.insert(InlineKeyboardButton(cat, callback_data=f"rec_{cat}"))
-                    await bot.send_message(uid, f"💸 Сумма: {format_amount(amount)} ₽\n\nВыбери категорию:", reply_markup=kb)
-                    
-            except ValueError:
-                await bot.send_message(uid, "❌ Ошибка преобразования суммы. Попробуйте снова.", reply_markup=get_digits_keyboard())
-            return
     
     if text.startswith("/"):
         return # let command handlers process
@@ -613,6 +564,78 @@ async def generic_text_handler(msg: types.Message):
         ptype = pending.get("type")
         pdata = pending.get("data", {})
         logger.info("PENDING: processing %s input from %s -> %s", ptype, uid, text[:50])
+        
+        # Обработка специальных кнопок цифровой клавиатуры
+        if text in ["✅", "⬅️"]:
+            current_input = pdata.get("current_input", "")
+            
+            if text == "⬅️":
+                # Удаляем последнюю цифру
+                current_input = current_input[:-1]
+                pdata["current_input"] = current_input
+                async with pending_lock:
+                    pending_actions[uid]["data"] = pdata
+                
+                # Обновляем сообщение с текущей суммой
+                display_amount = format_amount(float(current_input)) if current_input else "0"
+                if uid in amount_input_messages:
+                    try:
+                        await bot.edit_message_text(
+                            f"💳 Вводимая сумма: {display_amount} ₽\n\nПродолжайте ввод цифр или нажмите '✅' для подтверждения",
+                            uid, amount_input_messages[uid]
+                        )
+                    except:
+                        # Если не удалось отредактировать, отправляем новое
+                        new_msg = await bot.send_message(
+                            uid, 
+                            f"💳 Вводимая сумма: {display_amount} ₽\n\nПродолжайте ввод цифр или нажмите '✅' для подтверждения", 
+                            reply_markup=get_digits_keyboard()
+                        )
+                        amount_input_messages[uid] = new_msg.message_id
+                return
+                
+            elif text == "✅":
+                if not current_input:
+                    await bot.send_message(
+                        uid, 
+                        "❌ Сначала введите сумму!", 
+                        reply_markup=get_digits_keyboard()
+                    )
+                    return
+                    
+                try:
+                    amount = float(current_input)
+                    # Удаляем сообщение с вводом суммы
+                    if uid in amount_input_messages:
+                        try:
+                            await bot.delete_message(uid, amount_input_messages[uid])
+                        except:
+                            pass
+                        amount_input_messages.pop(uid, None)
+                    
+                    if ptype == "expense_amount":
+                        pdata['amount'] = amount
+                        async with pending_lock:
+                            pending_actions[uid]['data'] = pdata
+                            pending_actions[uid]['type'] = "expense_choose_category"
+                        kb = InlineKeyboardMarkup(row_width=2)
+                        for cat in ALL_CATEGORIES:
+                            kb.insert(InlineKeyboardButton(cat, callback_data=f"cat_{cat}"))
+                        await bot.send_message(uid, f"💸 Сумма: {format_amount(amount)} ₽\n\nВыбери категорию:", reply_markup=kb)
+                        
+                    elif ptype == "recurring_amount":
+                        pdata['amount'] = amount
+                        async with pending_lock:
+                            pending_actions[uid]['data'] = pdata
+                            pending_actions[uid]['type'] = "recurring_choose_category"
+                        kb = InlineKeyboardMarkup(row_width=2)
+                        for cat in ALL_CATEGORIES:
+                            kb.insert(InlineKeyboardButton(cat, callback_data=f"rec_{cat}"))
+                        await bot.send_message(uid, f"💸 Сумма: {format_amount(amount)} ₽\n\nВыбери категорию:", reply_markup=kb)
+                        
+                except ValueError:
+                    await bot.send_message(uid, "❌ Ошибка преобразования суммы. Попробуйте снова.", reply_markup=get_digits_keyboard())
+                return
         
         # Обработка цифрового ввода для сумм
         if ptype in ["expense_amount", "recurring_amount"] and text.isdigit():
@@ -633,11 +656,30 @@ async def generic_text_handler(msg: types.Message):
                 pending_actions[uid]["data"] = pdata
                 
             display_amount = format_amount(float(current_input)) if current_input else "0"
-            await bot.send_message(
-                uid, 
-                f"💳 Вводимая сумма: {display_amount} ₽\n\nПродолжайте ввод цифр или нажмите '✅' для подтверждения", 
-                reply_markup=get_digits_keyboard()
-            )
+            
+            # Если сообщение уже есть - редактируем его, иначе создаем новое
+            if uid in amount_input_messages:
+                try:
+                    await bot.edit_message_text(
+                        f"💳 Вводимая сумма: {display_amount} ₽\n\nПродолжайте ввод цифр или нажмите '✅' для подтверждения",
+                        uid, amount_input_messages[uid],
+                        reply_markup=get_digits_keyboard()
+                    )
+                except:
+                    # Если не удалось отредактировать, отправляем новое
+                    new_msg = await bot.send_message(
+                        uid, 
+                        f"💳 Вводимая сумма: {display_amount} ₽\n\nПродолжайте ввод цифр или нажмите '✅' для подтверждения", 
+                        reply_markup=get_digits_keyboard()
+                    )
+                    amount_input_messages[uid] = new_msg.message_id
+            else:
+                new_msg = await bot.send_message(
+                    uid, 
+                    f"💳 Вводимая сумма: {display_amount} ₽\n\nПродолжайте ввод цифр или нажмите '✅' для подтверждения", 
+                    reply_markup=get_digits_keyboard()
+                )
+                amount_input_messages[uid] = new_msg.message_id
             return
             
         elif ptype == "income":
@@ -702,11 +744,19 @@ async def generic_text_handler(msg: types.Message):
     # If no pending action, handle main keyboard texts
     if text == "➕ Добавить трату":
         await set_pending(uid, "expense_amount", {"current_input": ""})
-        await bot.send_message(
+        # Удаляем старое сообщение с вводом если есть
+        if uid in amount_input_messages:
+            try:
+                await bot.delete_message(uid, amount_input_messages[uid])
+            except:
+                pass
+        # Отправляем новое сообщение с клавиатурой
+        new_msg = await bot.send_message(
             uid, 
             "💸 Введите сумму траты с помощью цифровой клавиатуры:\n\nНажимайте цифры, затем '✅' для подтверждения", 
             reply_markup=get_digits_keyboard()
         )
+        amount_input_messages[uid] = new_msg.message_id
         return
         
     if text == "📜 История":
@@ -743,6 +793,14 @@ async def expense_category(cb: types.CallbackQuery):
             return
         await add_expense(uid, amount, cat)
         await pop_pending(uid)
+        # Удаляем сообщение с вводом суммы если есть
+        if uid in amount_input_messages:
+            try:
+                await bot.delete_message(uid, amount_input_messages[uid])
+            except:
+                pass
+            amount_input_messages.pop(uid, None)
+            
         try:
             await cb.message.edit_text(f"✅ Добавлено: {format_amount(amount)} ₽ — {cat}")
         except Exception:
@@ -847,13 +905,21 @@ async def add_recurring(msg: types.Message):
     """Добавление регулярного расхода с выбором дня 1-31"""
     uid = msg.from_user.id
     await set_pending(uid, "recurring_amount", {"current_input": ""})
-    await bot.send_message(
+    # Удаляем старое сообщение с вводом если есть
+    if uid in amount_input_messages:
+        try:
+            await bot.delete_message(uid, amount_input_messages[uid])
+        except:
+            pass
+    # Отправляем новое сообщение с клавиатурой
+    new_msg = await bot.send_message(
         msg.chat.id, 
         "💸 <b>Добавление регулярного расхода</b>\n\n"
         "Введите сумму регулярного расхода с помощью цифровой клавиатуры:\n\nНажимайте цифры, затем '✅' для подтверждения",
         parse_mode=types.ParseMode.HTML,
         reply_markup=get_digits_keyboard()
     )
+    amount_input_messages[uid] = new_msg.message_id
 
 # ---------------- Init helper to be called from main.py on startup ------------
 async def init_app_for_runtime(app):
