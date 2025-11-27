@@ -61,16 +61,9 @@ def get_cancel_keyboard():
     return kb
 
 def get_digits_keyboard():
-    """Цифровая клавиатура для ввода суммы"""
+    """Цифровая клавиатура для ввода суммы - теперь просто кнопка отмены"""
     kb = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-    row1 = [KeyboardButton("1"), KeyboardButton("2"), KeyboardButton("3")]
-    row2 = [KeyboardButton("4"), KeyboardButton("5"), KeyboardButton("6")]
-    row3 = [KeyboardButton("7"), KeyboardButton("8"), KeyboardButton("9")]
-    row4 = [KeyboardButton("0"), KeyboardButton("."), KeyboardButton("❌ Отмена")]
-    kb.add(*row1)
-    kb.add(*row2)
-    kb.add(*row3)
-    kb.add(*row4)
+    kb.add("❌ Отмена")
     return kb
 
 def get_days_keyboard():
@@ -580,7 +573,7 @@ async def generic_text_handler(msg: types.Message):
                     kb.insert(InlineKeyboardButton(cat, callback_data=f"cat_{cat}"))
                 await bot.send_message(uid, "Выбери категорию:", reply_markup=kb)
             except Exception:
-                await bot.send_message(uid, "❌ Неверная сумма. Введите число, например: 450.", reply_markup=get_digits_keyboard())
+                await bot.send_message(uid, "❌ Неверная сумма. Введите число, например: 450.", reply_markup=get_cancel_keyboard())
             return
             
         elif ptype == "recurring_amount":
@@ -595,7 +588,7 @@ async def generic_text_handler(msg: types.Message):
                     kb.insert(InlineKeyboardButton(cat, callback_data=f"rec_{cat}"))
                 await bot.send_message(uid, "Выбери категорию:", reply_markup=kb)
             except Exception:
-                await bot.send_message(uid, "❌ Неверная сумма. Введите число.", reply_markup=get_digits_keyboard())
+                await bot.send_message(uid, "❌ Неверная сумма. Введите число.", reply_markup=get_cancel_keyboard())
             return
             
         elif ptype == "recurring_day":
@@ -645,7 +638,7 @@ async def generic_text_handler(msg: types.Message):
         await bot.send_message(
             uid, 
             "💸 Введи сумму траты (например: 450):", 
-            reply_markup=get_digits_keyboard()
+            reply_markup=get_cancel_keyboard()
         )
         return
         
@@ -686,10 +679,13 @@ async def expense_category(cb: types.CallbackQuery):
         try:
             await cb.message.edit_text(f"✅ Добавлено: {format_amount(amount)} ₽ — {cat}")
         except Exception:
-            await bot.send_message(uid, f"✅ Добавлено: {format_amount(amount)} ₽ — {cat}")
+            await bot.send_message(uid, f"✅ Добавлено: {format_amount(amount)} ₽ — {cat}", reply_markup=get_main_keyboard())
         warnings = await check_limits(uid, cat, amount)
         if warnings:
-            await bot.send_message(uid, "\n".join(warnings))
+            await bot.send_message(uid, "\n".join(warnings), reply_markup=get_main_keyboard())
+        else:
+            # Если нет предупреждений, все равно показываем основную клавиатуру
+            await bot.send_message(uid, "Используйте кнопки ниже для продолжения:", reply_markup=get_main_keyboard())
         return
     else:
         await cb.answer("Сначала укажите сумму траты.")
@@ -789,7 +785,7 @@ async def add_recurring(msg: types.Message):
         "💸 <b>Добавление регулярного расхода</b>\n\n"
         "Введи сумму регулярного расхода (например: 5000):",
         parse_mode=types.ParseMode.HTML,
-        reply_markup=get_digits_keyboard()
+        reply_markup=get_cancel_keyboard()
     )
 
 # ---------------- Init helper to be called from main.py on startup ------------
