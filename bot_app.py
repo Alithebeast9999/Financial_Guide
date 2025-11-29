@@ -48,41 +48,27 @@ def get_main_keyboard():
     kb.row("📊 Моя статистика", "ℹ️ Помощь")
     return kb
 
-# NOTE: Standard Telegram bots cannot programmatically put characters into the user's native
-# input text field. To emulate a "calculator-like" keyboard where pressing digits shows
-# the current composed amount before final submission, we implement an InlineKeyboard that
-# sends callback queries and the bot updates a message showing the current input. This
-# gives the same UX (press digits, see composed number, press ✅ to confirm) within the
-# constraints of the Telegram Bot API.
-
-def get_amount_inline_keyboard():
+def get_amount_presets_inline():
+    """Inline keyboard with presets + manual input / cancel"""
     kb = InlineKeyboardMarkup(row_width=3)
-    # digits
+    # Preset buttons
     kb.row(
-        InlineKeyboardButton("1", callback_data="num_1"),
-        InlineKeyboardButton("2", callback_data="num_2"),
-        InlineKeyboardButton("3", callback_data="num_3"),
+        InlineKeyboardButton("50", callback_data="preset_50"),
+        InlineKeyboardButton("100", callback_data="preset_100"),
+        InlineKeyboardButton("200", callback_data="preset_200"),
     )
     kb.row(
-        InlineKeyboardButton("4", callback_data="num_4"),
-        InlineKeyboardButton("5", callback_data="num_5"),
-        InlineKeyboardButton("6", callback_data="num_6"),
+        InlineKeyboardButton("500", callback_data="preset_500"),
+        InlineKeyboardButton("1000", callback_data="preset_1000"),
+        InlineKeyboardButton("2000", callback_data="preset_2000"),
     )
+    # Manual / cancel
     kb.row(
-        InlineKeyboardButton("7", callback_data="num_7"),
-        InlineKeyboardButton("8", callback_data="num_8"),
-        InlineKeyboardButton("9", callback_data="num_9"),
+        InlineKeyboardButton("Ввести вручную", callback_data="preset_manual"),
+        InlineKeyboardButton("Другие...", callback_data="preset_other"),
+        InlineKeyboardButton("❌ Отмена", callback_data="preset_cancel"),
     )
-    # last row: 0, backspace, ok
-    kb.row(
-        InlineKeyboardButton("0", callback_data="num_0"),
-        InlineKeyboardButton("⬅️", callback_data="num_back"),
-        InlineKeyboardButton("✅", callback_data="num_ok"),
-    )
-    # cancel
-    kb.row(InlineKeyboardButton("❌ Отмена", callback_data="num_cancel"))
     return kb
-
 
 def get_days_keyboard():
     kb = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
@@ -193,7 +179,11 @@ async def set_income(uid: int, v: float):
 
 def format_amount(x):
     try:
-        return f"{x:,.0f}".replace(",", " ")
+        # show integer formatting with spaces
+        if isinstance(x, float) and not x.is_integer():
+            # show decimals if present
+            return f"{x:,.2f}".replace(",", " ")
+        return f"{int(x):,}".replace(",", " ")
     except Exception:
         return str(x)
 
@@ -299,7 +289,7 @@ async def generic_text_handler(msg: types.Message):
     uid = msg.from_user.id
     text = msg.text.strip()
     
-    # Handle cancellation
+    # Handle cancellation (text cancel)
     if text == "❌ Отмена":
         await pop_pending(uid)
         await bot.send_message(uid, "❌ Действие отменено.", reply_markup=get_main_keyboard())
@@ -326,13 +316,13 @@ async def generic_text_handler(msg: types.Message):
             await bot.send_message(uid, "❌ Неверный формат дохода. Введите число, например: 50000")
         return
     
-    # If user manually typed a number while in the amount-input flow, accept it as a direct amount.
+    # If user typed a number while in amount-input flow (manual input), accept it
     if pending and pending["type"] in ["expense_amount", "recurring_amount"]:
-        # Try to parse a full-number input (e.g. "1500" or "1 500" or "1,500.50")
+        # try parse direct full-number input (manual)
         try:
             cleaned = text.replace(" ", "").replace(",", ".")
             amount = float(cleaned)
-            # process like pressing ✅
+            # proceed similarly to pressing a preset/ok
             if pending["type"] == "expense_amount":
                 await set_pending(uid, "expense_choose_category", {"amount": amount})
                 kb = InlineKeyboardMarkup(row_width=2)
@@ -347,14 +337,15 @@ async def generic_text_handler(msg: types.Message):
                 await bot.send_message(uid, f"💸 Сумма: {format_amount(amount)} ₽\n\nВыбери категорию:", reply_markup=kb)
             return
         except Exception:
-            # Not a plain numeric message; fall through to other handlers
+            # Not a numeric message -> fall through
             pass
     
     # Main menu handlers
     if text == "➕ Добавить трату":
-        # send the inline "calculator" message first so we can edit it as user presses digits
-        sent = await bot.send_message(uid, "💸 Введите сумму траты:\n\n0 ₽", reply_markup=get_amount_inline_keyboard())
-        await set_pending(uid, "expense_amount", {"current_input": "", "msg_id": sent.message_id, "chat_id": sent.chat.id})
+        # send presets inline keyboard
+        sent = await bot.send_message(uid, "💸 Выберите сумму (пресеты) или введите вручную:", reply_markup=get_amount_presets_inline())
+        # set pending for amount. awaiting_manual indicates whether user pressed manual
+        await set_pending(uid, "expense_amount", {"awaiting_manual": False, "msg_id": sent.message_id, "chat_id": sent.chat.id})
         return
         
     elif text == "📜 История":
@@ -417,126 +408,127 @@ async def generic_text_handler(msg: types.Message):
             "/add_recurring - добавить регулярный расход\n"
             "/start - перезапустить бота"
         )
-        await bot.send_message(uid, help_text, parse_mode=types.ParseMode.HML)
+        await bot.send_message(uid, help_text, parse_mode=types.ParseMode.HTML)
         return
     
     await bot.send_message(uid, "Не понял. Используйте кнопки ниже.", reply_markup=get_main_keyboard())
 
-# Callback handlers for amount inline keyboard
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith('num_'))
-async def amount_inline_cb(cb: types.CallbackQuery):
+# Callback handlers for presets and category selection
+@dp.callback_query_handler(lambda c: c.data and (c.data.startswith('preset_') or c.data.startswith('cat_') or c.data.startswith('rec_') or c.data.startswith('del_') or c.data == 'preset_manual' or c.data == 'preset_other' or c.data == 'preset_cancel'))
+async def presets_and_categories(cb: types.CallbackQuery):
     uid = cb.from_user.id
-    key = cb.data[4:]
-    pending = await get_pending(uid)
+    data = cb.data
 
-    # If no pending or not in amount flow, ignore
-    if not pending or pending['type'] not in ['expense_amount', 'recurring_amount']:
-        await cb.answer()
-        return
-
-    data = pending['data']
-    current_input = data.get('current_input', '')
-
-    if key.isdigit():
-        # append digit
-        current_input += key
-        data['current_input'] = current_input
-        await set_pending(uid, pending['type'], data)
-        # update message text
-        display = format_amount(int(current_input)) if current_input else 0
-        try:
-            await cb.message.edit_text(f"💳 Вводимая сумма: {display} ₽\n\nПродолжайте ввод цифр или нажмите '✅' для подтверждения", reply_markup=get_amount_inline_keyboard())
-        except Exception:
-            pass
-        await cb.answer()
-        return
-
-    if key == 'back':
-        current_input = current_input[:-1]
-        data['current_input'] = current_input
-        await set_pending(uid, pending['type'], data)
-        display = format_amount(int(current_input)) if current_input else 0
-        try:
-            await cb.message.edit_text(f"💳 Вводимая сумма: {display} ₽\n\nПродолжайте ввод цифр или нажмите '✅' для подтверждения", reply_markup=get_amount_inline_keyboard())
-        except Exception:
-            pass
-        await cb.answer()
-        return
-
-    if key == 'cancel':
-        await pop_pending(uid)
-        try:
-            await cb.message.edit_text("❌ Действие отменено.")
-        except:
-            pass
-        await bot.send_message(uid, "Используйте кнопки ниже для продолжения:", reply_markup=get_main_keyboard())
-        await cb.answer()
-        return
-
-    if key == 'ok':
-        if not current_input:
-            await cb.answer("Введите сумму перед подтверждением")
-            return
-        try:
-            amount = float(current_input)
-            if pending['type'] == 'expense_amount':
-                await set_pending(uid, 'expense_choose_category', {'amount': amount})
-                kb = InlineKeyboardMarkup(row_width=2)
-                for cat in ALL_CATEGORIES:
-                    kb.insert(InlineKeyboardButton(cat, callback_data=f"cat_{cat}"))
-                try:
-                    await cb.message.edit_text(f"💸 Сумма: {format_amount(amount)} ₽\n\nВыбери категорию:", reply_markup=kb)
-                except Exception:
-                    # fallback: send new message
-                    await bot.send_message(uid, f"💸 Сумма: {format_amount(amount)} ₽\n\nВыбери категорию:", reply_markup=kb)
+    # Preset pressed: e.g. preset_100
+    if data.startswith("preset_"):
+        key = data.split("_", 1)[1]
+        if key == "manual" or key == "other":
+            # ask user to type the amount manually
+            pending = await get_pending(uid)
+            if not pending or pending["type"] not in ["expense_amount", "recurring_amount"]:
+                # set default pending to expense_amount if none
+                await set_pending(uid, "expense_amount", {"awaiting_manual": True})
             else:
-                await set_pending(uid, 'recurring_choose_category', {'amount': amount})
-                kb = InlineKeyboardMarkup(row_width=2)
-                for cat in ALL_CATEGORIES:
-                    kb.insert(InlineKeyboardButton(cat, callback_data=f"rec_{cat}"))
-                try:
-                    await cb.message.edit_text(f"💸 Сумма: {format_amount(amount)} ₽\n\nВыбери категорию:", reply_markup=kb)
-                except Exception:
-                    await bot.send_message(uid, f"💸 Сумма: {format_amount(amount)} ₽\n\nВыбери категорию:", reply_markup=kb)
+                pending["data"]["awaiting_manual"] = True
+                await set_pending(uid, pending["type"], pending["data"])
+            try:
+                await cb.message.edit_text("✍️ Введите сумму сообщением (например: 1200 или 1 200,50). После ввода нажмите Отправить.")
+            except:
+                pass
             await cb.answer()
             return
-        except Exception:
-            await cb.answer("Ошибка обработки суммы")
+        if key == "cancel":
+            await pop_pending(uid)
+            try:
+                await cb.message.edit_text("❌ Действие отменено.")
+            except:
+                pass
+            await bot.send_message(uid, "Используйте кнопки ниже для продолжения:", reply_markup=get_main_keyboard())
+            await cb.answer()
             return
 
-# Callback handlers for categories and deletions remain similar
-@dp.callback_query_handler(lambda c: c.data.startswith('cat_'))
-async def expense_category(cb: types.CallbackQuery):
-    uid = cb.from_user.id
-    cat = cb.data[4:]
-    pending = await get_pending(uid)
-    
-    if pending and pending["type"] == "expense_choose_category":
-        amount = pending["data"]["amount"]
-        await add_expense(uid, amount, cat)
-        await pop_pending(uid)
+        # numeric preset
         try:
-            await cb.message.edit_text(f"✅ Добавлено: {format_amount(amount)} ₽ — {cat}")
-        except:
-            pass
-        await bot.send_message(uid, "Используйте кнопки ниже для продолжения:", reply_markup=get_main_keyboard())
+            amount = float(key)
+        except Exception:
+            await cb.answer()
+            return
 
-@dp.callback_query_handler(lambda c: c.data.startswith('rec_'))
-async def recurring_category(cb: types.CallbackQuery):
-    uid = cb.from_user.id
-    cat = cb.data[4:]
-    pending = await get_pending(uid)
-    
-    if pending and pending["type"] == "recurring_choose_category":
-        amount = pending["data"]["amount"]
-        await set_pending(uid, "recurring_day", {"amount": amount, "category": cat})
+        pending = await get_pending(uid)
+        # Determine whether this was recurring flow or expense flow
+        if pending and pending["type"] == "recurring_amount":
+            # go to recurring_choose_category
+            await set_pending(uid, "recurring_choose_category", {"amount": amount})
+            kb = InlineKeyboardMarkup(row_width=2)
+            for cat in ALL_CATEGORIES:
+                kb.insert(InlineKeyboardButton(cat, callback_data=f"rec_{cat}"))
+            try:
+                await cb.message.edit_text(f"💸 Сумма регулярного расхода: {format_amount(amount)} ₽\n\nВыбери категорию:", reply_markup=kb)
+            except Exception:
+                await bot.send_message(uid, f"💸 Сумма регулярного расхода: {format_amount(amount)} ₽\n\nВыбери категорию:", reply_markup=kb)
+            await cb.answer()
+            return
+        else:
+            # expense flow
+            await set_pending(uid, "expense_choose_category", {"amount": amount})
+            kb = InlineKeyboardMarkup(row_width=2)
+            for cat in ALL_CATEGORIES:
+                kb.insert(InlineKeyboardButton(cat, callback_data=f"cat_{cat}"))
+            try:
+                await cb.message.edit_text(f"💸 Сумма: {format_amount(amount)} ₽\n\nВыбери категорию:", reply_markup=kb)
+            except Exception:
+                await bot.send_message(uid, f"💸 Сумма: {format_amount(amount)} ₽\n\nВыбери категорию:", reply_markup=kb)
+            await cb.answer()
+            return
+
+    # Category selection for expense
+    if data.startswith("cat_"):
+        cat = data[4:]
+        pending = await get_pending(uid)
+        if pending and pending["type"] == "expense_choose_category":
+            amount = pending["data"]["amount"]
+            await add_expense(uid, amount, cat)
+            await pop_pending(uid)
+            try:
+                await cb.message.edit_text(f"✅ Добавлено: {format_amount(amount)} ₽ — {cat}")
+            except:
+                pass
+            await bot.send_message(uid, "Используйте кнопки ниже для продолжения:", reply_markup=get_main_keyboard())
+        await cb.answer()
+        return
+
+    # Category selection for recurring
+    if data.startswith("rec_"):
+        cat = data[4:]
+        pending = await get_pending(uid)
+        if pending and pending["type"] == "recurring_choose_category":
+            amount = pending["data"]["amount"]
+            await set_pending(uid, "recurring_day", {"amount": amount, "category": cat})
+            try:
+                await cb.message.edit_text("Укажи день месяца (1–31):")
+            except:
+                pass
+            await bot.send_message(uid, "Укажи день месяца (1–31):", reply_markup=get_days_keyboard())
+        await cb.answer()
+        return
+
+    # Delete expense
+    if data.startswith("del_"):
         try:
-            await cb.message.edit_text("Укажи день месяца (1–31):")
+            eid = int(data[4:])
+            await delete_expense(eid)
+            await cb.answer("Удалено")
+            try:
+                await cb.message.delete()
+            except:
+                pass
         except:
-            pass
-        await bot.send_message(uid, "Укажи день месяца (1–31):", reply_markup=get_days_keyboard())
+            await cb.answer()
+        return
 
-@dp.callback_query_handler(lambda c: c.data.startswith('del_'))
+    await cb.answer()
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith('del_'))
 async def delete_expense_cb(cb: types.CallbackQuery):
     eid = int(cb.data[4:])
     await delete_expense(eid)
@@ -549,8 +541,8 @@ async def delete_expense_cb(cb: types.CallbackQuery):
 @dp.message_handler(commands=['add_recurring'])
 async def add_recurring(msg: types.Message):
     uid = msg.from_user.id
-    sent = await bot.send_message(uid, "💸 Введите сумму регулярного расхода:\n\n0 ₽", reply_markup=get_amount_inline_keyboard())
-    await set_pending(uid, "recurring_amount", {"current_input": "", "msg_id": sent.message_id, "chat_id": sent.chat.id})
+    sent = await bot.send_message(uid, "💸 Выберите сумму для регулярного расхода (пресеты) или введите вручную:", reply_markup=get_amount_presets_inline())
+    await set_pending(uid, "recurring_amount", {"awaiting_manual": False, "msg_id": sent.message_id, "chat_id": sent.chat.id})
 
 # Scheduler
 scheduler = AsyncIOScheduler(timezone=TZ)
