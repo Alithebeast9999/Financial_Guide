@@ -226,25 +226,15 @@ async def start(msg: types.Message):
     
     if income > 0:
         welcome = (
-            f"<b>С возвращением, {first_name}! 👋</b>
-
-"
-            f"Рад снова видеть тебя! Продолжим оптимизировать твои финансы?
-
-"
-            f"Твой доход: {format_amount(income)} ₽
-
-"
+            f"<b>С возвращением, {first_name}! 👋</b>\n\n"
+            f"Рад снова видеть тебя! Продолжим оптимизировать твои финансы?\n\n"
+            f"Твой доход: {format_amount(income)} ₽\n\n"
             f"Используй кнопки ниже для управления бюджетом!"
         )
     else:
         welcome = (
-            "<b>Привет! Я — твой финансовый помощник. 🤖💰</b>
-
-"
-            "Я помогу тебе отслеживать расходы, планировать бюджет и вовремя предупреждать о превышениях лимитов.
-
-"
+            "<b>Привет! Я — твой финансовый помощник. 🤖💰</b>\n\n"
+            "Я помогу тебе отслеживать расходы, планировать бюджет и вовремя предупреждать о превышениях лимитов.\n\n"
             "<b>Чтобы начать — введи свой ежемесячный доход</b> (например: <b>50 000</b>)"
         )
         await set_pending(uid, "income")
@@ -260,20 +250,13 @@ async def report_week_cmd(msg: types.Message):
     )
     
     if not rows:
-        await bot.send_message(msg.chat.id, "📊 <b>Отчёт за неделю</b>
-
-Нет данных за последние 7 дней.", parse_mode=types.ParseMode.HTML)
+        await bot.send_message(msg.chat.id, "📊 <b>Отчёт за неделю</b>\n\nНет данных за последние 7 дней.", parse_mode=types.ParseMode.HTML)
         return
     
     total_spent = sum(r["total"] for r in rows if r["total"])
-    text = "📊 <b>Отчёт за неделю</b>
-
-" + "
-".join(
+    text = "📊 <b>Отчёт за неделю</b>\n\n" + "\n".join(
         f"• {r['category']}: {format_amount(r['total'])} ₽" for r in rows
-    ) + f"
-
-<b>Итого:</b> {format_amount(total_spent)} ₽"
+    ) + f"\n\n<b>Итого:</b> {format_amount(total_spent)} ₽"
     
     await bot.send_message(msg.chat.id, text, parse_mode=types.ParseMode.HTML)
 
@@ -290,20 +273,13 @@ async def report_month_cmd(msg: types.Message):
     )
     
     if not rows:
-        await bot.send_message(msg.chat.id, "📊 <b>Отчёт за месяц</b>
-
-Нет данных за текущий месяц.", parse_mode=types.ParseMode.HTML)
+        await bot.send_message(msg.chat.id, "📊 <b>Отчёт за месяц</b>\n\nНет данных за текущий месяц.", parse_mode=types.ParseMode.HTML)
         return
     
     total_spent = sum(r["total"] for r in rows if r["total"])
-    text = f"📊 <b>Отчёт за {month_start.strftime('%B')}</b>
-
-" + "
-".join(
+    text = f"📊 <b>Отчёт за {month_start.strftime('%B')}</b>\n\n" + "\n".join(
         f"• {r['category']}: {format_amount(r['total'])} ₽" for r in rows
-    ) + f"
-
-<b>Итого:</b> {format_amount(total_spent)} ₽"
+    ) + f"\n\n<b>Итого:</b> {format_amount(total_spent)} ₽"
     
     await bot.send_message(msg.chat.id, text, parse_mode=types.ParseMode.HTML)
 
@@ -327,18 +303,12 @@ async def generic_text_handler(msg: types.Message):
             await set_income(uid, income)
             await pop_pending(uid)
             
-            limits_text = f"<b>Доход установлен:</b> {format_amount(income)} ₽
-
-<b>Рекомендуемые лимиты:</b>
-"
+            limits_text = f"<b>Доход установлен:</b> {format_amount(income)} ₽\n\n<b>Рекомендуемые лимиты:</b>\n"
             for group, cats in CATEGORIES.items():
-                limits_text += f"
-<b>{group}:</b>
-"
+                limits_text += f"\n<b>{group}:</b>\n"
                 for cat, pct in cats.items():
                     limit = income * pct
-                    limits_text += f"• {cat}: {format_amount(limit)} ₽
-"
+                    limits_text += f"• {cat}: {format_amount(limit)} ₽\n"
             
             await bot.send_message(uid, limits_text, parse_mode=types.ParseMode.HTML, reply_markup=get_main_keyboard())
         except ValueError:
@@ -357,17 +327,13 @@ async def generic_text_handler(msg: types.Message):
                 kb = InlineKeyboardMarkup(row_width=2)
                 for cat in ALL_CATEGORIES:
                     kb.insert(InlineKeyboardButton(cat, callback_data=f"cat_{cat}"))
-                await bot.send_message(uid, f"💸 Сумма: {format_amount(amount)} ₽
-
-Выбери категорию:", reply_markup=kb)
+                await bot.send_message(uid, f"💸 Сумма: {format_amount(amount)} ₽\n\nВыбери категорию:", reply_markup=kb)
             else:
                 await set_pending(uid, "recurring_choose_category", {"amount": amount})
                 kb = InlineKeyboardMarkup(row_width=2)
                 for cat in ALL_CATEGORIES:
                     kb.insert(InlineKeyboardButton(cat, callback_data=f"rec_{cat}"))
-                await bot.send_message(uid, f"💸 Сумма: {format_amount(amount)} ₽
-
-Выбери категорию:", reply_markup=kb)
+                await bot.send_message(uid, f"💸 Сумма: {format_amount(amount)} ₽\n\nВыбери категорию:", reply_markup=kb)
             return
         except Exception:
             # Not a numeric message -> fall through
@@ -415,20 +381,15 @@ async def generic_text_handler(msg: types.Message):
         spent = {r["category"]: (r["total"] or 0) for r in rows}
         total_spent = sum(spent.values())
         
-        text = f"💰 Ваш доход: {format_amount(income)} ₽
-
-"
+        text = f"💰 Ваш доход: {format_amount(income)} ₽\n\n"
         for group, cats in CATEGORIES.items():
-            text += f"📂 {group}
-"
+            text += f"📂 {group}\n"
             for cat, pct in cats.items():
                 lim = income * pct
                 s = spent.get(cat, 0)
                 perc = (s / lim * 100) if lim else 0
-                text += f"• {cat}: {format_amount(s)} ₽ / {format_amount(lim)} ₽ ({perc:.0f}%)
-"
-            text += "
-"
+                text += f"• {cat}: {format_amount(s)} ₽ / {format_amount(lim)} ₽ ({perc:.0f}%)\n"
+            text += "\n"
         text += f"📊 Всего потрачено: {format_amount(total_spent)} ₽ / {format_amount(income)} ₽ ({(total_spent/income*100) if income else 0:.0f}%)"
         
         await bot.send_message(uid, text)
@@ -436,24 +397,14 @@ async def generic_text_handler(msg: types.Message):
         
     elif text == "ℹ️ Помощь":
         help_text = (
-            "📋 <b>Доступные команды:</b>
-
-"
-            "➕ <b>Добавить трату</b> - быстро добавить расход
-"
-            "📊 <b>Моя статистика</b> - текущее состояние бюджета
-"
-            "📜 <b>История</b> - последние траты
-
-"
-            "<b>Команды:</b>
-"
-            "/reportweek - отчёт за неделю
-"
-            "/reportmonth - отчёт за месяц
-"
-            "/add_recurring - добавить регулярный расход
-"
+            "📋 <b>Доступные команды:</b>\n\n"
+            "➕ <b>Добавить трату</b> - быстро добавить расход\n"
+            "📊 <b>Моя статистика</b> - текущее состояние бюджета\n"
+            "📜 <b>История</b> - последние траты\n\n"
+            "<b>Команды:</b>\n"
+            "/reportweek - отчёт за неделю\n"
+            "/reportmonth - отчёт за месяц\n"
+            "/add_recurring - добавить регулярный расход\n"
             "/start - перезапустить бота"
         )
         await bot.send_message(uid, help_text, parse_mode=types.ParseMode.HTML)
@@ -496,13 +447,9 @@ async def presets_and_categories(cb: types.CallbackQuery):
             for cat in ALL_CATEGORIES:
                 kb.insert(InlineKeyboardButton(cat, callback_data=f"rec_{cat}"))
             try:
-                await cb.message.edit_text(f"💸 Сумма регулярного расхода: {format_amount(amount)} ₽
-
-Выбери категорию:", reply_markup=kb)
+                await cb.message.edit_text(f"💸 Сумма регулярного расхода: {format_amount(amount)} ₽\n\nВыбери категорию:", reply_markup=kb)
             except Exception:
-                await bot.send_message(uid, f"💸 Сумма регулярного расхода: {format_amount(amount)} ₽
-
-Выбери категорию:", reply_markup=kb)
+                await bot.send_message(uid, f"💸 Сумма регулярного расхода: {format_amount(amount)} ₽\n\nВыбери категорию:", reply_markup=kb)
             await cb.answer()
             return
         else:
@@ -512,13 +459,9 @@ async def presets_and_categories(cb: types.CallbackQuery):
             for cat in ALL_CATEGORIES:
                 kb.insert(InlineKeyboardButton(cat, callback_data=f"cat_{cat}"))
             try:
-                await cb.message.edit_text(f"💸 Сумма: {format_amount(amount)} ₽
-
-Выбери категорию:", reply_markup=kb)
+                await cb.message.edit_text(f"💸 Сумма: {format_amount(amount)} ₽\n\nВыбери категорию:", reply_markup=kb)
             except Exception:
-                await bot.send_message(uid, f"💸 Сумма: {format_amount(amount)} ₽
-
-Выбери категорию:", reply_markup=kb)
+                await bot.send_message(uid, f"💸 Сумма: {format_amount(amount)} ₽\n\nВыбери категорию:", reply_markup=kb)
             await cb.answer()
             return
 
