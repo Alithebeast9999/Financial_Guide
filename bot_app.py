@@ -734,15 +734,17 @@ async def generic_text_handler(msg: types.Message):
     
     await bot.send_message(uid, "Не понял. Используйте кнопки ниже.", reply_markup=get_main_keyboard())
 
-# Callback handlers
+# Заменяем существующий callback_handler на этот исправленный код:
+
 @dp.callback_query_handler(lambda c: c.data and (c.data.startswith('preset_') or c.data.startswith('cat_') or 
                                                  c.data.startswith('rec_') or c.data.startswith('del_') or
-                                                 c.data.startswith('savings_') or c.data.startswith('limit_')))
+                                                 c.data.startswith('savings_') or c.data.startswith('deposit_') or
+                                                 c.data.startswith('deletegoal_') or c.data.startswith('limit_')))
 async def callback_handler(cb: types.CallbackQuery):
     uid = cb.from_user.id
     data = cb.data
 
-    # Preset buttons
+    # Preset buttons - ВАЖНО: эта проверка должна быть первой!
     if data.startswith("preset_"):
         key = data.split("_", 1)[1]
         if key == "cancel":
@@ -780,6 +782,30 @@ async def callback_handler(cb: types.CallbackQuery):
                 await cb.message.edit_text(f"💸 Сумма: {format_amount(amount)} ₽\n\nВыбери категорию:", reply_markup=kb)
             except Exception:
                 await bot.send_message(uid, f"💸 Сумма: {format_amount(amount)} ₽\n\nВыбери категорию:", reply_markup=kb)
+        await cb.answer()
+        return
+
+    # Deposit to savings goal - ВАЖНО: эта проверка должна быть ДО savings_
+    if data.startswith("deposit_"):
+        try:
+            goal_id = int(data[8:])
+            await set_pending(uid, "savings_deposit", {"goal_id": goal_id})
+            await cb.message.edit_text("💰 Введите сумму для внесения:")
+        except Exception as e:
+            logger.error(f"Error in deposit callback: {e}")
+            await cb.message.edit_text("❌ Ошибка выбора цели.")
+        await cb.answer()
+        return
+
+    # Delete savings goal - ВАЖНО: эта проверка должна быть ДО savings_
+    if data.startswith("deletegoal_"):
+        try:
+            goal_id = int(data[11:])
+            await delete_savings_goal(goal_id)
+            await cb.message.edit_text("✅ Цель удалена.")
+        except Exception as e:
+            logger.error(f"Error deleting goal: {e}")
+            await cb.message.edit_text("❌ Ошибка удаления цели.")
         await cb.answer()
         return
 
@@ -824,11 +850,12 @@ async def callback_handler(cb: types.CallbackQuery):
                 await cb.message.delete()
             except:
                 pass
-        except:
-            await cb.answer()
+        except Exception as e:
+            logger.error(f"Error deleting expense: {e}")
+            await cb.answer("Ошибка удаления")
         return
 
-    # Savings goals
+    # Savings goals management - ВАЖНО: эта проверка должна быть ПОСЛЕ deposit_ и deletegoal_
     if data.startswith("savings_"):
         action = data[8:]
         
@@ -879,28 +906,6 @@ async def callback_handler(cb: types.CallbackQuery):
         await cb.answer()
         return
 
-    # Deposit to savings goal
-    if data.startswith("deposit_"):
-        try:
-            goal_id = int(data[8:])
-            await set_pending(uid, "savings_deposit", {"goal_id": goal_id})
-            await cb.message.edit_text("💰 Введите сумму для внесения:")
-        except:
-            await cb.message.edit_text("❌ Ошибка выбора цели.")
-        await cb.answer()
-        return
-
-    # Delete savings goal
-    if data.startswith("deletegoal_"):
-        try:
-            goal_id = int(data[11:])
-            await delete_savings_goal(goal_id)
-            await cb.message.edit_text("✅ Цель удалена.")
-        except:
-            await cb.message.edit_text("❌ Ошибка удаления цели.")
-        await cb.answer()
-        return
-
     # Limit management
     if data.startswith("limit_"):
         if data == "limits_show_all":
@@ -946,7 +951,8 @@ async def callback_handler(cb: types.CallbackQuery):
         await cb.answer()
         return
 
-    await cb.answer()
+    # Если ни одно условие не сработало
+    await cb.answer("Неизвестная команда")
 
 # Обработчик для регулярных платежей (день месяца)
 @dp.message_handler(lambda msg: msg.text.isdigit() and 1 <= int(msg.text) <= 31)
@@ -974,7 +980,8 @@ async def handle_recurring_day(msg: types.Message):
             reply_markup=get_main_keyboard()
         )
 
-# Обработчик для внесения денег в цель накопления
+# Замените существующий обработчик handle_savings_deposit на этот:
+
 @dp.message_handler(lambda msg: msg.text.replace(" ", "").replace(",", ".").replace(".", "", 1).isdigit())
 async def handle_savings_deposit(msg: types.Message):
     uid = msg.from_user.id
@@ -1000,11 +1007,15 @@ async def handle_savings_deposit(msg: types.Message):
                     f"Прогресс: {progress:.1f}%",
                     reply_markup=get_main_keyboard()
                 )
+            else:
+                await bot.send_message(uid, "❌ Цель не найдена.", reply_markup=get_main_keyboard())
+                await pop_pending(uid)
         except ValueError:
             await bot.send_message(uid, "❌ Неверный формат суммы.")
         except Exception as e:
             logger.error(f"Error depositing to savings: {e}")
-            await bot.send_message(uid, "❌ Ошибка при внесении средств.")
+            await bot.send_message(uid, "❌ Ошибка при внесении средств.", reply_markup=get_main_keyboard())
+            await pop_pending(uid)
 
 @dp.message_handler(commands=['add_recurring'])
 async def add_recurring(msg: types.Message):
