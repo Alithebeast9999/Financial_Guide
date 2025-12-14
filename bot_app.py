@@ -539,13 +539,34 @@ async def start(msg: types.Message):
         )
     else:
         welcome = (
-            "<b>Привет! Я — твой финансовый помощник. 🤖💰</b>\n\n"
+            "<b>Привет! Я Финик - твой финансовый помощник 🐶💰</b>\n\n"
             "Я помогу тебе отслеживать расходы, планировать бюджет и вовремя предупреждать о превышениях лимитов.\n\n"
             "<b>Чтобы начать — введи свой ежемесячный доход</b> (например: <b>50 000</b>)"
         )
         await set_pending(uid, "income")
     
     await bot.send_message(msg.chat.id, welcome, reply_markup=get_main_keyboard(), parse_mode=types.ParseMode.HTML)
+
+@dp.message_handler(commands=['setincome'])
+async def set_income_cmd(msg: types.Message):
+    """Команда для изменения дохода"""
+    uid = msg.from_user.id
+    await set_pending(uid, "income")
+    current_income = await get_income(uid)
+    
+    if current_income > 0:
+        await bot.send_message(
+            uid,
+            f"💰 <b>Текущий доход:</b> {format_amount(current_income)} ₽\n\n"
+            "Введите новую сумму ежемесячного дохода:",
+            parse_mode=types.ParseMode.HTML
+        )
+    else:
+        await bot.send_message(
+            uid,
+            "💰 Введите сумму ежемесячного дохода (например: 50 000):",
+            parse_mode=types.ParseMode.HTML
+        )
 
 @dp.message_handler(commands=['reportweek'])
 async def report_week_cmd(msg: types.Message):
@@ -892,6 +913,7 @@ async def generic_text_handler(msg: types.Message):
             "/reportweek - отчёт за неделю\n"
             "/reportmonth - отчёт за месяц\n"
             "/limits - управление лимитами\n"
+            "/setincome - изменить доход\n"
             "/add_recurring - добавить регулярный расход\n"
             "/start - перезапустить бота"
         )
