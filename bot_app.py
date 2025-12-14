@@ -151,9 +151,20 @@ async def init_db():
         created_at TEXT
     )""")
     
+    # Таблица для истории пополнений целей
+    await db.execute("""CREATE TABLE IF NOT EXISTS savings_deposits (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        goal_id INTEGER,
+        user_id INTEGER,
+        amount REAL,
+        timestamp TEXT,
+        FOREIGN KEY (goal_id) REFERENCES savings_goals(id) ON DELETE CASCADE
+    )""")
+    
     await db.execute("CREATE INDEX IF NOT EXISTS idx_expenses_user_timestamp ON expenses(user_id, timestamp)")
     await db.execute("CREATE INDEX IF NOT EXISTS idx_recurring_day ON recurring(day)")
     await db.execute("CREATE INDEX IF NOT EXISTS idx_savings_user ON savings_goals(user_id)")
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_savings_deposits_user ON savings_deposits(user_id)")
     await db.commit()
 
 async def close_db():
@@ -234,6 +245,47 @@ async def get_expenses(uid, limit=10):
         "SELECT id, amount, category, timestamp FROM expenses WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?",
         (uid, limit)
     )
+
+async def get_recent_operations(uid, limit=10):
+    """Получает последние операции (траты + пополнения целей)"""
+    # Получаем траты
+    expenses = await get_expenses(uid, limit)
+    
+    # Получаем последние пополнения целей
+    deposits = await db_fetchall("""
+        SELECT sd.id, sd.amount, sg.name, sd.timestamp 
+        FROM savings_deposits sd
+        JOIN savings_goals sg ON sd.goal_id = sg.id
+        WHERE sd.user_id = ?
+        ORDER BY sd.timestamp DESC
+        LIMIT ?
+    """, (uid, limit))
+    
+    # Объединяем и сортируем по времени
+    operations = []
+    
+    for exp in expenses:
+        operations.append({
+            'id': exp['id'],
+            'type': 'expense',
+            'amount': exp['amount'],
+            'description': exp['category'],
+            'timestamp': exp['timestamp']
+        })
+    
+    for dep in deposits:
+        operations.append({
+            'id': dep['id'],
+            'type': 'deposit',
+            'amount': dep['amount'],
+            'description': f"🎯 {dep['name']}",
+            'timestamp': dep['timestamp']
+        })
+    
+    # Сортируем по времени (новые сверху)
+    operations.sort(key=lambda x: x['timestamp'], reverse=True)
+    
+    return operations[:limit]
 
 async def delete_expense(eid):
     await db_execute("DELETE FROM expenses WHERE id = ?", (eid,))
@@ -336,11 +388,21 @@ async def add_savings_goal(uid: int, name: str, target_amount: float, deadline: 
         (uid, name, target_amount, deadline, created_at)
     )
 
-async def update_savings_goal(goal_id: int, current_amount: float):
+async def add_savings_deposit(uid: int, goal_id: int, amount: float):
+    """Добавляет запись о пополнении цели"""
+    ts = datetime.utcnow().isoformat()
+    
+    # Добавляем запись о пополнении
     await db_execute(
-        "UPDATE savings_goals SET current_amount = ? WHERE id = ?",
-        (current_amount, goal_id)
+        "INSERT INTO savings_deposits (goal_id, user_id, amount, timestamp) VALUES (?, ?, ?, ?)",
+        (goal_id, uid, amount, ts)
     )
+    
+    # Обновляем текущую сумму цели
+    goal = await db_fetchone("SELECT current_amount FROM savings_goals WHERE id = ?", (goal_id,))
+    if goal:
+        new_amount = goal["current_amount"] + amount
+        await db_execute("UPDATE savings_goals SET current_amount = ? WHERE id = ?", (new_amount, goal_id))
 
 async def get_savings_goals(uid: int) -> List[Dict[str, Any]]:
     rows = await db_fetchall(
@@ -348,6 +410,43 @@ async def get_savings_goals(uid: int) -> List[Dict[str, Any]]:
         (uid,)
     )
     return [dict(row) for row in rows]
+
+async def get_savings_analytics(uid: int) -> Dict[str, Any]:
+    """Получает аналитику по целям"""
+    goals = await get_savings_goals(uid)
+    
+    if not goals:
+        return {
+            "total_goals": 0,
+            "total_target": 0,
+            "total_current": 0,
+            "total_progress": 0,
+            "average_progress": 0
+        }
+    
+    total_target = sum(goal["target_amount"] for goal in goals)
+    total_current = sum(goal["current_amount"] for goal in goals)
+    total_progress = (total_current / total_target * 100) if total_target > 0 else 0
+    
+    # Считаем средний прогресс
+    progress_sum = 0
+    valid_goals = 0
+    for goal in goals:
+        if goal["target_amount"] > 0:
+            progress = (goal["current_amount"] / goal["target_amount"] * 100)
+            progress_sum += progress
+            valid_goals += 1
+    
+    average_progress = progress_sum / valid_goals if valid_goals > 0 else 0
+    
+    return {
+        "total_goals": len(goals),
+        "total_target": total_target,
+        "total_current": total_current,
+        "total_progress": total_progress,
+        "average_progress": average_progress,
+        "goals": goals
+    }
 
 async def delete_savings_goal(goal_id: int):
     await db_execute("DELETE FROM savings_goals WHERE id = ?", (goal_id,))
@@ -382,10 +481,14 @@ async def get_analytics_data(uid: int) -> Dict[str, Any]:
         FROM expenses WHERE user_id = ?
     """, (uid,))
     
+    # Аналитика по целям
+    savings_analytics = await get_savings_analytics(uid)
+    
     return {
         "weekly_stats": weekly_stats,
         "top_categories": top_categories,
-        "avg_check": avg_check
+        "avg_check": avg_check,
+        "savings_analytics": savings_analytics
     }
 
 # Функция 5: Умные напоминания
@@ -495,6 +598,7 @@ async def analytics_cmd(msg: types.Message):
     weekly_stats = data["weekly_stats"]
     top_categories = data["top_categories"]
     avg_check = data["avg_check"]
+    savings_analytics = data["savings_analytics"]
     
     text = "📈 <b>Аналитика расходов</b>\n\n"
     
@@ -515,6 +619,22 @@ async def analytics_cmd(msg: types.Message):
     if avg_check and avg_check["avg_amount"]:
         text += f"<b>Средний чек:</b> {format_amount(avg_check['avg_amount'])} ₽\n"
         text += f"<b>Всего трат:</b> {avg_check['count']}\n"
+        text += "\n"
+    
+    # Добавляем аналитику по целям
+    if savings_analytics["total_goals"] > 0:
+        text += "🎯 <b>Аналитика целей накоплений:</b>\n\n"
+        text += f"• Всего целей: {savings_analytics['total_goals']}\n"
+        text += f"• Всего накоплено: {format_amount(savings_analytics['total_current'])} ₽ из {format_amount(savings_analytics['total_target'])} ₽\n"
+        text += f"• Общий прогресс: {savings_analytics['total_progress']:.1f}%\n"
+        text += f"• Средний прогресс: {savings_analytics['average_progress']:.1f}%\n"
+        
+        # Показываем прогресс по каждой цели
+        if savings_analytics["goals"]:
+            text += "\n<b>Прогресс по целям:</b>\n"
+            for goal in savings_analytics["goals"]:
+                progress = (goal["current_amount"] / goal["target_amount"] * 100) if goal["target_amount"] > 0 else 0
+                text += f"• {goal['name']}: {progress:.1f}%\n"
     
     await bot.send_message(uid, text, parse_mode=types.ParseMode.HTML)
 
@@ -563,24 +683,23 @@ async def generic_text_handler(msg: types.Message):
             amount = float(text.replace(" ", "").replace(",", "."))
             goal_id = pending["data"]["goal_id"]
             
-            # Получаем текущую сумму цели
-            goal = await db_fetchone("SELECT current_amount, name, target_amount FROM savings_goals WHERE id = ?", (goal_id,))
+            # Добавляем запись о пополнении
+            await add_savings_deposit(uid, goal_id, amount)
+            await pop_pending(uid)
+            
+            # Получаем информацию о цели
+            goal = await db_fetchone("SELECT name, target_amount, current_amount FROM savings_goals WHERE id = ?", (goal_id,))
             if goal:
-                new_amount = goal["current_amount"] + amount
-                await update_savings_goal(goal_id, new_amount)
-                await pop_pending(uid)
-                
-                progress = (new_amount / goal["target_amount"] * 100) if goal["target_amount"] > 0 else 0
+                progress = (goal["current_amount"] / goal["target_amount"] * 100) if goal["target_amount"] > 0 else 0
                 await bot.send_message(
                     uid,
                     f"✅ Внесено {format_amount(amount)} ₽ в цель '{goal['name']}'\n\n"
-                    f"Всего накоплено: {format_amount(new_amount)} ₽ из {format_amount(goal['target_amount'])} ₽\n"
+                    f"Всего накоплено: {format_amount(goal['current_amount'])} ₽ из {format_amount(goal['target_amount'])} ₽\n"
                     f"Прогресс: {progress:.1f}%",
                     reply_markup=get_main_keyboard()
                 )
             else:
                 await bot.send_message(uid, "❌ Цель не найдена.", reply_markup=get_main_keyboard())
-                await pop_pending(uid)
         except ValueError:
             await bot.send_message(uid, "❌ Неверный формат суммы. Введите число, например: 1000")
         except Exception as e:
@@ -680,18 +799,23 @@ async def generic_text_handler(msg: types.Message):
         return
         
     elif text == "📜 История":
-        exps = await get_expenses(uid)
-        if not exps:
-            await bot.send_message(uid, "Пока нет трат 💰")
+        operations = await get_recent_operations(uid, 10)
+        if not operations:
+            await bot.send_message(uid, "Пока нет операций 💰")
             return
-        for e in exps:
-            ts = e['timestamp']
+        
+        for op in operations:
+            ts = op['timestamp']
             try:
                 dt = datetime.fromisoformat(ts).strftime('%d.%m %H:%M')
             except:
                 dt = ts
-            kb = InlineKeyboardMarkup().add(InlineKeyboardButton("❌ Удалить", callback_data=f"del_{e['id']}"))
-            await bot.send_message(uid, f"{dt} | {format_amount(e['amount'])} ₽ | {e['category']}", reply_markup=kb)
+            
+            if op['type'] == 'expense':
+                kb = InlineKeyboardMarkup().add(InlineKeyboardButton("❌ Удалить", callback_data=f"del_{op['id']}"))
+                await bot.send_message(uid, f"{dt} | 📤 {format_amount(op['amount'])} ₽ | {op['description']}", reply_markup=kb)
+            else:
+                await bot.send_message(uid, f"{dt} | 📥 {format_amount(op['amount'])} ₽ | {op['description']}")
         return
         
     elif text == "📊 Моя статистика":
@@ -714,9 +838,12 @@ async def generic_text_handler(msg: types.Message):
         # Получаем кастомные лимиты
         custom_limits = await get_all_limits(uid)
         
-        text = f"💰 Ваш доход: {format_amount(income)} ₽\n\n"
+        text = f"💰 <b>Ваш доход:</b> {format_amount(income)} ₽\n\n"
+        
+        # Секция с расходами по категориям
+        text += "<b>📊 Расходы по категориям:</b>\n"
         for group, cats in CATEGORIES.items():
-            text += f"📂 {group}\n"
+            text += f"\n<b>{group}:</b>\n"
             for cat, pct in cats.items():
                 # Используем кастомный лимит или расчетный
                 if cat in custom_limits:
@@ -729,11 +856,20 @@ async def generic_text_handler(msg: types.Message):
                 s = spent.get(cat, 0)
                 perc = (s / lim * 100) if lim else 0
                 text += f"• {cat}: {format_amount(s)} ₽ / {format_amount(lim)} ₽{limit_source} ({perc:.0f}%)\n"
-            text += "\n"
         
-        text += f"📊 Всего потрачено: {format_amount(total_spent)} ₽ / {format_amount(income)} ₽ ({(total_spent/income*100) if income else 0:.0f}%)"
+        text += f"\n<b>📈 Итого потрачено:</b> {format_amount(total_spent)} ₽ / {format_amount(income)} ₽ ({(total_spent/income*100) if income else 0:.0f}%)\n\n"
         
-        await bot.send_message(uid, text)
+        # Секция с целями накоплений
+        savings_analytics = await get_savings_analytics(uid)
+        if savings_analytics["total_goals"] > 0:
+            text += "🎯 <b>Цели накоплений:</b>\n"
+            for goal in savings_analytics["goals"]:
+                progress = (goal["current_amount"] / goal["target_amount"] * 100) if goal["target_amount"] > 0 else 0
+                text += f"• {goal['name']}: {format_amount(goal['current_amount'])} / {format_amount(goal['target_amount'])} ₽ ({progress:.1f}%)\n"
+            
+            text += f"\n<b>📊 Итого по целям:</b> {format_amount(savings_analytics['total_current'])} ₽ / {format_amount(savings_analytics['total_target'])} ₽ ({savings_analytics['total_progress']:.1f}%)\n"
+        
+        await bot.send_message(uid, text, parse_mode=types.ParseMode.HTML)
         return
         
     elif text == "📈 Аналитика":
@@ -755,8 +891,6 @@ async def generic_text_handler(msg: types.Message):
             "<b>Команды:</b>\n"
             "/reportweek - отчёт за неделю\n"
             "/reportmonth - отчёт за месяц\n"
-            "/analytics - расширенная аналитика\n"
-            "/savings - цели накоплений\n"
             "/limits - управление лимитами\n"
             "/add_recurring - добавить регулярный расход\n"
             "/start - перезапустить бота"
