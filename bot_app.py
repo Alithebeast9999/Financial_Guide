@@ -3,7 +3,7 @@ import os
 import logging
 import asyncio
 from datetime import datetime, timedelta
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, List
 import pytz
 import aiosqlite
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -557,6 +557,38 @@ async def generic_text_handler(msg: types.Message):
     
     pending = await get_pending(uid)
     
+    # Handle savings deposit input - ВАЖНО: должна быть ПЕРЕД другими проверками чисел
+    if pending and pending["type"] == "savings_deposit":
+        try:
+            amount = float(text.replace(" ", "").replace(",", "."))
+            goal_id = pending["data"]["goal_id"]
+            
+            # Получаем текущую сумму цели
+            goal = await db_fetchone("SELECT current_amount, name, target_amount FROM savings_goals WHERE id = ?", (goal_id,))
+            if goal:
+                new_amount = goal["current_amount"] + amount
+                await update_savings_goal(goal_id, new_amount)
+                await pop_pending(uid)
+                
+                progress = (new_amount / goal["target_amount"] * 100) if goal["target_amount"] > 0 else 0
+                await bot.send_message(
+                    uid,
+                    f"✅ Внесено {format_amount(amount)} ₽ в цель '{goal['name']}'\n\n"
+                    f"Всего накоплено: {format_amount(new_amount)} ₽ из {format_amount(goal['target_amount'])} ₽\n"
+                    f"Прогресс: {progress:.1f}%",
+                    reply_markup=get_main_keyboard()
+                )
+            else:
+                await bot.send_message(uid, "❌ Цель не найдена.", reply_markup=get_main_keyboard())
+                await pop_pending(uid)
+        except ValueError:
+            await bot.send_message(uid, "❌ Неверный формат суммы. Введите число, например: 1000")
+        except Exception as e:
+            logger.error(f"Error depositing to savings: {e}")
+            await bot.send_message(uid, "❌ Ошибка при внесении средств.", reply_markup=get_main_keyboard())
+            await pop_pending(uid)
+        return
+    
     # Handle income input
     if pending and pending["type"] == "income":
         try:
@@ -734,8 +766,7 @@ async def generic_text_handler(msg: types.Message):
     
     await bot.send_message(uid, "Не понял. Используйте кнопки ниже.", reply_markup=get_main_keyboard())
 
-# Заменяем существующий callback_handler на этот исправленный код:
-
+# Callback handlers
 @dp.callback_query_handler(lambda c: c.data and (c.data.startswith('preset_') or c.data.startswith('cat_') or 
                                                  c.data.startswith('rec_') or c.data.startswith('del_') or
                                                  c.data.startswith('savings_') or c.data.startswith('deposit_') or
@@ -979,43 +1010,6 @@ async def handle_recurring_day(msg: types.Message):
             f"• День месяца: {day}",
             reply_markup=get_main_keyboard()
         )
-
-# Замените существующий обработчик handle_savings_deposit на этот:
-
-@dp.message_handler(lambda msg: msg.text.replace(" ", "").replace(",", ".").replace(".", "", 1).isdigit())
-async def handle_savings_deposit(msg: types.Message):
-    uid = msg.from_user.id
-    pending = await get_pending(uid)
-    
-    if pending and pending["type"] == "savings_deposit":
-        try:
-            amount = float(msg.text.replace(" ", "").replace(",", "."))
-            goal_id = pending["data"]["goal_id"]
-            
-            # Получаем текущую сумму цели
-            goal = await db_fetchone("SELECT current_amount, name, target_amount FROM savings_goals WHERE id = ?", (goal_id,))
-            if goal:
-                new_amount = goal["current_amount"] + amount
-                await update_savings_goal(goal_id, new_amount)
-                await pop_pending(uid)
-                
-                progress = (new_amount / goal["target_amount"] * 100) if goal["target_amount"] > 0 else 0
-                await bot.send_message(
-                    uid,
-                    f"✅ Внесено {format_amount(amount)} ₽ в цель '{goal['name']}'\n\n"
-                    f"Всего накоплено: {format_amount(new_amount)} ₽ из {format_amount(goal['target_amount'])} ₽\n"
-                    f"Прогресс: {progress:.1f}%",
-                    reply_markup=get_main_keyboard()
-                )
-            else:
-                await bot.send_message(uid, "❌ Цель не найдена.", reply_markup=get_main_keyboard())
-                await pop_pending(uid)
-        except ValueError:
-            await bot.send_message(uid, "❌ Неверный формат суммы.")
-        except Exception as e:
-            logger.error(f"Error depositing to savings: {e}")
-            await bot.send_message(uid, "❌ Ошибка при внесении средств.", reply_markup=get_main_keyboard())
-            await pop_pending(uid)
 
 @dp.message_handler(commands=['add_recurring'])
 async def add_recurring(msg: types.Message):
